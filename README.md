@@ -44,12 +44,14 @@ curl -s 127.0.0.1:8110/v1/health
 
 ## 当前状态（ART-02）
 
+SeeCode 架构基线：[`ART-03-seecode-adapter-design-v1.md`](docs/architecture/ART-03-seecode-adapter-design-v1.md)；Job/Worker/SVG 裁决：[`ART-03A-job-worker-svg-decisions-v1.md`](docs/architecture/ART-03A-job-worker-svg-decisions-v1.md)。Mermaid 不属于本服务职责。
+
 - **已实现**：health / ready / generators / Artifact 元数据（创建、查询、分页、
   If-Match 更新）/ References / GenerationJob 查询与取消 / 幂等键 / 统一错误信封。
 - **被 P0 阻断（诚实 503，不伪装成功）**：Version 上传会话与 commit
   （file-service upload-intent / checksum / finalize 协议缺失）。
-- **未实现（如实 unavailable）**：Mermaid / SeeCode Generator Adapter，
-  GenerationJob 创建 → 503 GENERATOR_UNAVAILABLE。
+- **未实现（如实 unavailable）**：SeeCode Generator Adapter，
+  GenerationJob 创建 → 503 GENERATOR_UNAVAILABLE。Mermaid 由前端 Markdown 编辑器解析与预览，Artifact Service 不提供 Mermaid 专用能力。
 - **授权**：生产验证器 fail-closed——委托签发方存在两个 P0
   （resource token 端点未鉴权挂载、claims 缺 aud/tid）关闭前，
   所有业务端点默认 401/403。**没有运行时绕过开关**；

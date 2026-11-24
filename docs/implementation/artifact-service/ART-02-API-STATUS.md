@@ -7,7 +7,7 @@
 |---|---|---|---|---|---|
 | 1 | GET /v1/health | 进程存活 | ✅ 已实现+已测试 | 200，version/git_sha/built_at，不探测依赖 | api_meta::health_reports_build_info |
 | 2 | GET /v1/ready | 依赖就绪 | ✅ 已实现+已测试 | 200/503；components.database + file_storage=protocol_blocked_p0 如实上报 | api_meta::ready_reports_database_and_blocked_storage |
-| 3 | GET /v1/generators | Generator 能力 | ✅ 已实现+已测试 | 注册表实况；mermaid/seecode 均 unavailable + 原因 | api_meta::generators_report_unavailable_adapters |
+| 3 | GET /v1/generators | Generator 能力 | ✅ 已实现+已测试 | 注册表实况；SeeCode unavailable + 原因；Mermaid 不属于本服务能力 | api_meta::generators_report_unavailable_adapters |
 | 4 | POST /v1/artifacts | 创建 Artifact | ✅ 已实现+已测试 | 201+ETag；Idempotency-Key 重放 200（X-Idempotent-Replay）、同 key 异 body 409 | artifact_flow::create_get_patch_etag_roundtrip / idempotency_replay_and_reuse_conflict；sdk_contract |
 | 5 | GET /v1/artifacts | 分页查询 | ✅ 已实现+已测试 | cursor 分页（base64url(created_at\|id)）、artifact_type/lifecycle_state 过滤、limit≤200 | artifact_flow::list_pagination_with_cursor |
 | 6 | GET /v1/artifacts/{id} | 元数据+当前版本 | ✅ 已实现+已测试 | 200+ETag；跨 scope → 404（防 ID 探测） | artifact_flow（boundary） |
