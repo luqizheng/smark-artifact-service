@@ -25,8 +25,7 @@
 |---|---|---|
 | 8 | SeeCode Adapter（SVG-only、独立 Worker、安全签收、拆除 AI-PM crate 依赖） | ART-03（设计基线：docs/architecture/ART-03-seecode-adapter-design-v1.md） |
 | 9 | GenerationJob 编排 + Worker 最小服务身份 + 心跳/超时调度 | ART-03 |
-
-Mermaid Adapter 已取消：由前端 Markdown 编辑器负责解析与预览，不属于 Artifact Service。历史 0001 migration 中的 Mermaid seed 应通过后续 migration 删除。
+| 10 | Mermaid Adapter | **已取消**：由前端 Markdown 编辑器负责解析与预览；Artifact Service 不提供专用能力。历史 0001 migration 中的 Mermaid seed 应通过后续 migration 删除。 |
 | 11 | `/metrics`（网络受限）+ Job 队列深度等指标 | 可观测性批次 |
 | 12 | outbox_event 表与事件通知 | ART-01 标注"若启用"；轮询为 V1 必选，事件通知后补 |
 | 13 | PATCH 更新语义：无法区分"未提供字段"与"显式置 null"（当前 Option 三态缺省） | 契约演进时处理（如 JSON Merge Patch） |
