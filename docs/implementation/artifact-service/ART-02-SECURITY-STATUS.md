@@ -51,7 +51,7 @@
 | 项 | 状态 |
 |---|---|
 | 长期 S3/RustFS 凭据持有 | 无（无对象存储 SDK 依赖；StoragePort 是唯一出口） |
-| Mermaid/SeeCode 零外网、SVG 静态化、Worker 隔离 | 未实现（如实 unavailable）；实现门禁见 ART-01 §7（Golden/安全/隔离测试），属 ART-03+ |
+| SeeCode 零外网、SVG 静态化、Worker 隔离；Mermaid 由前端 Markdown 编辑器负责，不属于本服务 | 未实现（如实 unavailable）；实现门禁见 ART-01 §7（Golden/安全/隔离测试），属 ART-03+ |
 | 错误信封泄漏 | details 仅含稳定 reason；无内部路径/堆栈/凭据 |
 | 日志 | tracing 记录 request_id/动作；不记录 bearer token 原文（审计与日志结构均无凭证字段） |
 | compose 样例凭据 | 仅本地 dev 值且显式标注；`db-roles.sql` 不含口令，注入由 secret 管理完成 |
