@@ -44,7 +44,7 @@ curl -s 127.0.0.1:8110/v1/health
 
 ## 当前状态（ART-02）
 
-SeeCode 后续设计基线：[`ART-03-seecode-adapter-design-v1.md`](docs/architecture/ART-03-seecode-adapter-design-v1.md)。Mermaid 不属于本服务职责。
+SeeCode 架构基线：[`ART-03-seecode-adapter-design-v1.md`](docs/architecture/ART-03-seecode-adapter-design-v1.md)；Job/Worker/SVG 裁决：[`ART-03A-job-worker-svg-decisions-v1.md`](docs/architecture/ART-03A-job-worker-svg-decisions-v1.md)。Mermaid 不属于本服务职责。
 
 - **已实现**：health / ready / generators / Artifact 元数据（创建、查询、分页、
   If-Match 更新）/ References / GenerationJob 查询与取消 / 幂等键 / 统一错误信封。
