@@ -54,6 +54,19 @@ jobs:
         run: cargo build --release -p artifact-api
         env:
           ARTIFACT_GIT_SHA: ${{ github.sha }}
+      - name: worker binary builds without test-doubles feature
+        run: cargo build --release -p artifact-worker
+        env:
+          ARTIFACT_GIT_SHA: ${{ github.sha }}
+      - name: migration 0001 is immutable (ART-03B-01)
+        run: |
+          expected=ea8acd4490516a31700005838c18a41cb7ff41e81b62f549cb407f874343a1c8
+          actual=$(sha256sum migrations/0001_init.sql | awk '{print $1}')
+          echo "0001 sha256: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "ART-03B-01 forbids modifying the published 0001 migration"
+            exit 1
+          fi
 
   docker-build:
     name: docker image

@@ -109,7 +109,7 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
         .request_generation(
             created.id,
             CreateGenerationJobRequest {
-                generator_id: "mermaid".into(),
+                generator_id: "seecode".into(),
                 input: serde_json::json!({"source_version_id": uuid::Uuid::new_v4()}),
                 options: Some(serde_json::json!({"formats": ["svg"]})),
                 expected_current_version_id: None,

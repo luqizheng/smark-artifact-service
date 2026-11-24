@@ -385,7 +385,7 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "503":
-          description: GENERATOR_UNAVAILABLE（Mermaid/SeeCode Adapter 均未实现）
+          description: GENERATOR_UNAVAILABLE（SeeCode Adapter 未实现；Mermaid 不属于本服务）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

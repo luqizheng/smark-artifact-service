@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "apps/artifact-api",
+    "apps/artifact-worker",
     "crates/artifact-domain",
     "crates/artifact-application",
     "crates/artifact-infrastructure",

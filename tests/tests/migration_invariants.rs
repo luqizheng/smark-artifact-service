@@ -201,7 +201,7 @@ async fn deleted_artifact_rejects_children(pool: sqlx::PgPool) {
         sqlx::query(
             "INSERT INTO artifact.generation_job \
          (id, tenant_id, project_id, artifact_id, generator_id) \
-         VALUES ($1, $2, $3, $4, 'mermaid')",
+         VALUES ($1, $2, $3, $4, 'seecode')",
         )
         .bind(Uuid::new_v4())
         .bind(common::TENANT)
@@ -308,7 +308,7 @@ async fn generation_job_state_machine_enforced(pool: sqlx::PgPool) {
     let job = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO artifact.generation_job (id, tenant_id, project_id, artifact_id, generator_id) \
-         VALUES ($1, $2, $3, $4, 'mermaid')",
+         VALUES ($1, $2, $3, $4, 'seecode')",
     )
     .bind(job).bind(common::TENANT).bind(common::PROJECT_1).bind(artifact)
     .execute(&pool)

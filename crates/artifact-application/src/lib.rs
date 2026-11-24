@@ -15,8 +15,13 @@ pub use port::repo::{
     NewArtifact, ReferenceRepository, VersionRepository,
 };
 pub use port::storage::{ObjectInspection, StorageError, StoragePort, UploadIntent};
+pub use port::worker::{FailOutcome, WorkerCoordinationPort};
 pub use service::artifact::{
     ArtifactService, to_artifact_dto, to_generator_dto, to_job_dto, to_reference_dto,
     to_version_dto,
 };
 pub use service::generator::GeneratorService;
+pub use service::job_input::{
+    InputValidationError, MAX_DEPTH, MAX_EDGES, MAX_ENVELOPE_BYTES, MAX_NODES, MAX_TEXT_BYTES,
+    validate_job_input_envelope,
+};
