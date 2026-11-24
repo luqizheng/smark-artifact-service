@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: SMARK Artifact Service API
-  version: 1.0.0-art02
+  version: 1.0.0-art03b
   description: |
     独立 Artifact Service 的 V1 API（契约基线 = AI-PM ART-01 V1.0）。
 
@@ -10,6 +10,10 @@ info:
       GenerationJob 查询/取消。
     - `被 P0 阻断`：Version 上传会话与 commit（file-service 上传/finalize 协议缺失）。
     - `未实现`：GenerationJob 创建（Generator Adapter 未实现 → 503 GENERATOR_UNAVAILABLE）。
+
+    相对 ART-01 V1.0 的增量（待 ART-01 errata 确认，均为向后兼容的新增）：
+    - `GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；
+    - `requestGeneration` 文档化 409（Idempotency-Key 冲突）与 413（请求体超过 256 KiB）。
 
     授权：业务端点要求 `Authorization: Bearer <短时项目/动作范围委托凭证>`；
     当前生产验证器 fail-closed（P0 关闭前一切业务请求 401/403），详见安全状态文档。
@@ -365,6 +369,14 @@ paths:
       operationId: requestGeneration
       tags: [generation]
       summary: 请求生成（Adapter 未实现 → 503 GENERATOR_UNAVAILABLE）
+      description: |
+        `input` 是版本化的 SeeCode 输入信封：`schema` 固定为 `smark.seecode.input`，
+        `schema_version` 为服务端支持的版本（当前 `1`），`diagram` 必填且 `diagram.type` 非空。
+        未知顶层字段、超出结构上限、危险字段名或 URL 形态的值一律 400，
+        原因码与结构位置见 `error.details.reason` / `error.details.field`，响应不回显输入正文。
+        整个请求体上限 256 KiB。`diagram` 内部逐字段的 JSON Schema 尚未冻结（ART-03A 验收项）。
+
+        幂等：同一 Idempotency-Key 与相同请求体返回原 Job；同 key 不同请求体 → 409。
       parameters:
         - { $ref: "#/components/parameters/ArtifactId" }
         - { $ref: "#/components/parameters/ProjectIdHeader" }
@@ -384,6 +396,16 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "409":
+          description: IDEMPOTENCY_KEY_REUSED — 同一 Idempotency-Key 已用于不同的请求体
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: PAYLOAD_TOO_LARGE — 请求体超过 256 KiB
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: GENERATOR_UNAVAILABLE（SeeCode Adapter 未实现；Mermaid 不属于本服务）
           content:
@@ -395,6 +417,9 @@ paths:
       operationId: getJob
       tags: [generation]
       summary: 查询 Job 状态
+      description: |
+        轮询 Job 状态。响应不包含输入正文。`error_code` 在失败、超时或取消时给出稳定原因码；
+        `cancel_requested=true` 表示 running 期间已收到取消请求、尚未由 Worker 确认。
       parameters:
         - { $ref: "#/components/parameters/JobId" }
         - { $ref: "#/components/parameters/ProjectIdHeader" }
@@ -414,6 +439,11 @@ paths:
       operationId: cancelJob
       tags: [generation]
       summary: 取消 Job（尽力而为；终态 Job 原样返回）
+      description: |
+        queued / retry_wait 的 Job 直接取消，返回 `status=cancelled`。
+        running 的 Job 只登记取消请求：仍返回 200 与 `status=running`，并以
+        `cancel_requested=true` 表示请求已被接受，最终状态由 Worker 确认后给出。
+        终态 Job 不改变状态，原样返回。
       parameters:
         - { $ref: "#/components/parameters/JobId" }
         - { $ref: "#/components/parameters/ProjectIdHeader" }
@@ -714,19 +744,41 @@ components:
       required: [generator_id, input]
       properties:
         generator_id: { type: string }
-        input: { type: object }
+        input:
+          type: object
+          description: |
+            版本化的 SeeCode 输入信封。必填 `schema`（固定 `smark.seecode.input`）、
+            `schema_version`（当前 `1`）、`diagram`（含非空 `type`）。
+            顶层只允许 `schema`、`schema_version`、`diagram`、`options`、`provenance`。
+            结构上限：请求体 256 KiB、嵌套深度 16、`diagram.nodes` ≤ 500、`diagram.edges` ≤ 2000、
+            单个文本 4 KiB、单个数组或对象的元素 4096。
+            不接受 URL / 路径 / 脚本 / 命令 / 环境变量 / 凭据类字段名，也不接受 URL 形态的值。
         options: { type: object }
         expected_current_version_id: { type: [string, "null"], format: uuid }
 
     GenerationJob:
       type: object
-      required: [id, artifact_id, generator_id, status, created_at, poll_url]
+      required:
+        [id, artifact_id, generator_id, status, error_code, attempt_count, max_attempts,
+         cancel_requested, created_at, poll_url]
       properties:
         id: { type: string, format: uuid }
         artifact_id: { type: string, format: uuid }
         generator_id: { type: string }
         status:
           type: string
-          enum: [queued, running, retry_wait, succeeded, failed, cancelled, timed_out]
+          enum: [queued, running, retry_wait, succeeded, cancelled, timed_out, failed]
+        error_code:
+          type: [string, "null"]
+          description: |
+            失败、超时或取消的稳定原因码；成功时为 null，retry_wait 时为最近一次失败的原因。
+            已知取值（非穷尽，调用方必须容忍未知值）：
+            GENERATOR_VALIDATION_FAILED、GENERATOR_EXECUTION_FAILED、GENERATION_TIMEOUT、
+            OUTPUT_REJECTED、STORAGE_UNAVAILABLE、MAX_ATTEMPTS_EXCEEDED、CANCELLED、QUEUE_EXPIRED。
+        attempt_count: { type: integer, minimum: 0 }
+        max_attempts: { type: integer, minimum: 1 }
+        cancel_requested:
+          type: boolean
+          description: running 期间已收到取消请求、尚未由 Worker 确认。
         created_at: { type: string, format: date-time }
         poll_url: { type: string }

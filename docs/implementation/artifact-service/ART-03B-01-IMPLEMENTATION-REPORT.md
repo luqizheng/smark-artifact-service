@@ -1,11 +1,14 @@
 # ART-03B-01 — Job 持久化与 Worker 协调基础：实施报告
 
-> 状态：**已实现 + 已测试（本地真实 PostgreSQL 16）**；未合并，Draft PR 待审。
+> 状态：**已合并**。PR #2 于 2026-11-24 合入 `docs/art-03-seecode-adapter-design`。
 > 分支：`impl/art-03b-01-job-coordination`（基于 `docs/art-03-seecode-adapter-design`）。
 > 设计依据：`docs/architecture/ART-03-seecode-adapter-design-v1.md`、
 > `docs/architecture/ART-03A-job-worker-svg-decisions-v1.md`。
 > 范围声明：本切片只做 Migration、Attempt/Lease、受控函数、Worker 骨架、权限与部署基础；
 > **不实现** SeeCode / Mermaid / Node / File Service / SVG Sanitizer，不开放生产生成路径。
+>
+> **阅读提示**：§1 至 §11 记录迁移 0002 切片的原始实现。合并后的评审发现其中若干缺陷，
+> 由迁移 0003 修复，见 §12；两者不一致时以 §12 为准。
 
 ## 0. 实施前检查结论
 
@@ -147,7 +150,7 @@
 | A3A-04 | 原子 claim + lease/heartbeat | ✅ | `FOR UPDATE SKIP LOCKED`；token 明文一次性返回 |
 | A3A-05 | Worker 独立最小权限 role | ✅ | 仅函数 EXECUTE，全业务表拒绝 |
 | A3A-08 | Mermaid seed 后续 migration 删除 | ✅ | 幂等 DELETE，不改 0001 |
-| D1 | 文档应已合并 main | ⚠️ 偏差 | ART-03A 文档仍在远端设计分支，未合并 main；实现分支基于该设计分支，Draft PR 不指向 main |
+| D1 | 文档应已合并 main | 已解决 | ART-03A 文档已由 PR #1 合入 main |
 | D2 | Job+输入同事务创建 | ⚠️ 部分 | 受控创建函数已实现并测试；**API 生产创建路径仍 fail-closed**（generator unavailable + 无 adapter），未返回成功 Job |
 | D3 | claim 检查 generator=`available` | ⚠️ 生产不可领取 | 守约检查 available；因无 adapter、seed=unavailable，生产环境不领取任何 Job（这正是"不开放生产生成路径"）；测试库内临时置 available 验证协调机制，**非生产绕过开关** |
 | D4 | 256 KiB envelope | ✅ | 专用提取器 + 应用层校验 |
@@ -165,9 +168,67 @@
   5. SVG 安全签收未实现。
 - 本切片**不引入** Redis 或第二套 Job 权威状态源；**不增加**任何生产绕过开关；**未解除**任何 P0 门禁。
 
-## 11. 已知问题与未关闭风险
+## 11. 已知问题与未关闭风险（0002 切片当时的状态）
 
-- `deploy/docker-compose.yml` 基础文件在本次会话中读取被审批拦截，未修改；Worker 以 `docker-compose.worker.yml` override 形式提供独立服务，使用时需 `-f` 同时指定两份文件。**未验证基础 compose 中 postgres 服务名/网络是否与 override 完全一致**（本地 dev PG 为独立容器，非 compose 启动）。CI 未跑 docker compose 集成。
-- 输入校验为"通用结构上限 + 禁字段"规则集；SeeCode 专用 JSON Schema（字段/枚举/必填）冻结属 ART-03A 验收项，本切片以结构规则近似，未做 schema golden tests。
+- （已由 §12 取代）`deploy/docker-compose.yml` 基础文件在本次会话中读取被审批拦截，未修改；Worker 以 `docker-compose.worker.yml` override 形式提供独立服务，使用时需 `-f` 同时指定两份文件。**未验证基础 compose 中 postgres 服务名/网络是否与 override 完全一致**（本地 dev PG 为独立容器，非 compose 启动）。CI 未跑 docker compose 集成。
+- （部分解决，见 §12）输入校验为"通用结构上限 + 禁字段"规则集；SeeCode 专用 JSON Schema（字段/枚举/必填）冻结属 ART-03A 验收项，本切片以结构规则近似，未做 schema golden tests。
 - `VALID_JSON` 通用提取器仍允许 8 MiB，只有生成端点走 256 KiB 专用提取器；符合"生成 envelope 256 KiB"要求，其他端点不受影响。
-- Worker 领取后因无 Adapter 立即以 `GENERATOR_ADAPTER_NOT_IMPLEMENTED`（不可重试）fail；这是诚实的骨架行为，避免伪造成功，但也意味着生产一旦放开 generator=available 会快速耗尽 attempt——**必须在 Adapter 就绪后再放开 generator 状态**。
+- （已由 §12 取代）Worker 领取后因无 Adapter 立即以 `GENERATOR_ADAPTER_NOT_IMPLEMENTED`（不可重试）fail；这是诚实的骨架行为，避免伪造成功，但也意味着生产一旦放开 generator=available 会快速耗尽 attempt——**必须在 Adapter 就绪后再放开 generator 状态**。
+
+## 12. 评审修复（迁移 0003）
+
+> 状态：**已实现 + 已本地测试**。CI 结果以对应 PR 的检查为准。
+> 裁决依据：`ART-03A-job-worker-svg-decisions-v1.md` §11。
+> 0001、0002 未改写，内容哈希由 `migrations.sha256` 锁定。
+
+评审指出的问题逐项处置如下。验证一列是覆盖它的自动化测试；标为"实测"的项另在一次性 PostgreSQL 16 容器或 compose 栈上验证过。
+
+| # | 评审问题 | 处置 | 验证 |
+|---|---|---|---|
+| 1 | `lease_seconds = NULL` 产生永久 running 的 Job | NULL 被拒绝；活跃 Attempt 的租约必须非空（CHECK）；迁移会修复 0002 留下的卡死数据 | `invalid_lease_seconds_never_leaves_a_stuck_job`、`migration_0003_repairs_damage_left_by_0002` |
+| 2 | 重试没有退避 | `next_attempt_at` 与指数退避（A3A-10） | `crashed_worker_waits_for_backoff_before_reclaim` |
+| 3 | 没有最大执行时长 | Attempt deadline；heartbeat 不再越过 deadline（A3A-12） | `deadline_caps_the_lease_and_ends_the_attempt`、`recovery_classifies_a_reached_deadline_as_timeout` |
+| 4 | Worker 无法感知取消 | heartbeat 返回四态；fail 与 complete 返回 `cancel_requested`（A3A-13） | `cancel_is_visible_to_the_running_worker` |
+| 5 | `complete` 可以在没有 Version / Output 时成功 | 只有目标 Version 已 READY 且有通过检查的主 Output 才成功（A3A-14） | `completion_requires_a_ready_version_with_passed_output` |
+| 6 | 输入限额互相冲突，禁字段名单可绕过 | 文档规定的 500 节点 + 2000 边可以提交；信封层 allowlist；危险字段名按词元拦截；URL 形态的值被拒绝 | `job_input` 单元测试 12 例、`generation_request_enforces_the_input_envelope` |
+| 7 | 本地 compose 全新启动失败 | 角色与授权移到迁移之后（`db-grants` 服务与 `deploy/dev-grants.sh`） | 实测：compose 栈在全新卷上启动，migrate 与 db-grants 均以 0 退出 |
+| 8 | 版本没有在 Job 创建时固定 | 创建时从注册表固定；claim 按 adapter 版本匹配（A3A-15） | `job_creation_pins_versions_and_is_idempotent`、`claim_only_matches_advertised_adapter_version` |
+| 9 | 创建幂等未实现，`input_sha256` 未校验 | 部分唯一索引；同 key 同请求返回原 Job，不同请求报冲突；`input_sha256` 由数据库计算（A3A-16） | 同上 |
+| 10 | 接受空输入，排队没有时限 | 入参严格校验；生成器不可用时拒绝入队；排队时限（A3A-17） | `queue_ttl_cancels_unclaimed_job` |
+| 11 | API 契约表达不了结果 | `GenerationJob` 新增 4 个字段；OpenAPI 补 409 与 413 | `get_job_serves_the_documented_shape`、`cancel_running_job_reports_cancel_requested`、`generation_job_documents_outcome_fields` |
+| 12 | Worker 侧状态演进没有审计 | 受控函数内写审计（A3A-19） | `controlled_functions_write_audit_events` |
+| 13 | claim 全量排序，恢复扫描重复执行 | 窗口加主键复核；advisory lock（A3A-21） | 实测：排队约 10 万条时单次 claim 约 4 至 5 毫秒，修复前约 98 毫秒 |
+| 14 | 失败上报不健壮 | 诊断摘要截断；错误码形式约束；超时记为 `timed_out`；取消用返回值（A3A-18） | `long_diagnostic_is_truncated_not_rejected`、`worker_reported_timeout_is_recorded_as_timed_out` |
+| — | `db-roles.sql` 的默认权限缺 `FOR ROLE` | 已补；"迁移之后必须重跑授权脚本"写进脚本头与 README | `runtime_role_is_dml_only` |
+| — | 取消函数的 scope 校验在函数外 | 移入函数（A3A-20） | `job_endpoints_enforce_scope_and_action` |
+| — | `cancel_job` 的成功路径没有测试 | 新增 API 层测试 | `tests/tests/generation_api.rs`（5 例） |
+| — | Worker 配置写错时静默回落默认值；配置测试是空断言 | 取值不合法直接启动失败；测试改为真实断言 | `config.rs` 单元测试 3 例；compose 栈实测 |
+| — | `ClaimedJob` 的 Debug 输出明文 | 手写 Debug 脱敏 | `claimed_job_debug_redacts_secrets` |
+| — | 迁移哈希门禁只覆盖 0001 | `migrations.sha256` 加 `sha256sum -c`；未列入清单的迁移会使测试失败 | `released_migrations_are_unchanged` |
+| — | Worker 镜像没有 CI 构建，发布流程不发布 | CI 构建并冒烟；发布流程推送 Worker 镜像 | 实测镜像构建、入口冒烟与 SIGTERM 以 0 退出 |
+
+行为变化（调用方或运维可见）：
+
+- Worker 不再领取任务。没有申报 adapter 能力的 Worker 领不到 Job，`run` 模式只做租约恢复与输入清理。
+- 取消 running 的 Job 仍返回 200 与 `running`，新增 `cancel_requested=true`。终态 Job 上的取消是空操作，不再记审计。
+- `GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`。
+- 生成请求的校验失败改为 `INVALID_REQUEST` 加 `details.reason` 与 `details.field`，不再把原因拼进 message。
+- 环境变量 `ARTIFACT_WORKER_LEASE_SECONDS` 与 `ARTIFACT_WORKER_POLL_INTERVAL_MS` 已移除，新增 `ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS`。租约秒数由执行循环（ART-03B-02）作为 claim 参数传入。
+- `deploy/initdb/01-roles.sh` 已删除。部署顺序固定为迁移、执行 `deploy/db-roles.sql`、启动服务；compose 环境由 `db-grants` 服务完成第二步。
+
+本地验证：
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过，0 告警 |
+| `cargo test --workspace`（并行，PG 16 容器 `artifact-dev-pg`） | 83 通过，0 失败 |
+| compose 栈（postgres、migrate、db-grants、api、worker） | 全新卷一次启动成功；角色权限矩阵与预期一致；可领取的 Job 未被 Worker 领走；排队超时的 Job 被维护循环收尾；`docker stop` 以 0 退出 |
+
+仍未解决（不在本次修复范围）：
+
+- SeeCode 输入 schema 冻结之前，`diagram` 内部没有逐字段的 allowlist（A3A-22）。在那之前 Adapter 不得把原始 JSON 直接交给 CLI。
+- `GenerationJob` 的新增字段与 409、413 需要 ART-01 errata 确认。
+- 注册表里 seecode 的 `supported_input_formats` 仍是 `vizspec`，版本仍是 `0.0.0`，等输入 schema 冻结与 vendor 引入时一并更新。
+- 排队时限、退避参数与最大执行时长的默认值是否需要按生成器配置，尚未裁决。
+- Worker 的执行循环、强杀与容器隔离（ART-03B-02、ART-03B-03）。

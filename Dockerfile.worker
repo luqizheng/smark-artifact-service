@@ -1,19 +1,20 @@
 # ART-03B-01 独立 Worker 镜像（多阶段；无 apt 操作）。
-# 本切片只包含 Rust 协调骨架：没有 Node、没有 SeeCode vendor、没有用户 delegation。
-# 生产隔离（只读根文件系统、无外网、资源配额）在 ART-03B-03 单独实施，此处不伪造。
+# 本切片只包含 Rust 协调维护：没有 Node、没有 SeeCode vendor、没有用户 delegation，
+# 也不领取任何 Job。生产隔离（只读根文件系统、无外网、资源配额）在 ART-03B-03 单独实施，此处不伪造。
 
+# builder 阶段必须与 Dockerfile 逐条指令一致，才能复用它的层缓存。
 FROM rust:1-bookworm AS builder
 ARG ARTIFACT_GIT_SHA=unknown
 ENV ARTIFACT_GIT_SHA=${ARTIFACT_GIT_SHA}
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p artifact-worker && \
-    cp target/release/artifact-worker /out-artifact-worker
+RUN cargo build --release -p artifact-api -p artifact-worker
 
 FROM debian:bookworm-slim AS runtime
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /out-artifact-worker /usr/local/bin/artifact-worker
+COPY --from=builder /build/target/release/artifact-worker /usr/local/bin/artifact-worker
 RUN useradd --system --no-create-home artifact
 USER artifact
 # 无 HTTP 端口：Worker 只与 PostgreSQL 通信。
 ENTRYPOINT ["/usr/local/bin/artifact-worker"]
+CMD ["run"]

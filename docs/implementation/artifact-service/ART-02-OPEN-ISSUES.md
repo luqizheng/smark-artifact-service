@@ -24,8 +24,8 @@
 | # | 项 | 归属 |
 |---|---|---|
 | 8 | SeeCode Adapter（SVG-only、独立 Worker、安全签收、拆除 AI-PM crate 依赖） | ART-03（设计基线：docs/architecture/ART-03-seecode-adapter-design-v1.md） |
-| 9 | GenerationJob Attempt/Lease、受控 Worker DB 权限、输入快照清理 | ART-03B（设计裁决：docs/architecture/ART-03A-job-worker-svg-decisions-v1.md） |
-| 10 | Mermaid Adapter | **已取消**：由前端 Markdown 编辑器负责解析与预览；Artifact Service 不提供专用能力。历史 0001 migration 中的 Mermaid seed 应通过后续 migration 删除。 |
+| 9 | GenerationJob Attempt/Lease、受控 Worker DB 权限、输入快照清理 | **已实现并测试**（迁移 0002 与 0003，见 [ART-03B-01 实施报告 §12](ART-03B-01-IMPLEMENTATION-REPORT.md)）。剩余：Worker 执行循环与强杀（ART-03B-02）、容器隔离（ART-03B-03） |
+| 10 | Mermaid Adapter | **已取消**：由前端 Markdown 编辑器负责解析与预览；Artifact Service 不提供专用能力。0001 中的 Mermaid seed 已由迁移 0002 删除。 |
 | 11 | `/metrics`（网络受限）+ Job 队列深度等指标 | 可观测性批次 |
 | 12 | outbox_event 表与事件通知 | ART-01 标注"若启用"；轮询为 V1 必选，事件通知后补 |
 | 13 | PATCH 更新语义：无法区分"未提供字段"与"显式置 null"（当前 Option 三态缺省） | 契约演进时处理（如 JSON Merge Patch） |
@@ -40,3 +40,12 @@
 | 17 | PAT scope | fine-grained PAT 未包含新仓库 → 本仓库 push 暂走 SSH（fetch 保持 https）；如需统一 HTTPS，请把 `smark-artifact-service` 加入 PAT 的 repository access |
 | 18 | compose 样例凭据 | `deploy/` 全部为本地 dev 值（显式标注）；生产部署须走 secret 注入 + `db-roles.sql` |
 | 19 | OpenAPI 未用代码生成 | DTO/SDK 走"规范 + 双向契约测试"路线（任务 §4.4 允许）；若未来多语言客户端增多，可引入 spec 生成校验 |
+
+## ART-03B-01 评审后新增
+
+| # | 问题 | 现状 | 建议 |
+|---|---|---|---|
+| 20 | `GenerationJob` 响应新增字段与 409 / 413 | OpenAPI 与实现已对齐（`error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；`requestGeneration` 的 409 与 413） | 向 ART-01 契约提 errata 确认；均为向后兼容的新增 |
+| 21 | SeeCode 输入 schema 未冻结 | 信封层 allowlist 已实现；`diagram` 内部只有结构上限与危险内容拦截（ART-03A A3A-22） | 冻结 JSON Schema；在此之前 Adapter 不得把原始输入直接交给 CLI |
+| 22 | 重试与时限的默认值 | 退避、排队时限 24 小时、单次执行 300 秒是 ART-03A §11 的默认值 | 裁决是否需要按生成器配置 |
+| 23 | 每次迁移之后必须重新执行 `deploy/db-roles.sql` | 已写进脚本头与 README；compose 由 `db-grants` 服务完成，没有自动校验 | 生产部署流水线把"迁移、授权、启动"固化为同一流程 |

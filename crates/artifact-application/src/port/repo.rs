@@ -107,11 +107,27 @@ pub trait ReferenceRepository: Send + Sync {
     ) -> Result<Vec<ArtifactReference>, DomainError>;
 }
 
+/// 取消请求的结果（与数据库受控函数返回一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCancelOutcome {
+    /// queued / retry_wait 的 Job 已直接取消。
+    Cancelled,
+    /// running 的 Job 只登记了取消请求，等待 Worker 确认。
+    CancelRequested,
+    /// Job 已是终态，本次调用没有改变任何状态。
+    Terminal,
+}
+
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     async fn get(&self, scope: (Uuid, Uuid), job_id: Uuid) -> Result<GenerationJob, DomainError>;
-    async fn cancel(&self, scope: (Uuid, Uuid), job_id: Uuid)
-    -> Result<GenerationJob, DomainError>;
+    /// 取消必须经数据库受控函数完成；租户/项目校验在函数内进行，
+    /// scope 不匹配一律按 NotFound 处理，不泄露 Job 是否存在。
+    async fn cancel(
+        &self,
+        scope: (Uuid, Uuid),
+        job_id: Uuid,
+    ) -> Result<(GenerationJob, JobCancelOutcome), DomainError>;
 }
 
 #[async_trait]

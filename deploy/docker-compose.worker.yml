@@ -1,12 +1,13 @@
 # ART-03B-01 — 独立 Worker 服务 override
 #
 # 用法（不修改基础 compose 文件）：
-#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.worker.yml up -d
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.worker.yml up -d --build
 #
 # 约束：
 #   * Worker 是独立进程，使用独立 DB 账号（ARTIFACT_WORKER_DATABASE_URL）；
-#     绝不复用 API 的 ARTIFACT_API_DATABASE_URL / 角色。
-#   * 此切片 Worker 镜像只包含 Rust 协调骨架，不安装 Node、不含 SeeCode vendor。
+#     绝不复用 API 的 ARTIFACT_API_DATABASE_URL / 角色。口令若含 URL 保留字符需要百分号编码。
+#   * 此切片的 Worker 镜像只包含协调维护，不安装 Node、不含 SeeCode vendor，
+#     也不领取任何 Job（没有申报 adapter 能力）。
 #   * 生产隔离（只读根文件系统、无外网、资源配额）属于 ART-03B-03，本文件不伪造完成。
 
 services:
@@ -16,15 +17,15 @@ services:
       dockerfile: Dockerfile.worker
     image: artifact-worker:local
     restart: unless-stopped
+    # 等迁移与授权都完成之后再启动：Worker 角色由 db-grants 创建。
     depends_on:
-      - postgres
+      db-grants:
+        condition: service_completed_successfully
     environment:
       # 必须指向 deploy/db-roles.sql 创建的 __WORKER_ROLE__，不是 API role。
-      ARTIFACT_WORKER_DATABASE_URL: ${ARTIFACT_WORKER_DATABASE_URL:-postgres://artifact_worker:worker_dev@postgres:5432/artifact_service}
+      ARTIFACT_WORKER_DATABASE_URL: postgres://artifact_worker:${ARTIFACT_WORKER_DB_PASSWORD:?set ARTIFACT_WORKER_DB_PASSWORD}@postgres:5432/artifact_service
       ARTIFACT_WORKER_ID: ${ARTIFACT_WORKER_ID:-artifact-worker-1}
-      ARTIFACT_WORKER_LEASE_SECONDS: ${ARTIFACT_WORKER_LEASE_SECONDS:-30}
-      ARTIFACT_WORKER_POLL_INTERVAL_MS: ${ARTIFACT_WORKER_POLL_INTERVAL_MS:-1000}
+      # 协调维护（租约恢复 + 输入清理）的间隔，毫秒，>= 1000。
+      ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS: ${ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS:-10000}
       ARTIFACT_WORKER_LOG: ${ARTIFACT_WORKER_LOG:-info}
       ARTIFACT_WORKER_DB_MAX_CONNECTIONS: ${ARTIFACT_WORKER_DB_MAX_CONNECTIONS:-4}
-    # 本切片：独立进程 + 独立凭据。生产隔离（只读根文件系统/无外网/资源配额）
-    # 属于 ART-03B-03，未在本文件伪造完成。

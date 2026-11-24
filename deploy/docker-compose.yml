@@ -1,11 +1,17 @@
 # Artifact Service 本地部署样例（开发用；非生产配置）。
 # 用法：
 #   export ARTIFACT_APP_DB_PASSWORD=dev-only
+#   export ARTIFACT_WORKER_DB_PASSWORD=dev-worker
 #   docker compose -f deploy/docker-compose.yml up -d --build
+#   需要 Worker 时再叠加 override：-f deploy/docker-compose.worker.yml
+#
+# 启动顺序：postgres → migrate（迁移）→ db-grants（角色与授权）→ api（及 Worker）。
+# 授权必须在迁移之后：initdb 阶段 schema 与受控函数还不存在；迁移若重建函数，
+# 其 EXECUTE 授权也会随旧函数丢失。每次迁移之后重新执行一次授权：
+#   docker compose -f deploy/docker-compose.yml run --rm db-grants
 #
 # 角色分离：postgres 容器以 artifact_migrator（迁移/DDL 角色）初始化；
-# api 容器以 artifact_app（运行角色，仅 DML）连接；迁移由一次性 `migrate`
-# 任务在 api 启动前完成（depends_on: migrate completed）。
+# api 以 artifact_app（运行角色，仅 DML）连接。
 
 name: smark-artifact-service
 
@@ -16,11 +22,8 @@ services:
       POSTGRES_USER: artifact_migrator
       POSTGRES_PASSWORD: artifact_dev_migrator
       POSTGRES_DB: artifact_service
-      ARTIFACT_APP_DB_USER: artifact_app
-      ARTIFACT_APP_DB_PASSWORD: ${ARTIFACT_APP_DB_PASSWORD:?set ARTIFACT_APP_DB_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U artifact_migrator -d artifact_service"]
       interval: 5s
@@ -41,6 +44,28 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # 一次性任务：迁移之后创建运行角色并应用授权（幂等，可重复执行）。
+  db-grants:
+    image: postgres:16
+    entrypoint: ["bash", "/deploy/dev-grants.sh"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: artifact_service
+      PGUSER: artifact_migrator
+      PGPASSWORD: artifact_dev_migrator
+      ARTIFACT_MIGRATOR_DB_USER: artifact_migrator
+      ARTIFACT_APP_DB_USER: artifact_app
+      ARTIFACT_APP_DB_PASSWORD: ${ARTIFACT_APP_DB_PASSWORD:?set ARTIFACT_APP_DB_PASSWORD}
+      ARTIFACT_WORKER_DB_USER: artifact_worker
+      ARTIFACT_WORKER_DB_PASSWORD: ${ARTIFACT_WORKER_DB_PASSWORD:?set ARTIFACT_WORKER_DB_PASSWORD}
+    volumes:
+      - ./db-roles.sql:/deploy/db-roles.sql:ro
+      - ./dev-grants.sh:/deploy/dev-grants.sh:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     build:
       context: ..
@@ -51,7 +76,7 @@ services:
       ARTIFACT_API_DATABASE_URL: postgres://artifact_app:${ARTIFACT_APP_DB_PASSWORD}@postgres:5432/artifact_service
       ARTIFACT_API_LOG: info
     depends_on:
-      migrate:
+      db-grants:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:8110:8110"

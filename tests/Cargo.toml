@@ -58,6 +58,10 @@ name = "worker_coordination"
 path = "tests/worker_coordination.rs"
 
 [[test]]
+name = "generation_api"
+path = "tests/generation_api.rs"
+
+[[test]]
 name = "worker_roles"
 path = "tests/worker_roles.rs"
 

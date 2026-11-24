@@ -146,14 +146,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "artifact-application",
- "artifact-domain",
  "artifact-infrastructure",
- "serde_json",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

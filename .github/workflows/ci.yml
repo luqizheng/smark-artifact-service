@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'docs/**']
   pull_request:
 
 concurrency:
@@ -58,33 +58,48 @@ jobs:
         run: cargo build --release -p artifact-worker
         env:
           ARTIFACT_GIT_SHA: ${{ github.sha }}
-      - name: migration 0001 is immutable (ART-03B-01)
+      - name: released migrations are immutable
         run: |
-          expected=ea8acd4490516a31700005838c18a41cb7ff41e81b62f549cb407f874343a1c8
-          actual=$(sha256sum migrations/0001_init.sql | awk '{print $1}')
-          echo "0001 sha256: $actual"
-          if [ "$actual" != "$expected" ]; then
-            echo "ART-03B-01 forbids modifying the published 0001 migration"
-            exit 1
-          fi
+          # migrations.sha256 列出每个迁移的内容哈希；新增迁移在同一个 PR 里加一行，
+          # 之后该文件不得再修改（测试 migration_guard 用同一份清单再校验一次）。
+          sha256sum -c migrations.sha256
 
   docker-build:
-    name: docker image
+    name: docker images + compose
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build image
+      - name: build images
         run: |
           docker build \
             --build-arg ARTIFACT_GIT_SHA=${{ github.sha }} \
             -t artifact-api:ci .
+          # 与 API 镜像共用 builder 阶段的层缓存。
+          docker build \
+            --build-arg ARTIFACT_GIT_SHA=${{ github.sha }} \
+            -f Dockerfile.worker \
+            -t artifact-worker:ci .
       - name: entrypoint smoke (unknown command exits 1 from the binary, not the shell)
         run: |
           set +e
           docker run --rm artifact-api:ci __no_such_command__
           code=$?
+          docker run --rm artifact-worker:ci __no_such_command__
+          worker_code=$?
           set -e
           if [ "$code" -ne 1 ]; then
             echo "expected exit 1 for unknown command, got $code"
             exit 1
           fi
+          if [ "$worker_code" -ne 1 ]; then
+            echo "expected exit 1 for worker unknown command, got $worker_code"
+            exit 1
+          fi
+      - name: compose files are valid
+        run: |
+          ARTIFACT_APP_DB_PASSWORD=ci ARTIFACT_WORKER_DB_PASSWORD=ci \
+            docker compose -f deploy/docker-compose.yml config -q
+          ARTIFACT_APP_DB_PASSWORD=ci ARTIFACT_WORKER_DB_PASSWORD=ci \
+            docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.worker.yml config -q
+      - name: grant script parses
+        run: bash -n deploy/dev-grants.sh

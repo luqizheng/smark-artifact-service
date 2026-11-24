@@ -264,6 +264,12 @@ P0 未关闭时：生产验证器继续 fail-closed；StoragePort 继续 protoco
 7. Mermaid：后续 migration 删除历史 seed；不修改已发布的 0001 migration。
 
 仍需在实现阶段完成 OpenAPI/JSON Schema 冻结、parser PoC、容器隔离验证与迁移测试。ART-02 两个基础设施 P0 仍然是生产上线门禁。
+
+ART-03B-01 实现并评审后，重试退避、最大执行时长、取消可见性、完成一致性、版本固定与能力匹配、幂等、排队时限等落成了可执行契约，见 `ART-03A-job-worker-svg-decisions-v1.md` §11（A3A-09 至 A3A-22）。其中本节的实施拆分相应调整：
+
+- ART-03B 的"原子 Job claim、lease/heartbeat、取消、超时、崩溃恢复"已由迁移 0002 与 0003 实现并测试；Worker 的领取与执行循环、强杀留在 ART-03B-02。
+- 没有 Adapter 的 Worker 不领取任何 Job；claim 只把 Job 交给申报了相同 adapter 版本的 Worker。
+- §5.2 的超时与重试现在有确定的参数：单次执行时限、重试白名单与退避，见 A3A-10 至 A3A-12。
 ---
 
 **当前结论**：ART-03 的方向是“独立 Worker + SVG-only SeeCode Adapter + 独立安全签收”，不是在 API 进程内直接调用 Node，也不是把 AI-PM Visualization crate 搬进来。本文是设计基线，不表示 ART-03 已实现或 P0 已关闭。

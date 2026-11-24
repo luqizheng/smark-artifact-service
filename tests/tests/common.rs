@@ -3,9 +3,10 @@
 // 测试工具模块整体豁免。
 #![allow(dead_code)]
 
-use artifact_application::DelegationVerifier;
+use artifact_application::{AdapterCapabilities, DelegationVerifier};
 use artifact_domain::{Action, ActorType};
 use artifact_infrastructure::test_support::TestDelegationVerifier;
+use sha2::Digest;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -138,4 +139,215 @@ pub fn pg_error_code(err: &sqlx::Error) -> Option<String> {
         return db.code().map(|c| c.to_string());
     }
     None
+}
+
+/// 数据库错误消息（受控函数用稳定的异常消息表达拒绝原因）。
+pub fn pg_error_message(err: &sqlx::Error) -> String {
+    match err.as_database_error() {
+        Some(db) => db.message().to_string(),
+        None => err.to_string(),
+    }
+}
+
+/// 角色是集群级对象，sqlx::test 清理测试库时不会带走它们。每个建角色的测试结束时
+/// 必须自行删除，否则每运行一次就会在集群里留下一批带随机名的角色。
+pub async fn drop_test_roles(pool: &sqlx::PgPool, roles: &[&str]) {
+    for role in roles {
+        // DROP OWNED 清掉该角色在当前库拥有的对象与获得的授权，否则 DROP ROLE 会被依赖挡住。
+        let _ = sqlx::query(&format!("DROP OWNED BY \"{role}\""))
+            .execute(pool)
+            .await;
+        sqlx::query(&format!("DROP ROLE \"{role}\""))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("test role {role} must be removable: {e}"));
+    }
+}
+
+pub fn sha256_hex(text: &str) -> String {
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 把 seecode 临时注册为可用并带 adapter 版本。生产 seed 是 unavailable；
+/// 这里只在 sqlx::test 为每个测试新建的独立库里生效，不是任何生产绕过开关。
+pub async fn sql_enable_seecode(pool: &sqlx::PgPool, adapter_version: &str) {
+    sqlx::query(
+        "UPDATE artifact.generator_registry \
+         SET status = 'available', version = '0.6.3-test', adapter_version = $1 \
+         WHERE generator_id = 'seecode'",
+    )
+    .bind(adapter_version)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Worker 申报的能力（与 [`sql_enable_seecode`] 对应）。
+pub fn seecode_capabilities(adapter_version: &str) -> AdapterCapabilities {
+    AdapterCapabilities::from([("seecode".to_string(), adapter_version.to_string())])
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JobOptions {
+    pub max_attempts: i32,
+    pub max_execution_seconds: i32,
+    pub queue_ttl_seconds: i32,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            max_execution_seconds: 300,
+            queue_ttl_seconds: 86_400,
+        }
+    }
+}
+
+/// 测试用的最小合法输入信封。
+pub fn minimal_input() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "smark.seecode.input",
+        "schema_version": "1",
+        "diagram": {"type": "architecture", "title": "fixture", "nodes": [], "edges": []}
+    })
+}
+
+/// 直接调用受控函数建一个 queued Job（绕过 API，供协调与 API 测试布景）。
+/// 调用前必须已经 [`sql_enable_seecode`]：生成器不可用时数据库拒绝入队。
+pub async fn sql_create_job(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    project: Uuid,
+    artifact_id: Uuid,
+    options: &JobOptions,
+) -> Uuid {
+    sql_create_job_with(
+        pool,
+        tenant,
+        project,
+        artifact_id,
+        options,
+        None,
+        &sha256_hex("request"),
+    )
+    .await
+    .0
+}
+
+/// 同上，并可指定 Idempotency-Key 与 request hash。返回 (job_id, replayed)。
+pub async fn sql_create_job_with(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    project: Uuid,
+    artifact_id: Uuid,
+    options: &JobOptions,
+    idempotency_key: Option<&str>,
+    request_hash: &str,
+) -> (Uuid, bool) {
+    let requested = Uuid::new_v4();
+    let (created, replayed) = try_sql_create_job_with(
+        pool,
+        requested,
+        tenant,
+        project,
+        artifact_id,
+        options,
+        idempotency_key,
+        request_hash,
+    )
+    .await
+    .unwrap();
+    if !replayed {
+        assert_eq!(
+            created, requested,
+            "a fresh request must create its own job"
+        );
+    }
+    (created, replayed)
+}
+
+/// [`sql_create_job_with`] 的可失败版本：供断言数据库拒绝路径的测试使用。
+#[allow(clippy::too_many_arguments)]
+pub async fn try_sql_create_job_with(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    tenant: Uuid,
+    project: Uuid,
+    artifact_id: Uuid,
+    options: &JobOptions,
+    idempotency_key: Option<&str>,
+    request_hash: &str,
+) -> Result<(Uuid, bool), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM artifact.create_generation_job_with_input \
+         ($1, $2, $3, $4, 'seecode', $5, '{}'::jsonb, '1', $6, $7, $8, $9, $10)",
+    )
+    .bind(job_id)
+    .bind(tenant)
+    .bind(project)
+    .bind(artifact_id)
+    .bind(minimal_input())
+    .bind(request_hash)
+    .bind(idempotency_key)
+    .bind(options.max_attempts)
+    .bind(options.max_execution_seconds)
+    .bind(options.queue_ttl_seconds)
+    .fetch_one(pool)
+    .await
+}
+
+/// 模拟 ART-03D 的输出登记：建一个 READY Version 和一个已通过安全检查的主 Output，
+/// 并把它设为 Job 的目标版本。返回主 Output 的 sha256。
+pub async fn sql_register_ready_output(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    project: Uuid,
+    artifact_id: Uuid,
+    job_id: Uuid,
+) -> String {
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO artifact.artifact_version \
+         (id, tenant_id, project_id, artifact_id, state, generator_id, created_by) \
+         VALUES ($1, $2, $3, $4, 'pending', 'seecode', 'fixture')",
+    )
+    .bind(version_id)
+    .bind(tenant)
+    .bind(project)
+    .bind(artifact_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE artifact.generation_job SET target_version_id = $2 WHERE id = $1")
+        .bind(job_id)
+        .bind(version_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let sha256 = sha256_hex("svg-output");
+    sqlx::query(
+        "INSERT INTO artifact.artifact_output \
+         (id, tenant_id, project_id, artifact_id, version_id, output_role, format, mime_type, \
+          size_bytes, sha256, file_object_id, safety_status) \
+         VALUES ($1, $2, $3, $4, $5, 'primary', 'svg', 'image/svg+xml', 10, $6, 'fixture-object', 'passed')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant)
+    .bind(project)
+    .bind(artifact_id)
+    .bind(version_id)
+    .bind(&sha256)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE artifact.artifact_version SET state = 'ready', ready_at = now() WHERE id = $1",
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sha256
 }

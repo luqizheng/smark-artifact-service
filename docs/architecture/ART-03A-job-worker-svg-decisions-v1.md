@@ -4,6 +4,7 @@
 > 关联：`ART-03-seecode-adapter-design-v1.md`
 > 数据库基线：`migrations/0001_init.sql`
 > 目标：把 ART-03 实施前必须决定的持久化、Attempt、Worker 身份和 SVG 安全边界收敛为可实现契约。
+> 补充：ART-03B-01 评审后的裁决 A3A-09 至 A3A-22 见 §11，它们是迁移 `0003_job_coordination_fixes.sql` 的契约来源。
 
 ## 1. 裁决摘要
 
@@ -19,6 +20,8 @@
 | A3A-08 | Mermaid | 从 generator_registry 种子和后续能力清单中移除；历史 migration 不改写，使用新 migration 删除 seed 行 |
 
 这些裁决不会关闭 LMMS 授权委托 P0 或 File Service upload-intent/finalize P0。
+
+A3A-03 至 A3A-05 在实现时暴露出未落到可执行契约的地方，补充裁决见 §11。
 
 ## 2. A3A-01 — GenerationJob 输入持久化
 
@@ -223,17 +226,51 @@ Job succeeded、Attempt succeeded、Version READY、Output safety_status=passed 
 
 ## 10. ART-03A 验收门槛
 
-- [ ] OpenAPI/JSON Schema 对 input/options 完整定义并版本化。
-- [ ] 请求体、深度、节点、边、文本和总字节上限均有测试。
-- [ ] Job 与 input/options 在同一 DB transaction 创建。
-- [ ] 输入不出现在普通查询、日志、trace、error_message、audit_event。
-- [ ] 终态保留 7 天后清理输入，保留 hash/版本元数据。
-- [ ] 多 Worker 并发 claim 不会重复执行同一有效 Attempt。
-- [ ] lease 过期、迟到 heartbeat/complete、取消竞争、Worker 崩溃均有集成测试。
-- [ ] Worker DB role 不能任意读写业务表。
-- [ ] Worker 不接收用户 delegation，不持有长期对象存储凭据。
+勾选项均由 `tests/` 中的自动化测试覆盖。
+
+- [ ] OpenAPI/JSON Schema 对 input/options 完整定义并版本化。（过渡形态见 A3A-22：信封层 allowlist 已实现，逐字段 schema 未冻结）
+- [x] 请求体、深度、节点、边、文本和总字节上限均有测试。
+- [ ] Job 与 input/options 在同一 DB transaction 创建。（受控函数已实现并测试；API 创建路径未开放）
+- [x] 输入不出现在普通查询、日志、trace、error_message、audit_event。
+- [x] 终态保留 7 天后清理输入，保留 hash/版本元数据。
+- [x] 多 Worker 并发 claim 不会重复执行同一有效 Attempt。
+- [x] lease 过期、迟到 heartbeat/complete、取消竞争、Worker 崩溃均有集成测试。
+- [x] Worker DB role 不能任意读写业务表。
+- [x] Worker 不接收用户 delegation，不持有长期对象存储凭据。
 - [ ] SVG 采用 parser + allowlist rebuild；正反向 fixture 覆盖完整。
-- [ ] Mermaid seed 在新 migration 删除；README/OpenAPI/测试不再声称服务支持 Mermaid。
+- [x] Mermaid seed 在新 migration 删除；README/OpenAPI/测试不再声称服务支持 Mermaid。
 - [ ] LMMS delegation P0 与 File Service upload/finalize P0 仍保持独立上线门禁。
+
+## 11. ART-03B-01 评审后的补充裁决（迁移 0003）
+
+ART-03B-01（迁移 0002）评审发现 §3 至 §5 的部分裁决没有落到可实现的契约上，并暴露出若干缺陷。迁移 `0003_job_coordination_fixes.sql` 取代了 0002 的全部协调函数；0001、0002 不改写，内容哈希由 `migrations.sha256` 锁定。
+
+| ID | 主题 | 裁决 |
+|---|---|---|
+| A3A-09 | 租约参数 | `lease_seconds` 必填且在 1..3600；活跃 Attempt 的 `lease_expires_at` 必须非空（数据库 CHECK）。0002 对 NULL 的放行会产生永久 running、既不能恢复也不能取消的 Job |
+| A3A-10 | 重试退避 | `retry_wait` 的 Job 在 `next_attempt_at` 之前不会被领取。第 n 次失败后的等待为 min(5s × 2^(n−1), 300s) × [0.8, 1.2)；等不到的下一次重试直接终结 |
+| A3A-11 | 重试白名单 | 只有 `GENERATION_TIMEOUT` 与 `STORAGE_UNAVAILABLE` 可重试；Worker 自报的 `retryable` 不能扩大范围。租约过期（Worker 失联）按 attempt 上限重试 |
+| A3A-12 | 最大执行时长 | 每个 Attempt 的 `deadline_at = started_at + max_execution_seconds`（Job 创建时固定，1..3600 秒，默认 300）。租约不会超过 deadline；超过后 heartbeat 不再续租，Attempt 按 `timed_out` 收尾 |
+| A3A-13 | 取消可见性 | heartbeat 返回 `renewed / cancel_requested / deadline_exceeded / stale`；fail 与 complete 返回 `cancel_requested`。取消属于控制流，用返回值表达，不用异常；取消检查在租约校验之后，错误 token 一律 `stale` |
+| A3A-14 | 完成一致性 | Job 只有在目标 Version 已是 READY、且存在 `safety_status=passed` 的主 Output、其 sha256 与上报一致时才能 `succeeded`。输出登记（Output 与 Version pending → ready）由 ART-03D 在同一事务内先行完成，随后调用 complete |
+| A3A-15 | 版本固定与能力匹配 | Job 创建时从注册表固定 `generator_version` 与 `adapter_version`。`claim_generation_job(worker_id, lease_seconds, adapter_versions)` 只把 Job 交给申报了相同 adapter 版本的 Worker；没有申报能力的 Worker 领不到任何 Job。没有注册 `adapter_version` 的生成器，其 Job 不可领取 |
+| A3A-16 | 幂等与输入指纹 | `(tenant_id, project_id, idempotency_key)` 部分唯一索引。同 key 同 request hash 返回原 Job，不同 request hash 报 `IDEMPOTENCY_KEY_REUSED`。`input_sha256` 由数据库计算（schema 版本加 JSONB 规范文本），调用方不再自报 |
+| A3A-17 | 排队时限 | `expires_at`（默认 24 小时，1 秒至 7 天）。超过时限仍未被领取的 Job 以 `cancelled / QUEUE_EXPIRED` 收尾。生成器不可用时拒绝入队 |
+| A3A-18 | 错误码 | 形式固定为 `^[A-Z][A-Z0-9_]{0,63}$`。系统错误码：`CANCELLED`、`QUEUE_EXPIRED`、`MAX_ATTEMPTS_EXCEEDED`、`LEASE_EXPIRED`、`GENERATION_TIMEOUT`。Attempt 以 `timed_out` 或 `lease_expired` 收尾时，Job 的终态为 `timed_out` |
+| A3A-19 | 审计 | 受控函数内部写 `audit_event`（`generation.retry / fail / timeout / complete / cancelled / expired`，`actor_type=service`）。Worker 角色没有审计表写权限，审计只能在 `SECURITY DEFINER` 函数内完成；detail 不含输入正文 |
+| A3A-20 | 取消的 scope 校验 | `request_generation_job_cancel(tenant_id, project_id, job_id)` 在函数内校验 scope；不匹配一律 `not_found` |
+| A3A-21 | 领取性能与恢复扫描 | claim 分两步：先按 (generator, adapter) 取有序窗口（只走部分索引 `idx_generation_job_claimable`），再按主键加锁复核。恢复扫描用 advisory lock 保证同一时刻只有一个扫描器推进，每轮处理的数量有上限 |
+| A3A-22 | 输入校验（过渡） | 信封层是 allowlist：顶层字段、`schema = smark.seecode.input`、`schema_version = 1`、`diagram` 必填。其余只有结构上限、危险字段名与 URL 形态的值拦截；逐字段的 allowlist 等输入 schema 冻结后确定 |
+
+对原裁决的修订：
+
+- A3A-03 列出的 `claimed` 状态仍然没有任何函数产生；claim 直接创建 `running` 的 Attempt。
+- A3A-02 的各上限互相独立：500 节点与 2000 边同时取满时，元素字段较多会先触达 256 KiB 的请求体上限。
+- A3A-04 §4.1 的"已到期的 retry_wait"由 `next_attempt_at` 落实，§4.2 的续租上限由 `deadline_at` 落实。
+- ART-03B-01 的 Worker 构建不含任何 Adapter，因此 `run` 只做协调维护（租约恢复与输入清理），不领取 Job。领取与执行循环属于 ART-03B-02。
+
+API 契约的配套增量待 ART-01 errata 确认，均为新增字段或响应码：`GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；`requestGeneration` 文档化 409 与 413。
+
+部署顺序固定为：迁移，然后执行 `deploy/db-roles.sql`，再启动服务。迁移若重建函数，其 EXECUTE 授权随旧函数丢失，所以每次迁移之后都必须重新执行授权脚本。
 
 **裁决结论**：采用 PostgreSQL 有界 JSONB 作为 Job 输入快照，独立 Attempt + lease 作为可恢复执行模型，受控 DB 函数作为 Worker 权限边界，独立服务身份访问 File Service，SVG 使用 allowlist parse-and-rebuild。此设计允许 ART-03 后续并行实现 Worker 和 Adapter，但不允许绕过两个基础设施 P0 进入生产。
