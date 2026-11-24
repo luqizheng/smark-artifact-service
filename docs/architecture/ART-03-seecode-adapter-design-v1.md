@@ -1,6 +1,6 @@
 # ART-03 — SeeCode Generator Adapter 设计基线
 
-> 状态：设计基线（待项目负责人确认后实施）
+> 状态：架构基线；ART-03A 的输入持久化、Attempt/Lease、Worker 身份和 SVG 安全裁决见 `ART-03A-job-worker-svg-decisions-v1.md`。
 > 目标仓库：`luqizheng/smark-artifact-service`
 > 基线提交：`561ee7981cb6f7a9ea743ae983e126f3d411851f`
 > 上游实现来源：AI-PM `tools/seecode/` 与既有 Visualization SeeCode 集成
@@ -126,7 +126,7 @@ Artifact Service 不接受 AI-PM Rust 类型、数据库行或内部 JSON 结构
 - AI-PM 专属的节点类型、状态、关系、焦点裁剪和来源映射由 AI-PM 编译层完成；Artifact Service 只验证通用 SeeCode 输入契约。
 - 超限输入明确拒绝；不得静默丢弃节点/边。若业务方需要聚焦裁剪，应由 AI-PM 编译层显式完成并记录 warnings/provenance。
 
-**实施前置决策**：Generation Job 输入的持久化方式需要结合现有 ART-01 表结构和 File Service P0 再定稿。不能只把请求体留在 API 进程内存，也不能在 File Service 协议未完成时假装具备可靠持久化。评估方案时必须明确输入大小上限、敏感数据保留、重试可重放和删除策略。
+**已裁决**：输入以有界 PostgreSQL JSONB 快照持久化，Job 与输入同事务提交；具体上限、保留与清理策略见 `ART-03A-job-worker-svg-decisions-v1.md`。此方案不依赖 File Service P0。
 
 ## 5. Worker 与 Job 生命周期
 
@@ -251,18 +251,19 @@ P0 未关闭时：生产验证器继续 fail-closed；StoragePort 继续 protoco
 
 验收：完整端到端 Job → SVG → 安全检查 → File Service → READY Version；两个 P0 未关闭时仅允许测试环境验证，不允许生产流量。
 
-## 11. 本轮必须先解决的设计问题
+## 11. ART-03A 设计裁决状态
 
-实现前不得跳过以下设计审查：
+七项设计问题已形成推荐裁决，详见 `ART-03A-job-worker-svg-decisions-v1.md`：
 
-1. **输入持久化**：GenerationJob 当前表没有持久化 `input/options` 字段；需要决定结构化 JSONB、File Service 对象，或受控混合方案，并说明敏感数据保留与清理。
-2. **Job attempt 模型**：当前表只有 attempt_count，没有 attempt 明细；需决定增加 attempt 表还是可证明恢复正确性的最小模型。
-3. **Worker 身份**：Worker 如何 claim/heartbeat/complete Job，如何获得 File Service 最小服务身份，且不继承用户 delegation。
-4. **安全解析器**：选择成熟 SVG/XML parser 与 sanitizer 策略，不能将上游 AI-PM 安全模块未经审计照搬。
-5. **路径安全**：SeeCode CLI 输出路径必须被限制在本次 attempt 工作目录内。
-6. **零外网证明**：CI 中的单元测试不能代替容器/运行环境的网络隔离验证。
-7. **Generator 注册状态**：移除 Mermaid seed；SeeCode 仅在 Worker、依赖、配置和安全自检均通过后报告 available，否则保持 unavailable。
+1. 输入持久化：有界 PostgreSQL JSONB，Job 与输入同事务提交；终态 7 天后清理输入正文，保留 hash 和版本元数据。
+2. Attempt：新增独立 `generation_job_attempt`，Job 保留汇总 attempt_count。
+3. Worker：数据库原子 claim + lease/heartbeat；受控 DB 函数；独立最小权限 DB role。
+4. File Service：Worker 使用独立短时服务身份，不接收用户 delegation，不持有长期 S3/RustFS 凭据。
+5. SVG：XML parser + allowlist rebuild；具体 parser crate 在 PoC 和真实 SeeCode fixture 验证后锁定。
+6. 沙箱：工作目录路径约束、无外网和资源限额必须通过容器级测试证明。
+7. Mermaid：后续 migration 删除历史 seed；不修改已发布的 0001 migration。
 
+仍需在实现阶段完成 OpenAPI/JSON Schema 冻结、parser PoC、容器隔离验证与迁移测试。ART-02 两个基础设施 P0 仍然是生产上线门禁。
 ---
 
 **当前结论**：ART-03 的方向是“独立 Worker + SVG-only SeeCode Adapter + 独立安全签收”，不是在 API 进程内直接调用 Node，也不是把 AI-PM Visualization crate 搬进来。本文是设计基线，不表示 ART-03 已实现或 P0 已关闭。
