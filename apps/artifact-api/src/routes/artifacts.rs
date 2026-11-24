@@ -53,6 +53,45 @@ where
     }
 }
 
+/// 生成请求专用提取器：body 上限 256 KiB（ART-03A A3A-02），超限返回 413。
+/// 只保留原始字节数与解析后的 JSON；输入正文不进入日志/trace。
+pub struct ValidGenerationJson<T> {
+    pub value: T,
+    pub envelope_bytes: usize,
+}
+
+impl<S, T> FromRequest<S> for ValidGenerationJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::to_bytes(req.into_body(), artifact_application::MAX_ENVELOPE_BYTES)
+            .await
+            .map_err(|_| {
+                error_response(
+                    None,
+                    ErrorEnvelope::new(
+                        "PAYLOAD_TOO_LARGE",
+                        "generation input envelope exceeds 256 KiB",
+                        None,
+                        false,
+                        serde_json::Value::Null,
+                    ),
+                )
+            })?;
+        let envelope_bytes = bytes.len();
+        let value: T = serde_json::from_slice(&bytes)
+            .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
+        Ok(Self {
+            value,
+            envelope_bytes,
+        })
+    }
+}
+
 /// 查询参数（解析失败 → 400 INVALID_REQUEST 信封）。
 pub struct ValidQuery<T> {
     pub value: T,
@@ -422,9 +461,26 @@ pub async fn request_generation(
     req: Scoped,
     Path(artifact_id): Path<String>,
     _headers: HeaderMap,
-    body: ValidJson<CreateGenerationJobRequest>,
+    body: ValidGenerationJson<CreateGenerationJobRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
+
+    // 服务端输入校验（A3A-02）：大小、深度、节点/边、文本与禁用字段。
+    // 校验错误只返回稳定码与字段路径，绝不回显输入正文。
+    artifact_application::validate_job_input_envelope(
+        body.envelope_bytes,
+        &body.value.input,
+        body.value.options.as_ref(),
+    )
+    .map_err(|e| {
+        let detail = format!("{}: {}", e.code, e.field);
+        if e.code == "INPUT_TOO_LARGE" {
+            ApiError::from(DomainError::PayloadTooLarge(detail))
+        } else {
+            ApiError::from(DomainError::InvalidRequest(detail))
+        }
+    })?;
+
     match state
         .artifacts
         .request_generation(

@@ -32,9 +32,10 @@ async fn generators_report_unavailable_adapters(pool: sqlx::PgPool) {
     let client = ArtifactClient::new(ArtifactClientConfig::new(&base)).unwrap();
     let generators = client.generators().await.unwrap();
     let ids: Vec<_> = generators.iter().map(|g| g.generator_id.as_str()).collect();
-    assert!(ids.contains(&"mermaid") && ids.contains(&"seecode"));
+    // ART-03A A3A-08：Mermaid seed 由 0002 后续 migration 删除，仅在 seecode 保留。
+    assert_eq!(ids, vec!["seecode"]);
     for generator in &generators {
-        // ART-02 事实：两个 Adapter 均未实现，禁止上报 available。
+        // Adapter 未实现，禁止上报 available。
         assert_eq!(
             generator.status, "unavailable",
             "{}",

@@ -1,6 +1,6 @@
 //! PostgreSQL 仓储实现（schema `artifact`）。
 //!
-//! 不变量由 migration 0001 的约束与触发器强制；本层负责范围限定查询、
+//! 不变量由 migration 0001/0002 的约束与触发器强制；本层负责范围限定查询、
 //! 乐观并发（row_revision / ETag）与错误码映射。所有查询显式携带
 //! tenant_id/project_id，杜绝跨租户读取。
 
@@ -18,6 +18,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+pub mod worker;
+
+pub use worker::PgWorkerCoordination;
 
 // ── 行类型 ──────────────────────────────────────────────────────────────
 
@@ -641,28 +645,29 @@ impl JobRepository for PgJobRepository {
         scope: (Uuid, Uuid),
         job_id: Uuid,
     ) -> Result<GenerationJob, DomainError> {
-        // 尽力而为取消：终态 Job 原样返回（ART-01 §8.2）。
-        let sql = "UPDATE artifact.generation_job \
-             SET status = 'cancelled', completed_at = now(), \
-                 error_code = COALESCE(error_code, 'cancelled_by_request') \
-             WHERE id = $1 AND tenant_id = $2 AND project_id = $3 \
-               AND status IN ('queued', 'running', 'retry_wait') \
-             RETURNING id, tenant_id, project_id, artifact_id, generator_id, generator_version, \
-               adapter_version, status, attempt_count, created_at";
-        let updated: Option<JobRow> = sqlx::query_as(sql)
-            .bind(job_id)
-            .bind(scope.0)
-            .bind(scope.1)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| match trigger_message(&e) {
-                Some(msg) => DomainError::VersionConflict(msg),
-                None => map_db_error(e, "cancel job"),
-            })?;
-        match updated {
-            Some(row) => row.try_into(),
-            None => self.get(scope, job_id).await,
+        // ART-03B-01：取消统一走受控函数，避免两个权威来源。
+        // queued/retry_wait → 直接 cancelled；running → 只登记 cancel_requested_at，
+        // 不伪造 Worker 已停止（Worker 确认后由 confirm 函数置终态）。
+        // 函数以 SECURITY DEFINER 执行；scope 校验放在函数调用前，防止跨租户取消。
+        let scoped: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifact.generation_job \
+             WHERE id = $1 AND tenant_id = $2 AND project_id = $3",
+        )
+        .bind(job_id)
+        .bind(scope.0)
+        .bind(scope.1)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(e, "cancel job scope check"))?;
+        if scoped.is_none() {
+            return Err(DomainError::NotFound);
         }
+        let _: String = sqlx::query_scalar("SELECT artifact.request_generation_job_cancel($1)")
+            .bind(job_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| map_db_error(e, "request generation job cancel"))?;
+        self.get(scope, job_id).await
     }
 }
 

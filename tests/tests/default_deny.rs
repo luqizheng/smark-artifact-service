@@ -51,7 +51,7 @@ async fn all_business_endpoints_denied_without_credentials(pool: sqlx::PgPool) {
         (
             reqwest::Method::POST,
             format!("/v1/artifacts/{}/generation-jobs", uuid::Uuid::new_v4()),
-            Some(json!({"generator_id": "mermaid", "input": {}})),
+            Some(json!({"generator_id": "seecode", "input": {}})),
         ),
         (
             reqwest::Method::GET,

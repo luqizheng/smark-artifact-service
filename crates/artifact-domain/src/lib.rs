@@ -6,6 +6,7 @@
 
 pub mod action;
 pub mod artifact;
+pub mod attempt;
 pub mod audit;
 pub mod error;
 pub mod generator;
@@ -17,6 +18,7 @@ pub mod version;
 
 pub use action::{Action, Delegation};
 pub use artifact::{Artifact, ArtifactType, LifecycleState};
+pub use attempt::{AttemptState, ClaimedJob, GenerationJobAttempt};
 pub use audit::{AuditEvent, AuditOutcome};
 pub use error::DomainError;
 pub use generator::{GeneratorDescriptor, GeneratorStatus};
