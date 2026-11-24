@@ -135,7 +135,8 @@
   - fmt：https://github.com/luqizheng/smark-artifact-service/actions/runs/45429394570/job/138570160730
   - clippy + build + test (postgres 16)：https://github.com/luqizheng/smark-artifact-service/actions/runs/45429394570/job/138570161142
   - docker image：https://github.com/luqizheng/smark-artifact-service/actions/runs/45429394570/job/138570160349
-- 本地等价命令与结果见 §7；所有 CI 步骤均在本地以相同命令真实跑过。CI 最终结果以链接为准。
+- **CI 最终结果：3/3 job 全部 success**（fmt ✅ / clippy + build + test (postgres 16) ✅ / docker image ✅；run conclusion=`success`，2026-11-24 验证）。
+- 本地等价命令与结果见 §7；所有 CI 步骤均在本地以相同命令真实跑过。
 
 ## 9. 与 ART-03A 设计裁决的偏差
 
