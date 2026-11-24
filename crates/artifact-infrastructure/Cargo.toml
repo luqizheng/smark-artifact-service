@@ -1,0 +1,25 @@
+[package]
+name = "artifact-infrastructure"
+description = "Artifact Service infrastructure: PostgreSQL repositories, delegation verifiers, storage port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+# 仅测试编译：提供 TestDelegationVerifier（静态令牌表）。
+# 发布二进制（cargo build --release）不启用该 feature，不包含任何测试替身。
+test-doubles = []
+
+[dependencies]
+artifact-domain = { workspace = true }
+artifact-application = { workspace = true }
+artifact-contract = { workspace = true }
+sqlx = { workspace = true }
+async-trait = "0.1"
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }

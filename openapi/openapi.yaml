@@ -1,0 +1,732 @@
+openapi: 3.1.0
+info:
+  title: SMARK Artifact Service API
+  version: 1.0.0-art02
+  description: |
+    独立 Artifact Service 的 V1 API（契约基线 = AI-PM ART-01 V1.0）。
+
+    ART-02 实施状态（与 docs/implementation/artifact-service/ART-02-API-STATUS.md 一致）：
+    - `已实现`：health、ready、generators、Artifact 元数据 CRUD、References、
+      GenerationJob 查询/取消。
+    - `被 P0 阻断`：Version 上传会话与 commit（file-service 上传/finalize 协议缺失）。
+    - `未实现`：GenerationJob 创建（Generator Adapter 未实现 → 503 GENERATOR_UNAVAILABLE）。
+
+    授权：业务端点要求 `Authorization: Bearer <短时项目/动作范围委托凭证>`；
+    当前生产验证器 fail-closed（P0 关闭前一切业务请求 401/403），详见安全状态文档。
+servers:
+  - url: http://127.0.0.1:8110
+    description: local dev
+tags:
+  - name: meta
+    description: 健康/就绪/元信息
+  - name: generators
+    description: Generator 注册表
+  - name: artifacts
+    description: Artifact 元数据与版本
+  - name: references
+    description: 外部业务引用
+  - name: generation
+    description: 生成任务
+security:
+  - bearerDelegation: []
+
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      tags: [meta]
+      security: []
+      summary: 进程存活检查（不探测外部依赖）
+      responses:
+        "200":
+          description: 进程存活
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /v1/ready:
+    get:
+      operationId: getReady
+      tags: [meta]
+      security: []
+      summary: 依赖就绪检查
+      description: 数据库可达即 ready；file_storage 组件如实上报 protocol_blocked_p0。
+      responses:
+        "200":
+          description: 就绪
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ready" }
+        "503":
+          description: 未就绪（同一 schema，status=not_ready）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ready" }
+
+  /v1/generators:
+    get:
+      operationId: listGenerators
+      tags: [generators]
+      security: []
+      summary: 查询 Generator 注册表（未实现 Adapter 如实上报 unavailable）
+      responses:
+        "200":
+          description: Generator 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [generators]
+                properties:
+                  generators:
+                    type: array
+                    items: { $ref: "#/components/schemas/Generator" }
+
+  /v1/artifacts:
+    post:
+      operationId: createArtifact
+      tags: [artifacts]
+      summary: 创建逻辑 Artifact（支持 Idempotency-Key）
+      parameters:
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateArtifactRequest" }
+      responses:
+        "201":
+          description: 创建成功（ETag 头返回并发锚）
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artifact" }
+        "200":
+          description: "幂等重放（X-Idempotent-Replay: true）"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artifact" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+    get:
+      operationId: listArtifacts
+      tags: [artifacts]
+      summary: 按项目分页查询 Artifact（cursor 分页）
+      parameters:
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+        - name: artifact_type
+          in: query
+          schema: { type: string }
+        - name: lifecycle_state
+          in: query
+          schema: { type: string, enum: [active, archived, deleted] }
+      responses:
+        "200":
+          description: 分页结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArtifactPage" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}:
+    get:
+      operationId: getArtifact
+      tags: [artifacts]
+      summary: 查询 Artifact 元数据与当前版本指针
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: 元数据（ETag 头）
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artifact" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      operationId: patchArtifact
+      tags: [artifacts]
+      summary: 修改非版本元数据（If-Match 乐观并发）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+        - { $ref: "#/components/parameters/IfMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateArtifactRequest" }
+      responses:
+        "200":
+          description: 已更新（新 ETag）
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artifact" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/versions:
+    post:
+      operationId: createVersionSession
+      tags: [artifacts]
+      summary: 创建上传版本会话（P0 阻断：file-service 协议缺失 → 503）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateVersionSessionRequest" }
+      responses:
+        "201":
+          description: （未实现，P0 关闭前不可达）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArtifactVersion" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503":
+          description: STORAGE_UNAVAILABLE（阻断原因见 details）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      operationId: listVersions
+      tags: [artifacts]
+      summary: 列出版本（version_number 降序）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: 版本列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionPage" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/versions/{version_id}:
+    get:
+      operationId: getVersion
+      tags: [artifacts]
+      summary: 查询版本
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/VersionId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: 版本详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArtifactVersion" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/versions/{version_id}/commit:
+    post:
+      operationId: commitVersion
+      tags: [artifacts]
+      summary: 完成上传校验并提交 Version（P0 阻断 → 503）
+      description: |
+        提交协议要求：通过 file-service 读取可信元数据并校验 hash/大小/MIME，
+        与 ArtifactOutput 写入、current_version_id 切换在同一事务完成。
+        该协议当前被存储 P0 阻断，本端点诚实返回 503，不伪造成功。
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/VersionId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: （未实现，P0 关闭前不可达）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArtifactVersion" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503":
+          description: STORAGE_UNAVAILABLE
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/artifacts/{artifact_id}/current-version:
+    post:
+      operationId: setCurrentVersion
+      tags: [artifacts]
+      summary: 切换当前版本指针（只能指向 READY 版本；乐观并发）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetCurrentVersionRequest" }
+      responses:
+        "200":
+          description: 已切换（新 ETag）
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artifact" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/references:
+    post:
+      operationId: createReference
+      tags: [references]
+      summary: 建立外部业务引用（同引用重复创建返回既有记录）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateReferenceRequest" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reference" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    get:
+      operationId: listReferences
+      tags: [references]
+      summary: 列出有效引用
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: 引用列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReferencePage" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/references/{reference_id}:
+    delete:
+      operationId: removeReference
+      tags: [references]
+      summary: 解除引用（软删除）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ReferenceId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "204": { description: 已解除 }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/artifacts/{artifact_id}/generation-jobs:
+    post:
+      operationId: requestGeneration
+      tags: [generation]
+      summary: 请求生成（Adapter 未实现 → 503 GENERATOR_UNAVAILABLE）
+      parameters:
+        - { $ref: "#/components/parameters/ArtifactId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateGenerationJobRequest" }
+      responses:
+        "202":
+          description: （未实现，Adapter 落地前不可达）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationJob" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503":
+          description: GENERATOR_UNAVAILABLE（Mermaid/SeeCode Adapter 均未实现）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/generation-jobs/{job_id}:
+    get:
+      operationId: getJob
+      tags: [generation]
+      summary: 查询 Job 状态
+      parameters:
+        - { $ref: "#/components/parameters/JobId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: Job 状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationJob" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/generation-jobs/{job_id}/cancel:
+    post:
+      operationId: cancelJob
+      tags: [generation]
+      summary: 取消 Job（尽力而为；终态 Job 原样返回）
+      parameters:
+        - { $ref: "#/components/parameters/JobId" }
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: 当前 Job 状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationJob" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearerDelegation:
+      type: http
+      scheme: bearer
+      bearerFormat: delegation-jwt
+      description: |
+        短时、audience 固定、project/action scoped 的委托凭证（ART-01 §5.2）。
+        ART-02 期间生产验证器 fail-closed：P0（resource token 未鉴权挂载、
+        claims 缺 aud/tid）关闭前一切业务请求返回 401 UNAUTHENTICATED。
+
+  headers:
+    ETag:
+      description: 并发锚，格式 "r<row_revision>"；更新请求以 If-Match 回传。
+      schema: { type: string, example: '"r3"' }
+
+  parameters:
+    ArtifactId:
+      name: artifact_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    VersionId:
+      name: version_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ReferenceId:
+      name: reference_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProjectIdHeader:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: 资源定位输入；必须与委托凭证 project 范围一致，否则 403。
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: 创建类写请求幂等键；保留 ≥24h；同 key 不同请求体 → 409。
+      schema: { type: string, minLength: 1 }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Artifact ETag（如 "r3"）；不匹配 → 409 VERSION_CONFLICT。
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: 统一错误信封
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+              description: 稳定错误码（ART-01 §8.1）
+              enum:
+                - INVALID_REQUEST
+                - UNAUTHENTICATED
+                - SCOPE_DENIED
+                - RESOURCE_NOT_FOUND
+                - VERSION_CONFLICT
+                - IDEMPOTENCY_KEY_REUSED
+                - PAYLOAD_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - GENERATOR_VALIDATION_FAILED
+                - RATE_LIMITED
+                - STORAGE_UNAVAILABLE
+                - GENERATOR_UNAVAILABLE
+                - GENERATION_TIMEOUT
+                - INTERNAL_ERROR
+            message: { type: string }
+            request_id: { type: [string, "null"] }
+            retryable: { type: boolean }
+            details:
+              type: object
+              additionalProperties: true
+
+    Health:
+      type: object
+      required: [status, service, version, git_sha, built_at]
+      properties:
+        status: { type: string }
+        service: { type: string }
+        version: { type: string }
+        git_sha: { type: string }
+        built_at: { type: string }
+
+    Ready:
+      type: object
+      required: [status, components, version]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        components:
+          type: object
+          required: [database, file_storage]
+          properties:
+            database: { type: string }
+            file_storage: { type: string }
+        version: { type: string }
+
+    Generator:
+      type: object
+      required: [generator_id, display_name, version, status]
+      properties:
+        generator_id: { type: string }
+        display_name: { type: string }
+        version: { type: string }
+        adapter_version: { type: [string, "null"] }
+        supported_input_formats: { type: array, items: { type: string } }
+        supported_output_formats: { type: array, items: { type: string } }
+        capabilities: { type: object }
+        status: { type: string, enum: [available, unavailable, disabled] }
+        status_reason: { type: [string, "null"] }
+
+    CreateArtifactRequest:
+      type: object
+      required: [project_id, name, artifact_type]
+      properties:
+        project_id: { type: string, format: uuid }
+        name: { type: string, minLength: 1 }
+        artifact_type:
+          type: string
+          enum: [document, report, image, diagram, visualization, presentation, dataset, media, file]
+        artifact_key: { type: string }
+        description: { type: string }
+        category: { type: string }
+
+    UpdateArtifactRequest:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        category: { type: string }
+
+    Artifact:
+      type: object
+      required:
+        [id, tenant_id, project_id, name, artifact_type, lifecycle_state,
+         current_version_id, created_by, created_at, updated_at, etag]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        project_id: { type: string, format: uuid }
+        artifact_key: { type: [string, "null"] }
+        name: { type: string }
+        description: { type: [string, "null"] }
+        artifact_type: { type: string }
+        category: { type: [string, "null"] }
+        lifecycle_state: { type: string, enum: [active, archived, deleted] }
+        current_version_id: { type: [string, "null"], format: uuid }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: [string, "null"], format: date-time }
+        etag: { type: string, example: '"r1"' }
+
+    ArtifactPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Artifact" } }
+        next_cursor: { type: [string, "null"] }
+
+    CreateVersionSessionRequest:
+      type: object
+      properties:
+        source_format: { type: string }
+        source_object_id: { type: string }
+        source_sha256: { type: string }
+
+    ArtifactVersion:
+      type: object
+      required: [id, artifact_id, version_number, state, manifest, created_by, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        artifact_id: { type: string, format: uuid }
+        version_number: { type: integer, minimum: 1 }
+        state: { type: string, enum: [pending, ready, failed, quarantined] }
+        source_format: { type: [string, "null"] }
+        source_object_id: { type: [string, "null"] }
+        source_sha256: { type: [string, "null"] }
+        generator_id: { type: [string, "null"] }
+        generator_version: { type: [string, "null"] }
+        adapter_version: { type: [string, "null"] }
+        manifest: { type: object }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        ready_at: { type: [string, "null"], format: date-time }
+        failure_code: { type: [string, "null"] }
+
+    VersionPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/ArtifactVersion" } }
+        next_cursor: { type: [string, "null"] }
+
+    ArtifactOutput:
+      type: object
+      required: [id, version_id, output_role, format, mime_type, size_bytes, sha256, file_object_id, safety_status]
+      properties:
+        id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        output_role: { type: string, enum: [primary, preview, attachment, source-map] }
+        format: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer, minimum: 0 }
+        sha256: { type: string }
+        file_object_id: { type: string }
+        safety_status: { type: string, enum: [pending, passed, rejected] }
+        created_at: { type: string, format: date-time }
+
+    CreateReferenceRequest:
+      type: object
+      required: [owner_type, owner_id, relation_type]
+      properties:
+        owner_type:
+          type: string
+          enum: [requirement, design, adr, task, knowledge, project]
+        owner_id: { type: string, minLength: 1 }
+        relation_type:
+          type: string
+          enum: [generated_from, illustrates, supports, references, evidence_for, delivered_by]
+
+    Reference:
+      type: object
+      required: [id, artifact_id, owner_type, owner_id, relation_type, created_by, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        artifact_id: { type: string, format: uuid }
+        owner_type: { type: string }
+        owner_id: { type: string }
+        relation_type: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ReferencePage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Reference" } }
+        next_cursor: { type: [string, "null"] }
+
+    SetCurrentVersionRequest:
+      type: object
+      required: [version_id]
+      properties:
+        version_id: { type: string, format: uuid }
+        expected_current_version_id:
+          type: [string, "null"]
+          format: uuid
+          description: 乐观并发；与当前指针不一致 → 409 VERSION_CONFLICT。
+
+    CreateGenerationJobRequest:
+      type: object
+      required: [generator_id, input]
+      properties:
+        generator_id: { type: string }
+        input: { type: object }
+        options: { type: object }
+        expected_current_version_id: { type: [string, "null"], format: uuid }
+
+    GenerationJob:
+      type: object
+      required: [id, artifact_id, generator_id, status, created_at, poll_url]
+      properties:
+        id: { type: string, format: uuid }
+        artifact_id: { type: string, format: uuid }
+        generator_id: { type: string }
+        status:
+          type: string
+          enum: [queued, running, retry_wait, succeeded, failed, cancelled, timed_out]
+        created_at: { type: string, format: date-time }
+        poll_url: { type: string }

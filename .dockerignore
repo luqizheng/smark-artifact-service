@@ -1,0 +1,6 @@
+target
+.git
+.env
+*.local.env
+docs
+coverage

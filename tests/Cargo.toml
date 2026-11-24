@@ -1,0 +1,53 @@
+[package]
+name = "artifact-integration-tests"
+description = "Artifact Service integration / contract / boundary / invariant tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+artifact-api = { path = "../apps/artifact-api" }
+artifact-client = { workspace = true }
+artifact-contract = { workspace = true }
+artifact-application = { workspace = true }
+artifact-domain = { workspace = true }
+artifact-infrastructure = { workspace = true, features = ["test-doubles"] }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+
+[[test]]
+name = "api_meta"
+path = "tests/api_meta.rs"
+
+[[test]]
+name = "default_deny"
+path = "tests/default_deny.rs"
+
+[[test]]
+name = "artifact_flow"
+path = "tests/artifact_flow.rs"
+
+[[test]]
+name = "migration_invariants"
+path = "tests/migration_invariants.rs"
+
+[[test]]
+name = "roles_separation"
+path = "tests/roles_separation.rs"
+
+[[test]]
+name = "contract_openapi"
+path = "tests/contract_openapi.rs"
+
+[[test]]
+name = "sdk_contract"
+path = "tests/sdk_contract.rs"

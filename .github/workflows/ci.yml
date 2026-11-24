@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build-test:
+    name: clippy + build + test (postgres 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: artifact_service
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres -d artifact_service"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/artifact_service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: unit + integration + contract + invariant tests
+        run: cargo test --workspace
+      - name: release binary builds without test-doubles feature
+        run: cargo build --release -p artifact-api
+        env:
+          ARTIFACT_GIT_SHA: ${{ github.sha }}
+
+  docker-build:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: |
+          docker build \
+            --build-arg ARTIFACT_GIT_SHA=${{ github.sha }} \
+            -t artifact-api:ci .
+      - name: entrypoint smoke (unknown command exits 1 from the binary, not the shell)
+        run: |
+          set +e
+          docker run --rm artifact-api:ci __no_such_command__
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 for unknown command, got $code"
+            exit 1
+          fi
