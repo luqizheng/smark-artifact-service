@@ -19,7 +19,8 @@
 -- 用法（由管理员执行；占位符必须替换为实际角色名）：
 --   sed -e 's/__MIGRATOR_ROLE__/artifact_migrator/g' \
 --       -e 's/__APP_ROLE__/artifact_app/g' \
---       -e 's/__WORKER_ROLE__/artifact_worker/g' deploy/db-roles.sql \
+--       -e 's/__WORKER_ROLE__/artifact_worker/g' \
+--       -e 's/__MAINTENANCE_ROLE__/artifact_maintenance/g' deploy/db-roles.sql \
 --     | psql -v ON_ERROR_STOP=1
 --
 -- 口令策略：本脚本不设置口令。由运维以

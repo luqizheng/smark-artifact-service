@@ -65,7 +65,8 @@ docker compose -f deploy/docker-compose.yml run --rm db-grants
 
 ```bash
 sed -e 's/__MIGRATOR_ROLE__/postgres/' -e 's/__APP_ROLE__/artifact_app/' \
-    -e 's/__WORKER_ROLE__/artifact_worker/' deploy/db-roles.sql \
+    -e 's/__WORKER_ROLE__/artifact_worker/' \
+    -e 's/__MAINTENANCE_ROLE__/artifact_maintenance/' deploy/db-roles.sql \
   | docker exec -i -e PGPASSWORD=artifact_dev artifact-dev-pg \
       psql -U postgres -d artifact_service -v ON_ERROR_STOP=1
 ```
