@@ -11,7 +11,7 @@ info:
     - `被 P0 阻断`：Version 上传会话与 commit（file-service 上传/finalize 协议缺失）。
     - `未实现`：GenerationJob 创建（Generator Adapter 未实现 → 503 GENERATOR_UNAVAILABLE）。
 
-    相对 ART-01 V1.0 的增量（已由用户确认并纳入 ART-01 V1 正式契约，见 AI-PM 的 ART-01 V1 API Errata 001；均为向后兼容的新增）：
+    相对 ART-01 V1.0 的增量（已由用户确认并纳入 ART-01 V1 正式契约，见本仓库 `docs/architecture/ART-01-V1-API-ERRATA-001.md`；均为向后兼容的新增）：
     - `GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；
     - `requestGeneration` 文档化 409（Idempotency-Key 冲突）与 413（请求体超过 256 KiB）。
 
