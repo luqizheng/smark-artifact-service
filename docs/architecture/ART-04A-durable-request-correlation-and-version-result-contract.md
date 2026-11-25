@@ -252,11 +252,13 @@ Before calling create, AI-PM persists the intended stable artifact_key in its sl
 After an uncertain create response:
 1. GET by exact artifact_key.
 2. If found, persist the returned artifact_id and continue.
-3. If absent, retry POST with the same artifact_key and the same immutable identity fields.
-4. If a concurrent create wins, the API returns the same Artifact or the subsequent lookup finds it.
-5. Never generate a new artifact_key to work around a timeout or conflict.
+3. If absent, retry POST with the same artifact_key and the same immutable identity fields. The retry MUST NOT be blocked by a stale Idempotency-Key reservation left by a crashed request. AI-PM may omit the old Idempotency-Key or use a fresh short-window key for this recovery POST; the stable artifact_key, not the Idempotency-Key, guarantees convergence. Alternatively, the server may safely supersede a stale reservation after proving no Artifact exists for the key.
+4. Concurrent create requests with the same artifact_key must converge under the database unique index. The unique-constraint loser must re-read the winning Artifact and return it only after validating immutable identity compatibility.
+5. Never generate a new artifact_key to work around a timeout, stale idempotency reservation, or conflict.
 
-This removes the dependency on the finite Idempotency-Key cache for recovering the logical slot Artifact. Idempotency-Key remains useful for short-window HTTP response replay.
+The current implementation reserves Idempotency-Key before inserting the Artifact and completes the reservation afterward. A crash between reserve and insert can leave an in-progress reservation while no Artifact exists; replaying the same Idempotency-Key then returns an in-progress conflict. Therefore artifact_key lookup alone is not enough: the implementation MUST ensure key-based recovery can proceed independently of a stale response-cache reservation. Add crash-injection tests for reserve→crash-before-insert, insert→crash-before-cache-completion, and concurrent same-artifact_key creates.
+
+This removes the dependency on the finite Idempotency-Key cache for recovering the logical slot Artifact. Idempotency-Key remains useful for short-window HTTP response replay, but it is not the correctness boundary for the stable logical Artifact identity.
 
 ### 8.5 Implementation impact
 
