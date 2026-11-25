@@ -264,3 +264,22 @@ The original cutover wording assumed the old binary could honor a new per-instan
 The Idempotency-Key cleanup worker is also explicitly prohibited from receiving broad table DELETE privileges. Cleanup must use a narrowly scoped maintenance function that deletes only completed expired rows in bounded batches; incomplete-row reconciliation remains operator-controlled.
 
 One acceptance case was corrected: failure to write the completed idempotency response occurs before commit and therefore rolls back Artifact, identity, and reservation together. The prior wording that allowed Artifact commit followed by a separate idempotency completion failure contradicted the required single-transaction boundary.
+
+
+## 10. Final independent specification review
+
+**Review result: AS-1 specification is internally coherent and implementation-ready as a design baseline.** The seven source findings have explicit contract responses; the previously open expiry, legacy reconciliation, old-writer cutover, and transaction-port decisions are frozen in ART-04E.
+
+The final pass specifically checked the following consistency points:
+
+1. The single-transaction boundary no longer claims a post-commit idempotency completion step. The failure test now requires rollback of all keyed-create rows if completion cannot be written before commit.
+2. Existing completed Idempotency-Key records remain replayable until physically deleted; cleanup is serialized with request resolution. Incomplete rows are never TTL-deleted.
+3. Old binaries are not assumed to understand a new feature flag. The default cutover pauses the entire create route at ingress, drains requests, removes old instances, then applies the DB invariant and deploys the new build.
+4. The dedicated keyed-create port owns the SQLx transaction and returns typed outcomes; unkeyed create remains on the existing path in V1.
+5. Best-effort audit remains outside the transaction. Raw-body idempotency hash and semantic creation fingerprint remain distinct.
+6. The current lack of RLS is stated accurately; the new identity table receives explicit append-only permissions.
+7. Retention cleanup is restricted to a narrowly scoped SECURITY DEFINER function with pinned search_path, bounded batches, revoked PUBLIC execution, and an exact maintenance-principal grant.
+
+The current default-branch source files re-fetched for this pass retain the blob SHAs recorded in §2; no source drift was observed in the reviewed create service, idempotency port, PostgreSQL adapter, initial migration, or DB role script.
+
+**Disposition:** ART-04E/AS-1 design specification is accepted as implementation-ready. This is not permission to merge PR #7, and it is not implementation authorization. No code, migration, API, SDK, Worker, or deployment change has been made. Before implementation, the user must explicitly authorize the AS-1 implementation task; implementation must then be performed on a separate implementation PR and pass all 57 acceptance cases plus independent code review. ART-04D's other work packages and all production generation blockers remain separate.
