@@ -37,13 +37,28 @@ One AI-PM Task/Run step may create one or more GenerationJobs. Each GenerationJo
 AI-PM must persist the external correlation in its own database, at minimum:
 
 - AI-PM task/run identifier and stable step identifier;
-- Artifact Service `artifact_id`, `generation_job_id`, and target `version_id` when available;
+- Artifact Service `artifact_id` and `generation_job_id`; the committed `version_id` is recorded after the successful Job result exposes the created Version through the Artifact/Version API. V1 GenerationJob response does not itself promise a `version_id` field;
 - stable `Idempotency-Key` used for creation;
 - request hash or immutable request reference;
 - last observed GenerationJob status and observation timestamp (a local read model, not an authority);
 - correlation/trace identifier.
 
 The Artifact Service stores only generic scope and external reference identifiers. It must not interpret AI-PM Task, Requirement, Design, or ADR semantics.
+
+
+## 3.1 Artifact identity, business reference, and Version mapping
+
+The generic Artifact is created/selected through Artifact Service; AI-PM then creates a generic ArtifactReference for the relevant business object(s), after checking that those objects exist and the caller is authorized. Typical links include Design, Requirement, ADR, Task/Run, or a Visualization business record. Artifact Service stores opaque owner_type/owner_id/relation_type values only.
+
+Do not equate these identities:
+- AI-PM business Visualization record (`viz.artifact.id`): carries VizSpec, slot/nature, business state and approval semantics;
+- Artifact Service `artifact_id`: generic logical resource identity;
+- Artifact Service `version_id`: immutable generated/file version identity;
+- GenerationJob `job_id`: one technical execution request.
+
+For Visualization integration, AI-PM retains the business record and its approval workflow, and stores a durable mapping to the generic Artifact and the specific Version used by the business record. The generic ArtifactReference alone is an Artifact-level association; it must not be misrepresented as a Version-level approval or provenance record. The exact mapping table/columns and migration cutover belong to a separate AI-PM migration design and must be verified against the live schema before implementation.
+
+No indefinite dual-write between legacy `viz.*` storage and Artifact Service is allowed. Migration/cutover must define the read/write authority per phase, rollback window, and reconciliation procedure before any production data movement.
 
 ## 4. V1 interaction sequence
 
@@ -56,10 +71,10 @@ The Artifact Service stores only generic scope and external reference identifier
    `POST /v1/artifacts/{artifact_id}/generation-jobs`
 
 4. AI-PM supplies a stable `Idempotency-Key` derived from a durable AI-PM run-step identity. It must reuse the same key and exact request body when retrying an uncertain request.
-5. Artifact Service validates the request and generator availability, creates the Job and immutable input snapshot, and returns `202` with the GenerationJob identity when the creation path is enabled.
+5. Artifact Service validates the request and generator availability, creates the Job and immutable input snapshot, and returns `202` with the GenerationJob identity when the creation path is enabled. The request may carry `expected_current_version_id` as a current-pointer concurrency precondition; it is not a Job revision or a target Version ID. The GenerationJob response schema does not promise a `version_id`; the output Version is created on successful generation and must then be discovered through the Artifact/Version API.
 6. AI-PM persists the returned Job identity and moves its own Run step into a waiting-for-external-execution state.
 
-If the HTTP response is lost after the server accepted the request, AI-PM retries with the same Idempotency-Key and same body. It must not create a new key merely because the client timed out.
+If the HTTP response is lost after the server accepted the request, AI-PM retries with the same Idempotency-Key and byte-equivalent semantic request body while the server's idempotency record is guaranteed to be retained. The OpenAPI currently promises retention of at least 24 hours, not an unlimited lifetime, and provides no lookup-by-idempotency-key endpoint. Therefore, after the documented minimum retention window has elapsed, AI-PM must not blindly replay an uncertain create: it must hold the Run step for reconciliation/manual resolution until a durable request-correlation lookup contract exists. This is an open integration gap, not a solved recovery guarantee.
 
 **Current implementation constraint:** the GenerationJob creation API currently returns `503 GENERATOR_UNAVAILABLE` because the SeeCode Adapter is not implemented and no production generation path is enabled. This proposal does not authorize bypassing that gate.
 
@@ -126,7 +141,7 @@ The Rust `artifact-client` currently exposes `request_generation`, but the inspe
 
 - `get_generation_job(job_id, context)`;
 - `cancel_generation_job(job_id, context)`;
-- creation idempotency propagation through `CallContext.idempotency_key` (already represented in the context type; verify the generation method sends it);
+- creation idempotency propagation through `CallContext.idempotency_key` (the inspected SDK request primitive already emits the `Idempotency-Key` header);
 - stable typed GenerationJob response and error handling for `cancel_requested`, terminal status, 404, 409, 503, and retryable transport failures.
 
 SDK methods must remain thin API clients. They must not contain AI-PM business state transitions or poll forever internally. The AI-PM orchestration layer owns wait/retry policy.
@@ -179,8 +194,9 @@ Observed in `smark-artifact-service` main:
 - The inspected Rust SDK includes `request_generation` but does not yet expose `get_generation_job` or `cancel_generation_job`.
 
 Observed in `ai-pm` main:
-- Existing Visualization business semantics and approval remain in AI-PM.
-- Existing `viz.artifact` is a Visualization-specific model, not the generic Artifact Service resource.
-- The inspected repository search found the design documents but no actual consumer integration calling the independent Artifact Service API/SDK. This is a static search result, not proof about external/unindexed consumers.
+- Existing Visualization business semantics, VizSpec, Relation Registry, Live Graph, slot behavior and approval remain in AI-PM.
+- Existing `viz.artifact` is a Visualization-specific business record, not the generic Artifact Service resource. The integration design explicitly maps generic identity/version/output to Artifact Service while keeping Visualization semantics and business approval in AI-PM.
+- Existing Visualization handlers and persistence remain in the repository. The inspected code search did not find a live consumer adapter calling this independent Artifact Service API/SDK; treat this as a static search result, not proof about external/unindexed consumers.
+- Migration must be staged: do not rename/reuse `viz.*` tables as generic Artifact Service tables and do not introduce long-lived dual writes. Business approval must continue to reference the AI-PM business artifact identity and be linked to the generic Artifact/Version through stable mapping/reference data.
 
 This snapshot must be rechecked before implementation; it is not a runtime deployment claim.
