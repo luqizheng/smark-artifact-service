@@ -184,7 +184,7 @@ For a keyed create request:
 1. Authenticate and authorize the tenant/project. Validate and canonicalize the request; compute the versioned Artifact creation fingerprint and, when supplied, the existing endpoint-specific Idempotency-Key request hash.
 2. Start one transaction. For a supplied Idempotency-Key, atomically insert its reservation row (using the existing unique scope `tenant_id/project_id/endpoint/idempotency_key`) or lock/read the existing row:
    - a different request hash returns the existing idempotency conflict;
-   - a completed matching row replays its response;
+   - a completed matching row is a transport replay candidate, but before returning it the transaction MUST resolve its resource_id within the authorized tenant/project and verify the matching durable artifact_key identity and stored-version semantic fingerprint. A missing Artifact, missing identity, or mismatch is an integrity/reconciliation error; do not blindly replay a stale response snapshot.
    - an incomplete legacy row is not proof that the Artifact operation did not commit. It may be reconciled/reused only after the old-writer drain in §6.1 and an explicit check of both Artifact and identity state; if the key is still ambiguous, fail closed for operator reconciliation.
 3. Resolve `(tenant_id, project_id, artifact_key)` in `artifact_creation_identity` inside the same transaction:
    - if an identity exists, canonicalize the incoming semantic DTO using that stored identity's fingerprint version; a matching hash resolves the existing Artifact, while a mismatch returns HTTP 409 `ARTIFACT_KEY_CONFLICT`;
@@ -416,6 +416,18 @@ All tests below are required before AS-1 can be marked implementation-complete.
 42. An idempotency row whose expires_at is in the past but remains stored is not silently treated as absent or reusable.
 43. Fresh delegation authorization is required before replaying an existing Artifact.
 44. No test or documentation claims RLS isolation unless RLS is explicitly introduced and tested.
+45. Completed Idempotency-Key replay verifies that resource_id resolves to an Artifact and matching durable identity in the authorized scope before returning a response.
+46. A completed idempotency snapshot pointing to a missing Artifact or mismatched identity fails closed and emits an integrity signal.
+47. Completed rows past expires_at remain replayable until the cleanup transaction physically deletes them.
+48. Cleanup and an incoming request racing for the same Idempotency-Key cannot both win; row locking produces one deterministic outcome.
+49. TTL cleanup never deletes incomplete Idempotency-Key rows.
+50. Post-drain reconciliation completes an incomplete row only when matching Artifact identity and raw request hash are proven.
+51. Post-drain reconciliation does not auto-delete or reuse a row when an Artifact exists without durable identity.
+52. A keyed-create request under the write gate is rejected consistently by every old serving instance.
+53. The drain procedure records zero in-flight keyed creates and verifies no old application instance remains before migration.
+54. The database deferred invariant rejects a residual old binary's keyed Artifact insert without a matching identity row.
+55. The new application build remains gated until schema compatibility and atomic keyed-create smoke checks pass.
+56. New and existing-key responses use the frozen 201/200 semantics and a stable resolution indicator/header.
 
 
 ## 10. Failure-injection evidence
@@ -442,7 +454,7 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 4. Implement a single transactional create-or-resolve database/application path.
 5. Change handler ordering so durable key resolution is not blocked by stale Idempotency-Key reservations.
 6. Add conflict recovery using a fresh transaction.
-7. Add API/OpenAPI contract tests and the full concurrency/crash-injection suite.
+7. Add API/OpenAPI contract tests and the full 56-case concurrency/crash-injection/retention/cutover suite.
 8. Run an independent review focused on transaction atomicity, legacy behavior, RLS, and failure recovery.
 
 **AS-1 remains not implemented until all acceptance evidence exists.** Completing this document does not approve production code, SeeCode, Worker rollout, or the wider ART-04 implementation. AS-2, AS-3, AS-4, and AI-PM PM-1..PM-3 remain separate gates.
