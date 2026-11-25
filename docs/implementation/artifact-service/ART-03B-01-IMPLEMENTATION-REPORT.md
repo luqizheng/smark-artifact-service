@@ -258,7 +258,7 @@
 
 - 当前 Worker 不领取任何 Job（不申报 adapter 能力）；0002 切片"领取后立即失败"是历史行为（见 §11）。
 - API 层仍未接通实际 Job 创建流程：生成请求在输入校验后仍 fail-closed（503 `GENERATOR_UNAVAILABLE`），不产生 Job。数据库受控创建函数 `create_generation_job_with_input` 已实现并有测试，**不代表 API 创建路径已启用**。
-- `GenerationJob` 响应新增字段与 409 / 413 已由用户于 2026-11-25 确认，并正式记录于 AI-PM 的 [ART-01 V1 API Errata 001](https://github.com/luqizheng/ai-pm/blob/master/docs/architecture/smark-pm-architecture-decisions/ART-01-V1-API-ERRATA-001.md)，同时由 ART-01 V1.0 第 15 节引用。
+- `GenerationJob` 响应新增字段与 409 / 413 已由用户于 2026-11-25 确认，并正式记录于 AI-PM 的 [ART-01 V1 API Errata 001](https://github.com/luqizheng/smark-artifact-service/blob/impl/art-03b-01-review-fixes/docs/architecture/ART-01-V1-API-ERRATA-001.md)，同时由 ART-01 V1.0 第 15 节引用。
 - compose 全栈已在全新卷上验证（见 12.1 的验证表）；CI 校验 compose 配置、构建并冒烟 Worker 镜像，发布流程推送 Worker 镜像。
 
 **Migration 清单与 CI。** `migrations.sha256` 锁定 0001/0002/0003；CI 以 `sha256sum -c` 校验，测试 `released_migrations_are_unchanged` 用同一份清单再校验一次，并拒绝未列入清单的迁移。本轮修订后三个哈希均与清单一致，0001、0002 相对已推送基线无改动。
