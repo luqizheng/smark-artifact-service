@@ -1,4 +1,4 @@
-> **复审状态（2026-11-25）：NOT APPROVED / Changes Required。** 本文仍保留 v2 原始设计论证以供追溯，但不得作为实施基线。具有约束力的修订见 [ART-03B-02-v2.1-architecture-corrections.md](./ART-03B-02-v2.1-architecture-corrections.md)。若本文与 v2.1 修订冲突，以 v2.1 为准。主要阻断：DB-BLOCKER-01（deadline×cancel 后 retry_wait 不可领取）、DB-BLOCKER-02（短 deadline 缺少 DB 时间锚点）、TIMING-BLOCKER-03（INV-1/INV-2 不成立）、PROCESS-BLOCKER-04（Linux 进程树依赖 03B-03）、FSM-BLOCKER-05（状态边与不确定路径未闭合）。
+> **复审状态（2026-11-25）：NOT APPROVED / Changes Required。** 本文保留 v2 原始论证供追溯，不得作为实施基线。v2.1 事实修订见 [ART-03B-02-v2.1-architecture-corrections.md](./ART-03B-02-v2.1-architecture-corrections.md)；后续设计候选见 [DB-BLOCKER-01](./ART-03B-02-DB-BLOCKER-01-deadline-cancel-arbitration.md)、[DB-BLOCKER-02](./ART-03B-02-DB-BLOCKER-02-monotonic-deadline-contract.md) 与 [v2.2 Supervisor FSM/Lease/Heartbeat](./ART-03B-02-v2.2-supervisor-fsm-lease-heartbeat.md)。v2.1 是 SQL 事实核验记录；v2.2 与两份专题文档是后续候选设计，不覆盖/篡改历史 SQL 事实。凡与这些修订冲突，以较新的候选设计作为待评审目标，但在独立复审通过前仍不得实施。
 
 # ART-03B-02 — Worker 执行进程生命周期架构设计 v2
 
