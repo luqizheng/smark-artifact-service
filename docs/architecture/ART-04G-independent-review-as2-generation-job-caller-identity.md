@@ -1,6 +1,6 @@
 # ART-04G — AS-2（GenerationJob Durable Caller Identity）独立架构评审与实施契约
 
-> **Status:** ART-04H 挑战后修订版（v2，待独立复核；原 §5 冻结候选已由 §9 修订条款覆盖）
+> **Status:** ART-04H/04I 挑战后修订版（v3 冻结候选；§10 为最终规范性增补，优先级高于 §§5–9）
 > **Date:** 2026-11-25
 > **Reviewer:** 独立架构评审（基于源码与迁移的真实核查，非仅静态审计转述）
 > **Baseline:** `main` + AS-1 分支 `feat/as-1-durable-artifact-creation-identity` @ `5541d3be8c90cfcf9283b6e59426c8a3c2bfe099`（PR #8，Draft，未合并）
@@ -14,7 +14,7 @@
 | 对象 | 结论 |
 |---|---|
 | **AR04-01（ART-04A §2 设计文本）** | **CHANGES REQUIRED** — 设计方向正确，但有 5 处必须先冻结的规格缺口/缺陷（见 §4）。全部缺口在本文件 §5 中给出冻结解。 |
-| **AR04-01 → AS-2 代码实施** | **暂缓启动（CHANGES REQUIRED）** — ART-04H 新增 C-1 P1 与 C-2..C-5 P2 已按 §9 修订；须先由独立评审确认 §9 修订完整、无新 P1，再另行冻结并授权 AS-2 实施。 |
+| **AR04-01 → AS-2 代码实施** | **ART-04I 条件授权；待 v3 冻结复核** — 仅在 §10 修订完整落盘并通过 Diff 复核后，方可启动独立 AS-2 实施分支。 |
 | **AR04-02（target_version_id 暴露与完成不变量）** | **NOT APPROVED / DEFERRED to AS-3** — 详见 §7.2。不得在 AS-2 中实施任何 AR04-02 内容。 |
 
 **无 P0 缺陷。** 5 个 P1、5 个 P2，全部可通过本契约冻结解决，不需要推翻设计方向。
@@ -368,7 +368,8 @@ pub enum KeyedJobCreateError {
 | AS2-25 | unkeyed 创建（caller 三列 NULL） | 行为与 0003 语义逐项一致（同 key 同 hash 重放 / 异 hash 409 / 无 key 正常创建） |
 | AS2-26 | 历史 Job（NULL 身份）经 lookup | 任何 UUID 均 404 |
 | AS2-27 | 同 key 重放但换新 key + 同 ID 同指纹 | 'caller_request_replay'；原 Job 的 key/hash 不被改写 |
-| AS2-28 | 同 key 不同 body hash（含 caller 字段差异） | 409 IDEMPOTENCY_KEY_REUSED（现有语义不变） |
+| AS2-28a | caller_request_id 未命中时，同 key + 不同 raw body hash | 409 IDEMPOTENCY_KEY_REUSED（现有语义不变） |
+| AS2-28b | caller_request_id 命中且 fingerprint 一致，但当前 key 绑定其他 Job 且 raw hash 不同 | 409 IDEMPOTENCY_KEY_REUSED；不得 replay |
 | AS2-29 | 0003 重复键清洗语义（空/重复 key 置 NULL） | 0005 不触碰；既有迁移不变量测试通过 |
 | AS2-30 | 终态输入正文清理（purge_expired_generation_job_input）后同 ID 重放 | 指纹比较不受影响（存储 hash 判定） |
 | AS2-31 | AS-1 全量回归（artifact keyed/unkeyed、idempotency 清理、角色分离） | AS-1 57 项语义全部保持 |
@@ -394,13 +395,13 @@ pub enum KeyedJobCreateError {
 **H. 权限与迁移不变量（DB）**
 | ID | 场景 | 预期 |
 |---|---|---|
-| AS2-42 | APP 可 INSERT generation_job（经函数）但触发器拦截身份改写 | 通过 |
+| AS2-42 | APP 经受控 SECURITY DEFINER 函数创建 Job；按最终权限策略直接 INSERT 被拒绝（或仅允许有明确证据的最小受控路径）；直接 UPDATE 身份列被拒绝 | 通过；必须附 `has_table_privilege`/实际角色 SQL 测试及函数路径测试 |
 | AS2-43 | 新 create 函数 EXECUTE 仅 APP；PUBLIC/WORKER/MAINTENANCE 无 | 角色分离测试通过 |
 | AS2-44 | 部分唯一索引/CHECK/触发器存在性迁移不变量 | migration_guard 扩展通过 |
 | AS2-45 | Job 创建事务不写 idempotency_record | 断言该表行数在 Job 创建前后不变（Q8 固化） |
 | AS2-46 | 迁移证据：迁移前后 Job 行数一致、无身份回填 | 部署证据清单 |
 
-> 共 46 项自动化验收（含并发、故障注入、真实 PostgreSQL 集成）。AS2-37/41 明确划出 AS-4 接线门禁，避免"文档规格通过"被误述为"HTTP 实现通过"。
+> v2 原矩阵 46 项；经 28 拆分、47–51 增补及 v3 的 52–53 增补后，最终 **54 项**。其中 DB 并发场景必须使用真实 PostgreSQL；权限场景必须以最终 APP/WORKER/MAINTENANCE 角色执行。AS2-37/41 明确划出 AS-4 接线门禁，避免“文档规格通过”被误述为“HTTP 实现通过”。
 
 ---
 
@@ -439,10 +440,10 @@ AS-2 PR 中出现任何 `target_version_id` 暴露/分配/约束代码即为越�
 3. **Phase 2** 指纹 v1 实现 + golden vectors（UNIT）。
 4. **Phase 3** 端口 `KeyedGenerationJobCreatePort`（PostgreSQL 适配器）+ 并发/故障注入 DB 测试。
 5. **Phase 4** DTO/OpenAPI/SDK/lookup 路由 + 契约测试。
-6. **Phase 5** §6 矩阵 46 项全量执行 + AS-1 回归（AS2-31）+ 独立审查（对齐 ART-04E §11 先例）。
+6. **Phase 5** §6 矩阵 54 项全量执行 + AS-1 回归（AS2-31）+ 独立审查（对齐 ART-04E §11 先例）。
 7. PR 说明必须附：本评审文档、全部验收项状态、未解决 P0/P1 标记（目标为无）、迁移证据（§5.7.3）、Draft 状态提交。
 
-**当前状态：AS-2 实施尚未获授权。** ART-04H 已裁定 CHANGES REQUIRED；本文件 §9 为针对该裁决的规范性修订稿，须经独立复核确认后，才可将 AS-2 标记为 implementation-ready 并另行启动实施。任何情况下均不解除既有门禁：不启用生成、不动 Worker、不触碰 LMMS/File Service、不合并 PR #8、不启动 AS-3/AS-4/PM-1..PM-3。
+**当前状态：AS-2 获得条件实施授权，但尚未满足启动条件。** ART-04I 的条件是先完成本文件 §10 的 v3 冻结修订并通过针对性 Diff 复核；在该复核通过前，不得创建 AS-2 实施分支。任何情况下均不解除既有门禁：不启用生成、不动 Worker、不触碰 LMMS/File Service、不合并 PR #8、不启动 AS-3/AS-4/PM-1..PM-3。
 
 ---
 
@@ -569,3 +570,63 @@ ART-04H 的“46 → 51”总数存在算术错误：原 AS2-28 拆成 28a/28b �
 ### 9.8 修订后的冻结状态
 
 ART-04H 的 C-1 P1 已在文档层给出明确修订方案；C-2..C-5 P2 已纳入规范性约束。但文档作者不能自行把独立挑战评审改判为 APPROVED：本版仅作为修订候选，必须由独立评审针对 §9 复核 C-1 的读前查/异常块并发语义、SQLSTATE/token 映射及权限信任边界。复核通过后，另行签发 AS-2 implementation-ready 冻结结论。
+
+
+---
+
+## 10. ART-04I 第三轮挑战后的 v3 冻结修订（规范性；优先级高于 §§5–9）
+
+> 依据：`ART-04I-third-independent-challenge-review-as2-v2.md`。本节将 ART-04I 的 C-6 与 P3-1..P3-4 及 54 项验收矩阵落实为可实施规格。若本节与 §§5–9 的旧文字冲突，以本节为准。AS-2 条件授权只有在本节全部落盘并通过 Diff 复核后方可启动。
+
+### 10.1 C-6：Idempotency-Key 规范化必须先于所有 replay 分支（P2，冻结阻塞项）
+
+1. 创建函数必须在任何 caller identity lookup、Idempotency-Key lookup、replay return 或异常块 replay 处理之前，完成当前请求 key 的规范化与长度校验。
+2. 规范化规则与现有 0003 保持一致：`v_key := nullif(btrim(p_idempotency_key), '')`。当 `v_key IS NOT NULL` 时，先校验 `length(v_key) <= 255`；超限使用稳定 token `INVALID_IDEMPOTENCY_KEY` 与 SQLSTATE `22023`。
+3. §9.1 的普通读前查门禁和 unique_violation 异常块门禁，必须统一使用已规范化的 `v_key`，禁止直接使用原始参数 `p_idempotency_key`。建议通过同一 SQL helper 实现；不得出现两处语义漂移。
+4. `v_key IS NULL`（包括 NULL、空字符串或全空白字符串）等价于未提供 Idempotency-Key，跳过 key holder 门禁；caller identity replay 仍可继续。
+5. 该前移不得改变 caller 冲突优先级、key holder 冲突优先级、既有 raw `request_hash` 语义或 generator availability 检查顺序。输入校验先于身份查找，但 generator availability 仍在所有可判定 replay 之后。
+6. 长度校验必须在 replay 与 create 两条路径一致执行，避免已存在 caller identity 的请求通过 replay 分支绕过格式校验。
+
+### 10.2 P3-1：门禁是语句快照时点语义，不得过度修复
+
+1. key holder gate 的判断语义以执行该 SELECT 时的 READ COMMITTED 语句快照为准。
+2. gate 通过后、replay 返回前，另一事务提交新的 key 绑定属于 ART-04I §3.3 时序 B/E 所证明的合法串行等价结果；不得将其错误判定为 P1。
+3. 不得为消除该合法窗口而给 replay 路径增加 key 预留/绑定写入、advisory lock 或额外串行化机制。此类改动会改变已冻结的 replay 零写入语义，必须另行架构评审。
+4. 测试不得断言 gate 通过后并发 create 必然失败；必须按实际同步屏障验证合法结果集合。
+
+### 10.3 P3-2：并发验收时序前提必须确定化
+
+- **AS2-49**：所有预置 Job 与交叉 key 绑定必须先提交，再启动并发请求；在此前提下两个请求均确定返回 409。
+- **AS2-50**：必须用测试屏障保证竞争 key holder（T2）在败者异常块执行 gate SELECT 之前已经 commit；满足此前提时预期确定为 409。若测试没有建立该屏障，结果集合允许为 409 或合法 caller replay，不得将其作为 flaky failure。
+- 并发测试必须记录事务屏障/提交顺序，不得仅依赖 sleep 或调度概率。
+
+### 10.4 P3-3：Canonical JSON 实现加固
+
+v1 canonicalizer 应显式递归地按 object key 的 Unicode code point 顺序重排 payload 对象，再进行紧凑 JSON 序列化。serde_json 默认 Map 排序可作为一致性断言，不应成为唯一正确性前提；Cargo feature unification 不得静默改变 v1 fingerprint 输出。全部冻结 golden vectors 必须持续通过。
+
+### 10.5 P3-4：权限验收矩阵同步
+
+§6 的 AS2-42 已更新为最终权限语义：APP 必须能够经受控 SECURITY DEFINER create function 创建 Job；APP 直接 INSERT 必须按最终权限策略被拒绝，或证明存在明确、最小且受控的例外路径；APP 直接 UPDATE 身份列必须被拒绝。仅证明触发器拒绝 UPDATE 不足以通过 AS2-42。
+
+实施 PR 必须以最终数据库角色执行权限验证，至少覆盖 APP、WORKER、MAINTENANCE、PUBLIC 的函数 EXECUTE 和表 DML 权限；同步调整测试中直接写入 generation_job 的测试夹具，使用受控函数或专用测试角色，不得为方便测试恢复 APP 的宽表权限。
+
+### 10.6 最终验收矩阵：54 项
+
+在原 §6 基础上，按以下编号执行：
+
+| ID | 场景 | 预期 |
+|---|---|---|
+| AS2-52 | C-6 key 规范化回归：Job B 已绑定 K2；caller A 的匹配 fingerprint 请求携带 `' K2 '` | 409 IDEMPOTENCY_KEY_REUSED；门禁必须按规范化 `v_key` 命中 Job B |
+| AS2-52a | 空字符串/全空白 key | 等价无 key；匹配 caller identity 时允许 replay |
+| AS2-52b | 长度超过 255 的 key | replay 与 create 路径均返回 400 INVALID_IDEMPOTENCY_KEY |
+| AS2-53 | benign interleaving：预置 Job A(caller A, K1)；并发 R1={caller A, F_A, K2} replay 与 R2={caller B, F_B, K2} create；用屏障保证 R1 gate 先于 R2 commit | R1=200 caller replay A；R2=202 created B；K2 最终只绑定 B；无身份/key/hash 改写 |
+
+说明：AS2-52 的子场景 52a/52b 是同一验收项内的输入边界断言，不另计独立编号。最终编号集合为 AS2-01..27、AS2-28a/28b、AS2-29..46、AS2-47..53，共 **54 项**。AS2-49/50 的时序前提按 §10.3 固定；AS2-53 是独立的 benign interleaving 必测场景。
+
+### 10.7 实施前门禁与状态
+
+1. 实施分支创建前，重新核实 F-3：没有生产调用方，且迁移窗口不存在 in-flight create transaction；若发现任何生产调用方或无法证明 drain，停止并升级迁移方案。
+2. 重新盘点 APP 对 `generation_job` 的所有直接写入权限和调用路径；以 §10.5 的权限边界为实施目标，提交实际角色测试证据。
+3. AS-2 实施按 §8 Phase 1–6 执行，54 项逐项给出测试位置、执行结果与证据；真实 PostgreSQL 并发、异常块故障注入和角色权限测试不可用 mock 替代。
+4. PR 保持 Draft，完成实施后接受独立代码评审。该授权不包含 PR #8 合并、不包含 AS-3/AS-4/PM-1..PM-3，也不解除 Generator/Worker/LMMS/File Service/SeeCode 的既有门禁。
+5. **v3 状态：条件冻结候选。** 本次提交仅完成规范性文档修订；在针对性 Diff 复核确认 C-6、P3-1..P3-4、AS2-42 与 54 项矩阵全部一致之前，不得启动 AS-2 代码实施。
