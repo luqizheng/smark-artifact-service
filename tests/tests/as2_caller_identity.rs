@@ -216,40 +216,201 @@ async fn as2_09_replay_after_commit_returns_same_job(pool: PgPool) {
     assert_eq!(job_count(&pool).await, 1);
 }
 
-// ── AS2-10：创建事务中途 kill（真实连接终止） ────────────────────────────
+// ── AS2-10：创建事务中途 kill —— 三阶段故障注入（分别实现、分别断言） ─────
+//
+// 三个阶段独立测试（独立审查修复版）：
+//   A. INSERT 前终止：以未提交的 SHARE 表锁作为可控注入点（函数此前的全部
+//      SELECT 只需 ACCESS SHARE，不与 SHARE 冲突；INSERT 所需 ROW EXCLUSIVE
+//      与 SHARE 冲突），目标 backend 阻塞在行写入开始之前，用
+//      pg_terminate_backend 终止并等待 backend 真正退出。
+//   B. INSERT 已执行、COMMIT 前终止：显式 BEGIN + 函数返回 'created' 证明
+//      INSERT 已执行，不提交，由独立管理连接终止 backend。
+//   C. COMMIT 成功后终止（响应丢失）：已提交数据必须完整持久化且可重放。
+//
+// 共同纪律：pg_terminate_backend() 返回 true 不等于事务已经结束——必须轮询
+// pg_stat_activity 确认目标 backend 进程真正退出后，才以独立连接检查数据库
+// 持久化状态；不凭客户端连接断开推断回滚。全部注入手段只存在于测试数据库，
+// 不进入生产业务路径。
+
+// ── 阶段 A：INSERT 前终止 ────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "../migrations")]
-async fn as2_10_killed_transaction_leaves_no_half_row(pool: PgPool) {
+async fn as2_10a_termination_before_insert_leaves_nothing(pool: PgPool) {
     let artifact = setup(&pool).await;
-    let spec = Spec::caller(artifact, CALLER_A, &fp_a());
+    let spec = Spec::caller(artifact, CALLER_A, &fp_a()).with_key("K10");
     let job_id = Uuid::new_v4();
 
-    // 在已 INSERT 但未 COMMIT 的位置真实终止后端连接。
-    let mut victim = pool.acquire().await.unwrap();
-    let victim_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *victim)
+    // 注入点：gate 连接持有 generation_job 的 SHARE 表锁（未提交）。
+    let mut gate = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *gate).await.unwrap();
+    sqlx::query("LOCK TABLE artifact.generation_job IN SHARE MODE")
+        .execute(&mut *gate)
         .await
         .unwrap();
-    sqlx::query("BEGIN").execute(&mut *victim).await.unwrap();
-    let inserted = call_create(&mut *victim, job_id, &spec).await;
-    assert!(inserted.is_ok(), "the row must be inserted before the kill");
-    // 终止发生在 INSERT 之后、COMMIT 之前。
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+
+    // 目标 backend：调用创建函数，阻塞在 INSERT 获取 ROW EXCLUSIVE 表锁处。
+    let mut victim = pool.acquire().await.unwrap();
+    let (victim_pid, victim_started) = backend_identity(&mut victim).await;
+    let spec_for_task = spec.clone();
+    let handle =
+        tokio::spawn(async move { call_create(&mut *victim, job_id, &spec_for_task).await });
+    let evidence = wait_for_index_contention(&pool, victim_pid, gate_pid).await;
+    assert!(
+        evidence.blockers == vec![gate_pid],
+        "the victim must be blocked solely by the SHARE lock holder, got {:?}",
+        evidence.blockers
+    );
+    assert_eq!(
+        evidence.wait_event_type.as_deref(),
+        Some("Lock"),
+        "the victim must be waiting on the table lock, got {evidence:?}"
+    );
+    assert_eq!(
+        evidence.wait_event.as_deref(),
+        Some("relation"),
+        "a blocked table-lock acquisition must report the relation wait event, got {evidence:?}"
+    );
+    assert!(
+        evidence.query.contains("create_generation_job_with_input"),
+        "the victim must be blocked inside the real create statement, got {evidence:?}"
+    );
+
+    // 在 INSERT 前终止 backend；等待其真正退出后释放注入点。
     let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
         .bind(victim_pid)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert!(terminated, "the victim backend must be terminated");
+    let victim_result = handle.await.unwrap();
+    assert!(
+        victim_result.is_err(),
+        "the terminated session must fail its call: {victim_result:?}"
+    );
+    wait_backend_gone(&pool, victim_pid, victim_started).await;
+    sqlx::query("ROLLBACK").execute(&mut *gate).await.unwrap();
+    drop(gate);
+
+    // 独立连接断言：Job、caller 身份、key 绑定都不存在。
+    assert_eq!(
+        job_count(&pool).await,
+        0,
+        "no job may survive a pre-insert kill"
+    );
+    assert_eq!(caller_count(&pool, CALLER_A).await, 0);
+    let keyed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM artifact.generation_job WHERE idempotency_key = 'K10'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        keyed, 0,
+        "no idempotency binding may survive a pre-insert kill"
+    );
+}
+
+// ── 阶段 B：INSERT 已执行、COMMIT 前终止 ────────────────────────────────
+
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_10b_termination_before_commit_rolls_back(pool: PgPool) {
+    let artifact = setup(&pool).await;
+    let spec = Spec::caller(artifact, CALLER_A, &fp_a()).with_key("K11");
+    let job_id = Uuid::new_v4();
+
+    // 显式 BEGIN；函数返回 'created' 即证明 INSERT 已在该未提交事务内执行。
+    let mut victim = pool.acquire().await.unwrap();
+    let (victim_pid, victim_started) = backend_identity(&mut victim).await;
+    sqlx::query("BEGIN").execute(&mut *victim).await.unwrap();
+    let inserted = call_create(&mut *victim, job_id, &spec).await;
+    let (inserted_id, resolution) = inserted.expect("the row must be inserted before the kill");
+    assert_eq!((inserted_id, resolution.as_str()), (job_id, "created"));
+
+    // 由独立管理连接终止 backend；等待 PostgreSQL 确认 backend 退出。
+    // pg_terminate_backend 返回 true 不等于事务已结束，也不能凭客户端断开
+    // 判断回滚——判断依据是 pg_stat_activity 中该 backend 消失。
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(victim_pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(terminated, "the victim backend must be terminated");
+    wait_backend_gone(&pool, victim_pid, victim_started).await;
     drop(victim);
 
-    // 以数据库状态证明回滚：Job、caller 身份、key 均未持久化。
+    // 以数据库持久化状态证明回滚：Job、caller 身份、key 绑定均不存在。
     assert_eq!(job_count(&pool).await, 0, "no half-written job may survive");
     assert_eq!(caller_count(&pool, CALLER_A).await, 0);
+    let keyed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM artifact.generation_job WHERE idempotency_key = 'K11'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(keyed, 0, "no idempotency binding may survive the rollback");
 
     // 重试收敛为恰好一个 Job。
     let (retried, resolution) = call_create(&pool, job_id, &spec).await.unwrap();
     assert_eq!((retried, resolution.as_str()), (job_id, "created"));
     assert_eq!(job_count(&pool).await, 1);
+}
+
+// ── 阶段 C：COMMIT 后终止（响应丢失） ───────────────────────────────────
+
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_10c_termination_after_commit_is_durable_and_replayable(pool: PgPool) {
+    let artifact = setup(&pool).await;
+    let spec = Spec::caller(artifact, CALLER_A, &fp_a()).with_key("K12");
+    let job_id = Uuid::new_v4();
+
+    // 创建 Job 并成功 COMMIT；随后终止客户端连接（模拟响应丢失）。
+    let mut victim = pool.acquire().await.unwrap();
+    let (victim_pid, victim_started) = backend_identity(&mut victim).await;
+    sqlx::query("BEGIN").execute(&mut *victim).await.unwrap();
+    let (created, resolution) = call_create(&mut *victim, job_id, &spec).await.unwrap();
+    assert_eq!((created, resolution.as_str()), (job_id, "created"));
+    sqlx::query("COMMIT").execute(&mut *victim).await.unwrap();
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(victim_pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        terminated,
+        "the committed session's backend must be terminated"
+    );
+    wait_backend_gone(&pool, victim_pid, victim_started).await;
+    drop(victim);
+
+    // 独立连接：已提交的 Job、caller 身份与 key 绑定完整持久化。
+    let persisted: (Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT caller_request_id, idempotency_key FROM artifact.generation_job WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted,
+        (Some(CALLER_A), Some("K12".to_string())),
+        "a committed job must survive connection loss with its identity and key"
+    );
+
+    // 同 caller_request_id 与指纹重试：返回同一个 Job，不创建重复。
+    let (replayed, resolution) = call_create(&pool, Uuid::new_v4(), &spec).await.unwrap();
+    assert_eq!(
+        (replayed, resolution.as_str()),
+        (job_id, "caller_request_replay")
+    );
+    assert_eq!(
+        job_count(&pool).await,
+        1,
+        "the retry must not duplicate the job"
+    );
 }
 
 // ── AS2-11：Idempotency-Key 已在其他 Job 上使用（不同 hash） ─────────────
@@ -948,126 +1109,281 @@ async fn as2_49_precommitted_cross_requests_both_conflict(pool: PgPool) {
     assert_eq!(job_count(&pool).await, 2);
 }
 
-// ── AS2-50：异常块必须执行同一 key 门禁（确定性事务屏障，无 sleep） ──────
+// ── AS2-50：unique_violation 异常块必须执行同一 key 门禁（真实唯一索引竞争） ─
 //
-// 时序（全部由显式 await 与行锁构成，不使用 sleep）：
-//   0. 主连接持有屏障行锁（未提交）。
-//   1. T1（caller A + K50）在 BEFORE INSERT 触发器中阻塞在屏障行上；
-//      此时 T1 尚未写入任何唯一索引条目（可观测：pg_blocking_pids 指向主连接）。
-//   2. T2（caller B + K50）提交 —— 竞争 key holder 在 T1 的异常块之前落库。
-//   3. T3（caller A + K3）提交 —— caller A 行在 T1 的异常块之前落库。
-//   4. 主连接提交释放屏障 → T1 的唯一约束违例进入异常块：caller A 命中且指纹
-//      一致，但 K50 已绑定 caller B 且 raw hash 不同 → 必须 409，不得 replay。
+// （独立审查修复版）不再使用测试辅助表的行锁制造阻塞：T1 真实阻塞在
+// uq_generation_job_caller_request 唯一索引上，等待 T3 的未提交索引条目。
+//
+// 时序（满足 ART-04G v3 §10.3 的确定性前提：T2 在 T1 异常块 gate 之前提交）：
+//   1. T3 开启事务，创建 caller A + F_A + K3，保持未提交 —— caller A 的唯一
+//      索引条目已写入但对其他事务不可见。
+//   2. T1 开启事务，请求 caller A + F_A + K50：caller 读前查未命中（T3 未提交），
+//      到达 INSERT 后真实阻塞在 caller 唯一索引上，等待 T3 的事务。
+//      阻塞位置以三项可观测证据证明：pg_blocking_pids(T1) 恰为 [T3]（T3 在
+//      该时点的唯一数据库足迹就是 caller A 的索引条目，K3 与 caller B 均与
+//      T1 无交集）、T1 的 wait_event_type='Lock'、T1 的活跃语句就是本创建调用。
+//   3. T2 创建 caller B + F_B + K50（不同 raw hash）并成功提交 —— 竞争 key
+//      holder 在 T1 的异常块之前落库。
+//   4. T3 提交 —— T1 的索引等待解除并确认 unique_violation，进入异常块。
+//   5. 异常块以新语句快照重读 caller A（命中 T3 已提交行、指纹一致），执行与
+//      读前查完全相同的 key 门禁：K50 已绑定 T2 且 raw hash 不同 → 409
+//      IDEMPOTENCY_KEY_REUSED，不得 replay。
+//
+// 索引处理顺序说明（真实执行路径，非伪造）：PostgreSQL 按索引 OID 升序执行
+// 插入期的唯一性检查；迁移序中 uq_generation_job_idempotency_key（0003）的 OID
+// 小于 uq_generation_job_caller_request（0005），T1 会先把 K50 写入 key 索引再
+// 阻塞，其 speculative 条目会反过来阻塞 T2 对 K50 的插入，破坏 §10.3 的提交
+// 顺序前提。测试以完全相同的定义重建 key 索引（仅 OID 排序变化，唯一性语义
+// 与部分索引谓词逐字不变），使 caller 索引先于 key 索引被检查，T1 在触及
+// key 索引之前即阻塞在目标索引上。本测试不创建任何测试辅助表或触发器。
 
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_50_exception_block_reapplies_key_gate(pool: PgPool) {
     let artifact = setup(&pool).await;
-    // 屏障：只有 (caller A, key K50) 的插入会在 BEFORE INSERT 中等待该行锁。
-    sqlx::query(
-        "CREATE TABLE artifact.as2_barrier (id integer PRIMARY KEY, holder integer NOT NULL)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO artifact.as2_barrier (id, holder) VALUES (1, 0)")
+
+    // 0. 重建 key 索引使其 OID 晚于 caller 索引：同名、同列、同谓词，
+    //    唯一约束语义不变；仅让 T1 的阻塞点落在 caller 唯一索引上。
+    sqlx::query("DROP INDEX artifact.uq_generation_job_idempotency_key")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query(&format!(
-        "CREATE FUNCTION artifact.as2_barrier_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN \
-           IF NEW.caller_request_id = '{CALLER_A}'::uuid AND NEW.idempotency_key = 'K50' THEN \
-             PERFORM 1 FROM artifact.as2_barrier WHERE id = 1 FOR UPDATE; \
-           END IF; \
-           RETURN NEW; \
-         END $$"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
     sqlx::query(
-        "CREATE TRIGGER as2_barrier BEFORE INSERT ON artifact.generation_job \
-         FOR EACH ROW EXECUTE FUNCTION artifact.as2_barrier_fn()",
+        "CREATE UNIQUE INDEX uq_generation_job_idempotency_key \
+         ON artifact.generation_job (tenant_id, project_id, idempotency_key) \
+         WHERE idempotency_key IS NOT NULL",
     )
     .execute(&pool)
     .await
     .unwrap();
 
-    // 0. 主连接持有屏障行锁（未提交）。
-    let mut locker = pool.acquire().await.unwrap();
-    let locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *locker)
+    // 1. T3：caller A + K3 的事务保持未提交 —— caller 唯一索引条目的未提交持有者。
+    let mut t3 = pool.acquire().await.unwrap();
+    let t3_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *t3)
         .await
         .unwrap();
-    sqlx::query("BEGIN").execute(&mut *locker).await.unwrap();
-    sqlx::query("UPDATE artifact.as2_barrier SET holder = holder + 1 WHERE id = 1")
-        .execute(&mut *locker)
-        .await
-        .unwrap();
-
-    // 1. T1：caller A + K50 → 在触发器处阻塞。
-    let t1_spec = Spec::caller(artifact, CALLER_A, &fp_a())
-        .with_key("K50")
+    sqlx::query("BEGIN").execute(&mut *t3).await.unwrap();
+    let t3_spec = Spec::caller(artifact, CALLER_A, &fp_a())
+        .with_key("K3")
         .with_hash(hash_x());
+    let (t3_job, t3_res) = call_create(&mut *t3, Uuid::new_v4(), &t3_spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        t3_res, "created",
+        "T3 must insert caller A inside its open transaction"
+    );
+
+    // 2. T1：caller A + F_A + K50 —— 目标竞争请求，必须真实阻塞在 caller 唯一索引。
     let mut t1 = pool.acquire().await.unwrap();
     let t1_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *t1)
         .await
         .unwrap();
-    let spec_for_task = t1_spec.clone();
-    let handle =
-        tokio::spawn(async move { call_create(&mut *t1, Uuid::new_v4(), &spec_for_task).await });
+    let t1_job_id = Uuid::new_v4();
+    let t1_spec = Spec::caller(artifact, CALLER_A, &fp_a())
+        .with_key("K50")
+        .with_hash(hash_x());
+    let t1_handle = tokio::spawn(async move { call_create(&mut *t1, t1_job_id, &t1_spec).await });
+
+    // 3. 可观测证据：T1 的唯一阻塞者是 T3，等待事件是锁，活跃语句是真实创建调用。
+    //    （不依赖推断：阻塞位置由数据库自身报告，本测试没有辅助表可阻塞。）
+    let evidence = wait_for_index_contention(&pool, t1_pid, t3_pid).await;
     assert!(
-        wait_until_blocked(&pool, t1_pid, locker_pid).await,
-        "T1 must block in the BEFORE INSERT barrier"
+        evidence.blockers == vec![t3_pid],
+        "T1 must be blocked solely by T3's uncommitted caller index entry, got {:?}",
+        evidence.blockers
+    );
+    assert_eq!(
+        evidence.wait_event_type.as_deref(),
+        Some("Lock"),
+        "T1 must be waiting on a lock (transactionid held by T3), got {evidence:?}"
+    );
+    assert_eq!(
+        evidence.wait_event.as_deref(),
+        Some("transactionid"),
+        "a unique-index insert conflict waits on the conflicting transaction itself, got {evidence:?}"
+    );
+    assert!(
+        evidence.query.contains("create_generation_job_with_input"),
+        "T1 must be blocked inside the real create statement, got {evidence:?}"
     );
 
-    // 2. T2：caller B 绑定 K50（不同 raw hash），先于 T1 的异常块提交。
+    // 4. T2：caller B + F_B + K50（不同 raw hash）——竞争 key holder，先于 T1 的
+    //    异常块提交（§10.3）。T1 阻塞在 caller 索引、尚未触及 key 索引，因此 T2
+    //    对 K50 的插入不会与 T1 的 speculative 条目耦合，可确定性地立即提交。
+    let mut t2 = pool.acquire().await.unwrap();
     let t2_spec = Spec::caller(artifact, CALLER_B, &fp_b())
         .with_key("K50")
         .with_hash(hash_y());
-    let (t2_job, t2_res) = call_create(&pool, Uuid::new_v4(), &t2_spec).await.unwrap();
-    assert_eq!(t2_res, "created");
+    let (t2_job, t2_res) = call_create(&mut *t2, Uuid::new_v4(), &t2_spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        t2_res, "created",
+        "T2 must commit while T1 is still blocked"
+    );
 
-    // 3. T3：caller A 落库（不同 key），先于 T1 的异常块提交。
-    let t3_spec = Spec::caller(artifact, CALLER_A, &fp_a())
-        .with_key("K3")
-        .with_hash(hash_x());
-    let (_t3_job, t3_res) = call_create(&pool, Uuid::new_v4(), &t3_spec).await.unwrap();
-    assert_eq!(t3_res, "created");
-
-    // 4. 释放屏障 → T1 的唯一约束违例进入异常块；门禁必须返回 409。
-    sqlx::query("COMMIT").execute(&mut *locker).await.unwrap();
-    let err = handle
+    // 5. T3 提交：caller A 的索引条目可见，T1 以 unique_violation 进入异常块；
+    //    异常块 gate 必须发现 K50 已归属 T2 并返回 409 语义的稳定 token。
+    sqlx::query("COMMIT").execute(&mut *t3).await.unwrap();
+    let err = t1_handle
         .await
         .unwrap()
         .expect_err("the exception block must enforce the key gate");
     expect_code(&err, "23505");
     expect_token(&err, "IDEMPOTENCY_KEY_REUSED");
+
+    // 6. 数据库终态：T1 无残留；T2/T3 的事务结果完整保留且互不侵占。
     assert_eq!(job_count(&pool).await, 2, "no third job may be created");
-    let k50_holder: Vec<Uuid> =
-        sqlx::query_scalar("SELECT id FROM artifact.generation_job WHERE idempotency_key='K50'")
+    let caller_a_rows: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifact.generation_job \
+         WHERE tenant_id = $1 AND project_id = $2 AND caller_request_id = $3",
+    )
+    .bind(TENANT)
+    .bind(PROJECT)
+    .bind(CALLER_A)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        caller_a_rows,
+        vec![t3_job],
+        "caller A must resolve to T3's job only"
+    );
+    let caller_b_rows: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifact.generation_job \
+         WHERE tenant_id = $1 AND project_id = $2 AND caller_request_id = $3",
+    )
+    .bind(TENANT)
+    .bind(PROJECT)
+    .bind(CALLER_B)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        caller_b_rows,
+        vec![t2_job],
+        "caller B must resolve to T2's job only"
+    );
+    let k50_holders: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM artifact.generation_job WHERE idempotency_key = 'K50'")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(k50_holder, vec![t2_job], "K50 must remain bound to T2 only");
+    assert_eq!(
+        k50_holders,
+        vec![t2_job],
+        "K50 must remain bound to T2's job only"
+    );
+    let t1_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job WHERE id = $1")
+            .bind(t1_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(t1_rows, 0, "T1 must not leave its own job behind");
+    let survivors: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT idempotency_key, request_hash, request_fingerprint::text \
+         FROM artifact.generation_job ORDER BY created_at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected: Vec<(Option<String>, Option<String>, Option<String>)> = vec![
+        (Some("K3".to_string()), Some(hash_x()), Some(fp_a())),
+        (Some("K50".to_string()), Some(hash_y()), Some(fp_b())),
+    ];
+    assert_eq!(
+        survivors, expected,
+        "T3/T2 rows must keep their key, hash and fingerprint untouched"
+    );
 }
 
-/// 有界轮询 `pg_blocking_pids`：不使用 sleep，靠 `yield_now` 让步 + 时间上限。
-async fn wait_until_blocked(pool: &PgPool, blocked: i32, expected_blocker: i32) -> bool {
+/// 阻塞证据：阻塞者 PID 列表 + 被阻塞会话的等待事件与活跃语句。
+/// 有界轮询 `pg_blocking_pids()` 与 `pg_stat_activity`：每轮都是一次真实的
+/// 数据库状态观测（不使用 sleep），靠 `yield_now` 让步 + 时间上限兜底。
+#[derive(Debug)]
+struct ContentionEvidence {
+    blockers: Vec<i32>,
+    wait_event_type: Option<String>,
+    wait_event: Option<String>,
+    query: String,
+}
+
+async fn wait_for_index_contention(
+    pool: &PgPool,
+    blocked: i32,
+    expected_blocker: i32,
+) -> ContentionEvidence {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    loop {
         let blockers: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
             .bind(blocked)
             .fetch_one(pool)
             .await
             .unwrap();
+        let (wait_event_type, wait_event, query): (Option<String>, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT wait_event_type, wait_event, left(query, 160) \
+                 FROM pg_stat_activity WHERE pid = $1",
+            )
+            .bind(blocked)
+            .fetch_one(pool)
+            .await
+            .unwrap();
         if blockers.contains(&expected_blocker) {
-            return true;
+            return ContentionEvidence {
+                blockers,
+                wait_event_type,
+                wait_event,
+                query,
+            };
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "backend {blocked} never contended on {expected_blocker} within the deadline; \
+                 last blockers {blockers:?}, activity ({wait_event_type:?}, {wait_event:?}, {query:?})"
+            );
         }
         tokio::task::yield_now().await;
     }
-    false
+}
+
+/// 有界轮询 `pg_stat_activity`：确认目标 backend 已真正退出（进程消失），
+/// 而不是仅凭 `pg_terminate_backend` 返回 true 或客户端断开推断事务已结束。
+/// 以 (pid, backend_start) 双条件匹配，避免 PID 复用造成的误判。
+async fn wait_backend_gone(pool: &PgPool, pid: i32, backend_start_epoch: f64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE pid = $1 AND extract(epoch from backend_start)::float8 = $2",
+        )
+        .bind(pid)
+        .bind(backend_start_epoch)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if alive == 0 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("backend {pid} did not exit within the deadline");
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// 捕获目标连接的 backend 身份：pid + backend_start（epoch 秒）。
+async fn backend_identity(conn: &mut sqlx::PgConnection) -> (i32, f64) {
+    sqlx::query_as(
+        "SELECT pg_backend_pid(), extract(epoch from backend_start)::float8 \
+                    FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+    )
+    .fetch_one(conn)
+    .await
+    .unwrap()
 }
 
 // ── AS2-51：GENERATOR_UNAVAILABLE → 503 业务语义，不落入 IntegrityFailure ─
