@@ -8,6 +8,9 @@ pub mod service;
 
 pub use port::audit::AuditSink;
 pub use port::auth::{DelegationVerifier, VerificationError};
+pub use port::delegation_binding::{
+    DelegationBindingOutcome, DelegationBindingStore, DelegationTokenUse,
+};
 pub use port::idempotency::{IdempotencyOutcome, IdempotencyStore};
 pub use port::keyed_create::{
     IdempotencyInput, KeyedArtifactCreateError, KeyedArtifactCreateOutcome,
@@ -16,6 +19,9 @@ pub use port::keyed_create::{
 pub use port::keyed_job_create::{
     KeyedGenerationJobCreatePort, KeyedJobCreateError, KeyedJobCreateOutcome,
     ValidatedCreateGenerationJobRequest,
+};
+pub use port::revocation::{
+    DelegationRevocationChecker, FailClosedRevocationChecker, RevocationCheckUnavailable,
 };
 
 pub use port::repo::{
@@ -34,6 +40,9 @@ pub use service::artifact::{
 pub use service::creation_fingerprint::{
     CURRENT_FINGERPRINT_VERSION, FingerprintError, canonical_fingerprint, current_fingerprint,
     normalize_optional_text, normalize_text,
+};
+pub use service::delegation_request::{
+    assert_delegation_matches_request, canonical_request_fingerprint,
 };
 pub use service::generation_fingerprint::{
     CURRENT_JOB_FINGERPRINT_VERSION, GENERATION_JOB_CREATE_DOMAIN, JobFingerprintError,

@@ -70,6 +70,7 @@
 | 迁移 | 状态 | 本计划影响 |
 |---|---|---|
 | AS 0001–0003 | 已在主干发布 | 委托链路（阶段 1/2）**AS 侧仍无 schema 变更**：`Delegation` 领域模型的操作绑定字段先由验证层携带（V10 在 verifier/服务层比对），暂不落库——若第二轮评审要求持久化绑定，届时新增迁移并评审 |
+| AS 0006（**O-5 待裁决项，本 PR 附带**） | 仅存在于 PR 分支，未接线 | `artifact.delegation_token_use`（jti 唯一 + 配对 CHECK + purge 护栏）：本实现为"jti 改绑硬拒 / 并发重放 DB 原子仲裁"的纵深防御候选，与"AS 不加表"裁决冲突，提请第二轮评审保留或移除（默认无任何路由消费）；**评审通过前不得在共享环境执行** |
 | AS 0004（AS-1）/ 0005（AS-2） | 代码就绪，生产执行受控（部署流程含 `db-roles.sql` 重跑） | 阶段 1/2 前必须在目标环境执行；hash 由 `migrations.sha256` + CI 迁移不可变守卫保护 |
 | **AI-PM 新增迁移（R1 变更）** | 待实现 | **Q1 已裁决 → 撤销存储为 P0 必需**：`pm_delegation` + `pm_delegation_revocation`（jti 主键、状态、事务内批量撤销、7 天撤销记录保留），属 ai-pm 自有 schema，AS 不加表 |
 | 回滚 | 迁移不可变约定下无 down 脚本 | AS 侧回滚=应用回退上一镜像（验证器配置清空即回到全拒姿态）；AI-PM 侧回滚=停用签发器（业务端点不触达 AS），撤销表保留不删 |
@@ -94,7 +95,9 @@
 | 签发器：claims 形状（tenant UUID/lmms_tid 追溯/绑定字段）/TTL 上限 300 拒发 301/无授权拒发/签发记录 fail-closed/审计事件 | 单测 | ai-pm |
 | 撤销存储：事务内批量撤销/原子性/保留期清理/查询端点认证 | 单测+集成 | ai-pm |
 | JWKS 端点：kid 轮换双活、错误 key 隔离 | 单测+集成 | ai-pm |
-| AS 验证器：P1-01 全矩阵（V1–V12 逐项）、缺失 kid 拒绝、未知 kid 单次刷新、时钟偏差 ±60s 边界、操作绑定五场景 | 单测 | as |
+| AS 验证器：P1-01 全矩阵（V1–V12 逐项）、缺失 kid 拒绝、未知 kid 单次刷新、时钟偏差 ±60s 边界、操作绑定五场景 | 单测 | as | **✅ 已实现（本 PR）**：`delegation_security` 23 用例 + `ai_pm`/`jwks`/`config`/`revocation` 单测，映射见契约 §9 |
+| AS 撤销查询：撤销后写 403 / 查询超时与停机 → 写 503 读不受影响 / 禁缓存断言 | 单测+集成 | as | **部分**：`DelegationRevocationChecker` 端口 + fail-closed 默认已实现；HTTP 客户端随任务 1.7 |
+| AS JWKS 缓存：15min 陈旧 fail-closed / 刷新失败超窗拒绝 / 重启空缓存 fail-closed | 单测 | as | **✅ 已实现**（`JwksCache` 策略 + 常量契约单测） |
 | AS 撤销查询：撤销后写 403 / 查询超时与停机 → 写 503 读不受影响 / 禁缓存断言 | 单测+集成 | as |
 | AS JWKS 缓存：15min 陈旧 fail-closed / 刷新失败超窗拒绝 / 重启空缓存 fail-closed | 单测 | as |
 | 端到端：签发→创建 artifact→重放幂等→取消→撤销→审计对账（dev compose） | 集成 | 双仓 |

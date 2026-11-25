@@ -320,3 +320,34 @@ sequenceDiagram
 | O-2 | 撤销查询端点的认证形态（复用 service-jwt 模式 or 内部 mTLS——LMMS 无 mTLS，V1 用 service-jwt） | 阶段 1 细化 |
 | O-3 | `act` 委托链字段是否 V1 启用 | 建议 V1 恒为服务代理形态，可先固定不签；复审确认 |
 | O-4 | 意图接口的 REST 形态与错误码表 | 阶段 1 设计产出 |
+| O-5 | **AS 侧 jti 消费绑定表（`artifact.delegation_token_use`，本 PR 迁移 0006）**：本实现为"同一 jti 不同请求 → 硬拒 / 并发重放 → DB 原子仲裁"提供了超出 §3.1.2 分层的纵深防御层（含 purge 护栏）。与"AS 不加表"（§5.1）的冻结裁决冲突，**提请第二轮评审裁决**：保留（修订契约，作为声明绑定的服务端兜底 + 复用取证）或移除（AS-4 接线前可无损删除，声明层绑定 + 各端点幂等 + 在线撤销已覆盖同等威胁）。**默认未接线**：无任何路由消费该表 | 本 PR 附带，待裁决 |
+| O-6 | 请求指纹扩展 claim `biz.request_hash`（canonical fingerprint 规范冻结于 `canonical_request_fingerprint`）：为意图接口落地前提供内容级绑定；若采纳需并入 §3.1.1 claims 表并由 AI-PM 签发侧实现 | 本 PR 附带（AS 侧解析 + 校验 + 测试），待裁决 |
+
+---
+
+## 9. 实现与测试证据映射（本次提交，待独立评审）
+
+> 本节为**实现附注**（随代码提交）：验证器与 JWKS 缓存已按 §3.1.1/§3.2/§4.2 实现；
+> 全部条目可在 PR diff 与 CI 测试运行中独立复核。**实现 ≠ 已通过安全评审**；
+> AS-4 接线（§5.3 写路径撤销检查、V10 目标一致性、意图接口）仍为后续任务。
+
+| 契约条目 | 实现 | 测试证据 |
+|---|---|---|
+| V1 算法固定 RS256 | `AiPmDelegationVerifier::verify` header.alg 检查 | s02 签名拒绝族；`ai_pm` 单测 |
+| V2 kid 存在/未知 kid 单次限频刷新/缺失 kid 拒绝 | header.kid 必填；`JwksCache::lookup` 60s 限频 | s05（含出站次数断言）、s05b（轮换双活） |
+| V3 issuer 精确匹配（Q6 单 issuer） | 受信清单匹配；配置层强制恰一项 | s03；`config` 单测 `multiple_active_issuers_are_rejected` |
+| V4 audience 精确单值 | `set_audience` + 固定字符串反序列化（数组型即拒） | s04 |
+| V5 时间规则（±60s、TTL≤300、exp>iat、nbf） | `validate_time_claims` + Validation leeway=60 | s07/s08/s09；`ai_pm` 单测（边界 300/301） |
+| V6 jti 必须 UUID | `claims.jti.parse::<Uuid>()` | `ai_pm` 单测 + s 族 |
+| V7 purpose == delegation | 固定值精确比较 | 拒绝矩阵 |
+| V8 actions 非空/无重复/∈15 动作 | 逐项 parse + 重复检测 | s12；`ai_pm` 单测 |
+| V9 scope 装配（P0-01 tenant UUID） | claims→`TenantScope`；header 仅定位 | s10 跨租户 404、s11 claim/头不一致 403、s18 缺头 400 |
+| V10 操作绑定字段携带 | `artifact_id`/`operation_id`/`caller_request_id` 解析（UUID 强校验）；目标一致性属 AS-4 接线 | s16（指纹扩展层）；V10 服务层用例待接线 |
+| V11 写路径在线撤销（Q1） | `DelegationRevocationChecker` 端口 + `FailClosedRevocationChecker`（端点未上线前写路径 fail-closed 503 `REVOCATION_UNAVAILABLE`） | 端口单测；客户端实现属任务 1.7 |
+| V12 审计 | 复用 `audit_and_enrich_layer`（401/403 拒绝入 `audit_event`，无 token 本体） | 错误消息无 token 断言（rejects_with） |
+| §4.2 JWKS 缓存策略（Q5） | 5min 软刷新 / 15min 最大陈旧 / 60s 刷新限频 / 重启空缓存 fail-closed | `jwks` 单测 + 常量契约测试；s06 断供 503 `DELEGATION_VERIFIER_UNAVAILABLE` |
+| §3.1.2 场景①③⑤（合法重试/重复提交/worker 无 token） | 绑定表存储（O-5）+ 既有 AS-1/AS-2 幂等 | s13/s14/s15/s19/s20；AS-2 既有回归 |
+| §3.1.2 场景④（取消后残余） | TTL 收敛 + jti 改绑硬拒 | s17 |
+| 配置缺省全拒 | 空 issuer 清单 → `ClosedDelegationVerifier` | s21；`default_verifier_is_fail_closed` 回归 |
+
+测试运行：`cargo test --workspace`（226 通过；本机 Docker PG 高并发下 `sqlx::test` 建库可能 `PoolTimedOut`，属环境饱和——`--test-threads=8` 或 CI Linux 均稳定）。

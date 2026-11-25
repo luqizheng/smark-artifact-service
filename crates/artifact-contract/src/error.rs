@@ -73,6 +73,8 @@ impl ErrorEnvelope {
             "VERSION_CONFLICT"
             | "IDEMPOTENCY_KEY_REUSED"
             | "CALLER_REQUEST_ID_REUSED"
+            // WP 契约 v0.2 §3.4：同一 jti 绑定到不同请求的确定性冲突。
+            | "DELEGATION_TOKEN_REUSED"
             | "ARTIFACT_KEY_CONFLICT"
             | "ARTIFACT_KEY_LEGACY_UNVERIFIABLE" => 409,
             "INVALID_IDEMPOTENCY_KEY" => 400,
@@ -86,6 +88,11 @@ impl ErrorEnvelope {
             "GENERATOR_VALIDATION_FAILED" => 422,
             "RATE_LIMITED" => 429,
             "STORAGE_UNAVAILABLE" | "GENERATOR_UNAVAILABLE" | "PERSISTENCE_UNAVAILABLE" => 503,
+            // WP 契约 v0.2 §4：JWKS 不可用时的失败关闭（可重试，但绝不降级为放行）。
+            "DELEGATION_VERIFIER_UNAVAILABLE" => 503,
+            // WP 契约 v0.2 §5.3（Q1 裁决）：写路径撤销查询不可用 → fail-closed 503，
+            // 语义 = 暂不可判定而非凭证无效；禁止任何 fail-open 分支。
+            "REVOCATION_UNAVAILABLE" => 503,
             "GENERATION_TIMEOUT" => 504,
             _ => 500,
         }

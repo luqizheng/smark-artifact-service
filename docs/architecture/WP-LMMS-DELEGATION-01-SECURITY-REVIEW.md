@@ -152,9 +152,9 @@
 | 意图签发 | 意图→Action 映射、调用方提交 actions 拒绝、非人类身份拒发、dev-off/cpk 拒发 | AI-PM | 待实现（P0-03） |
 | 上游验证链 | §3.0 七项：aud 缺失/不匹配/类型错误、purpose 枚举、ct、service roles、身份类别 | AI-PM | 待实现（P0-02） |
 | 文件链路 | intent 绑定/哈希校验/补偿/孤儿清理 | AS | 待实现（阶段 3） |
-| 失效关闭 | JWKS 断供、file-service 停机、**撤销服务停机 → 写 503 读不受影响** | AI-PM / AS | 部分（补运行中断供用例） |
-| 撤销 | 撤销后写路径 403 / 移出项目事务内批量撤销 / TTL 过期 401 / 读路径残余 ≤TTL | AI-PM / AS | 待实现（Q1 已冻结，随实现） |
-| 日志卫生 | 错误消息不含凭证；F-21/F-22 凭据零复述 | AS | 待实现（随验证器） |
+| 失效关闭 | JWKS 断供、file-service 停机、**撤销服务停机 → 写 503 读不受影响** | AI-PM / AS | **部分**：JWKS 断供 → 503 `DELEGATION_VERIFIER_UNAVAILABLE` 已实现（s06）；撤销查询客户端随任务 1.7；file 停机用例属阶段 3 |
+| 撤销 | 撤销后写路径 403 / 移出项目事务内批量撤销 / TTL 过期 401 / 读路径残余 ≤TTL | AI-PM / AS | **部分**：`DelegationRevocationChecker` 端口 + fail-closed 默认（端点未上线前写路径 503）已实现；查询客户端随任务 1.7；过期 401 已覆盖（s07）；AI-PM 侧撤销存储待实现 |
+| 日志卫生 | 错误消息不含凭证；F-21/F-22 凭据零复述 | AS | **✅ 已实现**（验证器错误消息仅含判定原因，测试断言无 token 本体；`FailClosedRevocationChecker`/错误文案均无凭证） |
 
 ## 13. R1 独立安全评审决议（P0/P1 修订落点汇总）
 

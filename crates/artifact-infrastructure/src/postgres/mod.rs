@@ -19,10 +19,12 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod delegation_binding;
 pub mod keyed_create;
 pub mod keyed_job_create;
 pub mod worker;
 
+pub use delegation_binding::PgDelegationBindingStore;
 pub use keyed_create::PgKeyedArtifactCreator;
 pub use keyed_job_create::PgKeyedGenerationJobCreator;
 pub use worker::PgWorkerCoordination;
@@ -290,6 +292,13 @@ impl TryFrom<GeneratorRow> for GeneratorDescriptor {
 }
 
 // ── 错误映射 ────────────────────────────────────────────────────────────
+
+/// 连接池 / IO / 协议层故障统一折算：可重试的持久化不可用（fail-closed，
+/// 绝不把数据库故障折算成"放行"或"请求非法"）。供各受控实现共用。
+pub(crate) fn persistence_unavailable(context: &str, err: impl std::fmt::Display) -> DomainError {
+    tracing::warn!(context, error = %err, "database unavailable");
+    DomainError::PersistenceUnavailable(format!("{context}: {err}"))
+}
 
 fn map_db_error(err: sqlx::Error, context: &str) -> DomainError {
     if let sqlx::Error::Database(db) = &err {

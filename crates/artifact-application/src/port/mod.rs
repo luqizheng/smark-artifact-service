@@ -1,8 +1,10 @@
 pub mod audit;
 pub mod auth;
+pub mod delegation_binding;
 pub mod idempotency;
 pub mod keyed_create;
 pub mod keyed_job_create;
 pub mod repo;
+pub mod revocation;
 pub mod storage;
 pub mod worker;

@@ -24,6 +24,11 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+# WP 契约 v0.2 §3 安全测试：本地铸造 RS256 委托 token（测试密钥运行期生成，不落盘）。
+jsonwebtoken = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
 
 [[test]]
 name = "api_meta"
@@ -76,3 +81,7 @@ path = "tests/as1_creation_identity.rs"
 [[test]]
 name = "as2_caller_identity"
 path = "tests/as2_caller_identity.rs"
+
+[[test]]
+name = "delegation_security"
+path = "tests/delegation_security.rs"

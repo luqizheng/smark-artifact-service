@@ -1,10 +1,20 @@
-//! 生产委托验证器：**fail-closed**。
+//! 委托验证器实现。
+//!
+//! * [`ClosedDelegationVerifier`]：默认装配，无条件拒绝（fail-closed）。
+//!   受信 issuer 清单为空时生产姿态不变。
+//! * [`ai_pm::AiPmDelegationVerifier`]：候选 B 真实验证器（WP 契约 v0.2 §3），
+//!   仅在显式配置 `ARTIFACT_API_DELEGATION_ISSUERS` 后才会被装配。
+//! * [`jwks`]：JWKS 信任根（固定 URL / kid-strict / 失败关闭）。
 //!
 //! ART-02 结论（`ART-02-artifact-service-pre-implementation-verification-v1.0.md`）：
 //! lmms v1.8.1 token-service 的 resource token endpoint 未挂载认证 middleware，
-//! 且 claims 缺少 `aud` / `tid`。在两个 P0 关闭之前，不存在可安全验证的
-//! 委托凭证签发方，因此生产实现拒绝一切业务请求，而不是降级为
-//! "只验签名不验范围"（ART-01 §5.5 明确禁止）。
+//! 且 claims 缺少 `aud` / `tid`——候选 B 完全绕开该不可用端点（AI-PM 签发），
+//! LMMS 侧两个 P0 仍是后续版本需求，不因本实现而消失。
+
+pub mod ai_pm;
+pub mod jwks;
+
+pub use ai_pm::{AiPmDelegationVerifier, TrustedIssuer};
 
 use artifact_application::{DelegationVerifier, VerificationError};
 use artifact_domain::Delegation;

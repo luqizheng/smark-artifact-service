@@ -4,9 +4,10 @@
 #![allow(dead_code)]
 
 use artifact_application::{AdapterCapabilities, DelegationVerifier};
-use artifact_domain::{Action, ActorType};
+use artifact_domain::{Action, Actor, ActorType, Delegation, TenantScope};
 use artifact_infrastructure::test_support::TestDelegationVerifier;
 use sha2::Digest;
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -14,6 +15,33 @@ use uuid::Uuid;
 pub const TENANT: Uuid = Uuid::from_u128(0x0001);
 pub const PROJECT_1: Uuid = Uuid::from_u128(0x0101);
 pub const PROJECT_2: Uuid = Uuid::from_u128(0x0102);
+/// 第二租户（跨租户隔离测试用）及其项目。
+pub const TENANT_OTHER: Uuid = Uuid::from_u128(0x0002);
+pub const PROJECT_OTHER: Uuid = Uuid::from_u128(0x0201);
+/// LMMS 数字租户镜像（契约 v0.2 P0-01，仅审计语义）。
+pub const LMMS_TID: i64 = 42;
+
+/// 构造一个（可选携带操作绑定的）测试 Delegation，供声明层一致性判定使用。
+pub fn delegation_for(
+    tenant_id: Uuid,
+    project_id: Uuid,
+    caller_request_id: Option<Uuid>,
+    request_hash: Option<&str>,
+) -> Delegation {
+    Delegation {
+        delegation_id: Uuid::new_v4().to_string(),
+        jti: Uuid::new_v4().to_string(),
+        scope: TenantScope::new(tenant_id, project_id),
+        actor: Actor::new("user-1", ActorType::User),
+        actions: HashSet::from([Action::ArtifactCreate, Action::ArtifactRead]),
+        expires_at: chrono::Utc::now() + chrono::Duration::seconds(300),
+        lmms_tid: Some(LMMS_TID.to_string()),
+        artifact_id: None,
+        operation_id: None,
+        caller_request_id,
+        request_hash: request_hash.map(str::to_string),
+    }
+}
 
 /// 进程内启动 API（独立端口），返回 base_url。
 pub async fn spawn_app(pool: sqlx::PgPool, verifier: Arc<dyn DelegationVerifier>) -> String {

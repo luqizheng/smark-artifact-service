@@ -3,6 +3,70 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// 受信委托签发方（WP 契约 v0.2 §4：候选 B）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DelegationIssuerConfig {
+    /// `iss` claim 精确值（如 `ai-pm`）。
+    pub issuer: String,
+    /// 固定 JWKS URL。https 强制；仅 127.0.0.1/localhost/[::1] 的 http 回环
+    /// 豁免（本机 dev/compose 联调）。不存在任何其他明文传输豁免。
+    pub jwks_url: String,
+    /// 期望 `aud`；缺省 = `artifact-service`（契约固定受众）。
+    #[serde(default = "default_delegation_audience")]
+    pub audience: String,
+}
+
+fn default_delegation_audience() -> String {
+    artifact_infrastructure::delegation::ai_pm::DELEGATION_AUDIENCE.to_string()
+}
+
+impl DelegationIssuerConfig {
+    /// 校验信任根配置（P0-03 + Q6 裁决）：清单为空 = 维持全拒（合法姿态）；
+    /// 非空时**恰一项 active issuer**（契约 Q6：V1 单 issuer；LMMS 未来上线
+    /// 候选 A 时按清单机制平滑过渡，届时需复审）；issuer/jwks_url/audience
+    /// 非空、jwks_url 为 https（或本机回环 http）。
+    pub fn validate_all(list: &[DelegationIssuerConfig]) -> anyhow::Result<()> {
+        if !list.is_empty() && list.len() != 1 {
+            anyhow::bail!(
+                "exactly one active trusted issuer is required (contract v0.2 Q6:                  single active issuer); got {}",
+                list.len()
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for issuer in list {
+            if issuer.issuer.trim().is_empty() {
+                anyhow::bail!("delegation issuer id must not be empty");
+            }
+            if !seen.insert(issuer.issuer.clone()) {
+                anyhow::bail!("duplicate delegation issuer '{}'", issuer.issuer);
+            }
+            if issuer.audience.trim().is_empty() {
+                anyhow::bail!(
+                    "delegation issuer '{}' audience must not be empty",
+                    issuer.issuer
+                );
+            }
+            validate_jwks_url(&issuer.jwks_url)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_jwks_url(raw: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("delegation jwks_url '{raw}' is not a valid URL: {e}"))?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => anyhow::bail!(
+            "delegation jwks_url must be https (loopback http is allowed only for \
+             127.0.0.1/localhost/[::1]); got '{raw}'"
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -10,6 +74,9 @@ pub struct Config {
     pub log_filter: String,
     pub db_max_connections: u32,
     pub request_timeout: Duration,
+    /// 受信委托签发方清单。**空 = 维持全拒（fail-closed 默认）**：
+    /// `ClosedDelegationVerifier` 装配，一切业务请求 401。
+    pub delegation_issuers: Vec<DelegationIssuerConfig>,
 }
 
 impl Config {
@@ -30,12 +97,92 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10u64);
+        let delegation_issuers: Vec<DelegationIssuerConfig> =
+            match std::env::var("ARTIFACT_API_DELEGATION_ISSUERS") {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    let parsed: Vec<DelegationIssuerConfig> =
+                        serde_json::from_str(&raw).map_err(|e| {
+                            anyhow::anyhow!(
+                                "invalid ARTIFACT_API_DELEGATION_ISSUERS (expected JSON array of \
+                         {{issuer, jwks_url, audience?}}): {e}"
+                            )
+                        })?;
+                    DelegationIssuerConfig::validate_all(&parsed)?;
+                    parsed
+                }
+                _ => Vec::new(),
+            };
         Ok(Self {
             bind,
             database_url,
             log_filter,
             db_max_connections,
             request_timeout: Duration::from_secs(timeout_secs),
+            delegation_issuers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_issuer_list_is_accepted_and_means_fail_closed() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str("[]").unwrap();
+        DelegationIssuerConfig::validate_all(&issuers).unwrap();
+        assert_eq!(issuers.len(), 0);
+    }
+
+    #[test]
+    fn https_issuer_config_roundtrips() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://ai-pm.internal/.well-known/jwks.json"}]"#,
+        )
+        .unwrap();
+        assert_eq!(issuers[0].audience, "artifact-service");
+        DelegationIssuerConfig::validate_all(&issuers).unwrap();
+    }
+
+    #[test]
+    fn plaintext_remote_jwks_url_is_rejected() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"http://ai-pm.internal/.well-known/jwks.json"}]"#,
+        )
+        .unwrap();
+        assert!(DelegationIssuerConfig::validate_all(&issuers).is_err());
+    }
+
+    #[test]
+    fn loopback_http_jwks_url_is_allowed() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"http://127.0.0.1:9090/jwks.json"}]"#,
+        )
+        .unwrap();
+        DelegationIssuerConfig::validate_all(&issuers).unwrap();
+    }
+
+    #[test]
+    fn multiple_active_issuers_are_rejected_single_issuer_q6() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://a/jwks"},
+                {"issuer":"other","jwks_url":"https://b/jwks"}]"#,
+        )
+        .unwrap();
+        let err = DelegationIssuerConfig::validate_all(&issuers).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exactly one active trusted issuer")
+        );
+    }
+
+    #[test]
+    fn duplicate_issuers_are_rejected() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://a/jwks"},
+                {"issuer":"ai-pm","jwks_url":"https://b/jwks"}]"#,
+        )
+        .unwrap();
+        assert!(DelegationIssuerConfig::validate_all(&issuers).is_err());
     }
 }
