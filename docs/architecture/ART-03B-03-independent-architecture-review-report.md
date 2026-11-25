@@ -157,3 +157,89 @@ PR #5 允许 DB recovery 先撤销 Job/Attempt 的执行/提交资格，前提�
 本轮确认 ARC + OCI + cgroup v2 是合理的目标方向，但当前不能批准实施。新增 NRG、StartPermit 语义和 journal write-ahead 协议只是设计修订，不是实现证据。NRG 如何可靠撤销 ARC 的 in-flight Start admission 仍是 P0 设计与实测门禁。
 
 PR #6 必须保持 Open / Draft。不得创建 Worker/ARC/NRG 业务代码、Migration、Compose 或生产 Executor 启用开关；先对修订后的设计做第二轮独立复审。
+
+
+## 7. 第二轮独立复审（2026-11-25）
+
+第二轮裁决：**Changes Required / Not approved for implementation。** 首轮修订改善了问题描述，但仍未把 NRG admission revoke 落到可验证的权限/内核执行机制；同时发现时间锚定与死亡证明契约不完整。
+
+### AR-03B-03-05 — P0：NRG Start-admission revoke 没有可执行的强制执行点
+
+**问题**
+
+当前拓扑仍让 ARC 直接持有 containerd socket 与 cgroup 管理权限，同时要求 NRG 在 ARC 失联时撤销 ARC 的 Start admission。关闭 UDS、关闭客户端 socket、更新 generation 或发送 gRPC cancel，都不能证明已经进入 containerd 的 Start 请求不会迟到生效。
+
+NRG 若只有 KillOnly 权限，就不能撤销 ARC 的 runtime socket 能力；若 NRG 直接拥有 runtime socket，则它已不再是 KillOnly 组件。首轮设计没有裁决这两者的权限冲突。
+
+**必须修正**
+- 在 §7.7 明确两种可验证候选：A) NRG 独占 cgroup freeze/kill execution fence，ARC 保留受限 runtime API；B) NRG 成为唯一最小权限 runtime broker，ARC 不持 runtime socket。
+- 方案 A 必须证明 Executor 在第一条用户态指令前已进入 NRG 可 freeze 的 Attempt cgroup；NRG freeze 确认后，即使迟到 Start 创建 task，也不能执行；保持 frozen 直到 runtime task 删除与所有在途 Start 收敛。
+- 方案 B 必须证明 Start/revoke 在同一持久化 generation 状态机线性化，并处理已发给 containerd 的在途 RPC；不能只依赖 gRPC cancel。
+- 未选定并在目标 containerd/OCI runtime 上完成并发原型前，NRG revoke 不得被视为已设计完成。
+
+**状态：已写入 §7.7 候选方案；P0 仍开放。**
+
+### AR-03B-03-06 — P0：cgroup populated=0 不能单独证明未来不会出现迟到 task
+
+**问题**
+
+原 DeathConfirmed predicate 包含 runtime task exited、cgroup populated=0 和 ARC 已撤销 Start，但未把“所有可创建 task 的在途操作已收敛”变成强制证据。一次 populated=0 只是瞬时观察；如果 Start RPC 仍在 runtime server/shim 内处理，后续可能创建 task。
+
+**必须修正**
+- NRG 先 freeze cgroup，并等待内核 frozen 事件；
+- 撤销 StartPermit/admission generation；
+- 证明所有 runtime Start 操作已完成、明确失败或不可再提交；
+- 删除 OCI task/container，禁用 restart policy 与外部自动重建；
+- 再执行 cgroup.kill，确认 populated=0，确保旧操作不能重新填充 cgroup；
+- 任一条件未知即 DeathUnconfirmed/Quarantined；保留 frozen cgroup，不读输出、不提交、不清理。
+
+**状态：已写入 §7.8 与 ARC-T46/T48；仍需真实 runtime 证据。**
+
+### AR-03B-03-07 — P1：Linux suspend 会使泛称 CLOCK_MONOTONIC 的 Permit 截止时间失真
+
+**问题**
+
+设计要求使用“暂停感知 monotonic clock”，但没有指定时钟源。Linux CLOCK_MONOTONIC 不计入系统 suspend 时间；若 ARC/NRG 节点 suspend，Permit/admission cutoff 可能在挂起期间不前进，恢复后旧执行权可能比预期多存活。
+
+**必须修正**
+- Linux 使用 CLOCK_BOOTTIME 或经证明计入 suspend 的等价时钟；
+- resume 后先检查 Permit/admission lease 并完成 reconciliation，不得先解除 frozen cgroup 或接收 Start；
+- 加入 ARC-T47 suspend/resume 测试。
+
+**状态：已写入 §9.3；目标平台实测未完成，P1 仍开放。**
+
+### AR-03B-03-08 — P1：StartPermit 剩余时长缺少 DB→本机的保守锚定规则
+
+**问题**
+
+StartPermit 绑定 expiry，但未规定 DB 验证响应的网络延迟如何扣除。如果本机按 receive time + DB 返回剩余时长计算，传输延迟会被错误地加回 Permit，扩大执行窗口。DB validation 函数是否锁 Attempt/Job、与 cancel/recovery 的锁序也未定义。
+
+**必须修正**
+- DB-BLOCKER-02 返回向下取整、被 lease/deadline clamp 的 start_permit_remaining_ms；
+- ARC 在 RPC send 前记录 CLOCK_BOOTTIME t_send，以 t_send + remaining - transport/scheduler guard 计算 cutoff；
+- response 到达时已过期或不足以覆盖 Start/kill 预算则拒绝；
+- DB-BLOCKER-02 明确隔离级别、行锁与 cancel/recovery 锁序；若不锁行，证明短 TTL 足以覆盖竞态；若锁行，不得引入反向锁序；
+- 同一 Permit 只允许一个 operation_id；Start uncertain 后不得盲目重放。
+
+**状态：已写入 §9.3；DB-BLOCKER-02 尚未设计，P1 仍开放。**
+
+### AR-03B-03-09 — P1：NRG 自身故障的“独立监督”仍是抽象承诺
+
+**问题**
+
+设计写有 systemd watchdog/restart，但没有固定服务依赖、watchdog 超时、RestartSec、停止超时、NRG 卡在不可中断内核等待时的处理，以及节点 Ready 的恢复门槛。不能把“由 systemd 监督”直接等同于有界 fail-safe。
+
+**必须修正**
+- 具体冻结 NRG systemd unit/watchdog/RestartSec/TimeoutStopSec 与 NRG service cgroup；
+- 明确 PID 1、kernel、containerd 的故障假设；若 systemd/PID 1 无法执行回收，节点必须被视为不可用并由节点外部 fencing/重启策略处理；
+- NRG crash/restart 前后，所有 Attempt cgroup 先 freeze/reconcile，未知资源 KillOnly；
+- 实测 NRG crash、hang、D-state、watchdog、systemd restart、权限/磁盘故障的最坏时延；
+- 未证明时节点 Ready 必须失败。
+
+**状态：未充分设计，P1 仍开放。**
+
+## 8. 第二轮最终裁决
+
+PR #6 仍为 **Changes Required / Not approved for implementation**。第二轮新增的 §7.7/§7.8/§9.3 是候选约束，不是已证明的实现方案。
+
+当前不批准创建 ARC/NRG 代码、DB migration、Compose 或生产启用配置。下一步应先做一个最小 Linux runtime feasibility spike：固定目标 kernel/containerd/runc/systemd 版本，验证方案 A/B 中一个完整的 Start-vs-freeze/revoke-vs-late-Start 时序，并保留内核、containerd、shim、cgroup 证据。若无法证明迟到 Start 不会执行，则必须改变执行架构，不能靠加长 timeout 或增加轮询掩盖。
