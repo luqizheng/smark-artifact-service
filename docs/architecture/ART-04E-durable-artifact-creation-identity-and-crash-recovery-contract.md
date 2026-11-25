@@ -185,7 +185,7 @@ For a keyed create request:
 2. Start one transaction. For a supplied Idempotency-Key, atomically insert its reservation row (using the existing unique scope `tenant_id/project_id/endpoint/idempotency_key`) or lock/read the existing row:
    - a different request hash returns the existing idempotency conflict;
    - a completed matching row replays its response;
-   - an incomplete legacy row may proceed only under the cutover/drain rule in §6.1.
+   - an incomplete legacy row is not proof that the Artifact operation did not commit. It may be reconciled/reused only after the old-writer drain in §6.1 and an explicit check of both Artifact and identity state; if the key is still ambiguous, fail closed for operator reconciliation.
 3. Resolve `(tenant_id, project_id, artifact_key)` in `artifact_creation_identity` inside the same transaction:
    - if an identity exists, canonicalize the incoming semantic DTO using that stored identity's fingerprint version; a matching hash resolves the existing Artifact, while a mismatch returns HTTP 409 `ARTIFACT_KEY_CONFLICT`;
    - if no identity exists, insert the Artifact and its identity row in this transaction.
@@ -233,7 +233,8 @@ The migration must enforce both directions of the identity relationship:
 - A deferred constraint trigger on newly inserted/key-mutated Artifact rows verifies at commit that a non-null `artifact_key` has a matching identity row for the same tenant/project/Artifact.
 - A deferred constraint trigger on identity-row insertion verifies at commit that the referenced Artifact has exactly the same `artifact_key` and scope.
 - Runtime permissions and append-only triggers prevent identity update/delete/rebinding.
-- A BEFORE UPDATE guard rejects any change to an existing Artifact's `artifact_key`.
+- A BEFORE UPDATE guard rejects any change to an existing Artifact's non-null `artifact_key`.
+- In V1, NULL→non-NULL key assignment on an existing Artifact is also rejected. If a future adoption workflow needs to assign a key to an existing unkeyed Artifact, it must be a separately specified atomic operation that creates the immutable identity and fingerprint in the same transaction; it is not part of AS-1.
 
 This allows the Artifact and identity inserts to occur in either order within one transaction while preventing either side from committing alone or being paired with a mismatched key. Existing legacy rows are not retroactively rejected merely because they predate the identity table.
 
@@ -351,6 +352,15 @@ All tests below are required before AS-1 can be marked implementation-complete.
 33. A deferred trigger rejects commit of a new keyed Artifact without a matching identity row.
 34. A deferred trigger rejects commit of an identity row whose artifact_key differs from the referenced Artifact.
 35. An old reservation-first writer cannot overlap the new handler during cutover; deployment evidence demonstrates the old writer drain gate.
+36. The keyed-create transaction commits idempotency reservation, Artifact, creation identity, and completed response snapshot/resource_id together.
+37. Best-effort audit failure after commit does not change the successful create response or roll back the Artifact.
+38. Existing raw-body Idempotency-Key hashing remains byte-sensitive; the semantic Artifact creation fingerprint is stable across equivalent JSON serialization.
+39. APP role cannot UPDATE or DELETE creation identity rows.
+40. APP role cannot mutate an existing artifact_key through direct SQL.
+41. NULL→non-NULL artifact_key assignment on an existing Artifact is rejected unless a separately approved adoption operation is used.
+42. An idempotency row whose expires_at is in the past but remains stored is not silently treated as absent or reusable.
+43. Fresh delegation authorization is required before replaying an existing Artifact.
+44. No test or documentation claims RLS isolation unless RLS is explicitly introduced and tested.
 
 
 ## 10. Failure-injection evidence
@@ -372,7 +382,7 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 ## 11. Implementation sequence and gates
 
 1. Reconfirm current default-branch schema, application create path, idempotency implementation, RLS/DB roles, audit helper, and test harness before writing migration code.
-2. Add migration for the append-only identity table, constraints, indexes, and role/RLS policy.
+2. Add migration for the append-only identity table, constraints, indexes, and explicit APP/WORKER grants/revokes. Do not describe the current design as RLS-protected.
 3. Add canonicalization implementation with golden vectors.
 4. Implement a single transactional create-or-resolve database/application path.
 5. Change handler ordering so durable key resolution is not blocked by stale Idempotency-Key reservations.
@@ -384,10 +394,9 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 
 ## 12. Open questions to resolve during independent review
 
-1. Confirm whether Artifact create currently permits mutation of `artifact_key`; if so, enforce immutability without breaking legitimate legacy workflows.
-2. Confirm the exact existing idempotency reservation/response-cache transaction semantics and adapt handler ordering without regressing non-keyed clients.
-3. Confirm whether audit insertion can be part of the same transaction through the existing controlled function.
-4. Confirm the service's canonical API behavior for a replayed create (200 existing resource vs 201 original-create semantics). The recommended contract is 200 for a durable key replay.
-5. Confirm the final fingerprint field set against the actual CreateArtifactRequest DTO and any server-generated defaults.
+1. Confirm the exact API response convention for a durable key replay (recommended: 200 with explicit replay indicator).
+2. Confirm any server-generated defaults in CreateArtifactRequest before freezing fingerprint golden vectors.
+3. Define the operational mechanism proving old keyed-create writers are drained before new handler activation.
+4. Define explicit cleanup/reconciliation semantics for expired idempotency rows; an `expires_at` timestamp alone does not make a conflicting row reusable.
 
 No open question permits weakening the atomic Artifact + creation-identity transaction or treating the Idempotency-Key cache as durable authority.
