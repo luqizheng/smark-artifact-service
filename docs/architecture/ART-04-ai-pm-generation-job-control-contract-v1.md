@@ -3,7 +3,7 @@
 > **Status:** Cross-service design proposal / Draft; not an implementation approval.
 > **Date:** 2026-11-25
 > **Authority:** Artifact Service owns the GenerationJob API and technical execution state. AI-PM owns the business task/run and its intent.
-> **Related:** ART-01 V1 API, ART-01 V1 API Errata 001, ART-03A, ART-03B-01 implementation report.
+> **Related:** ART-01 V1 API, ART-01 V1 API Errata 001, ART-03A, ART-03B-01 implementation report, [ART-04A durable request correlation and exact Version result contract](ART-04A-durable-request-correlation-and-version-result-contract.md).
 
 ## 1. Purpose
 
@@ -200,3 +200,15 @@ Observed in `ai-pm` main:
 - Migration must be staged: do not rename/reuse `viz.*` tables as generic Artifact Service tables and do not introduce long-lived dual writes. Business approval must continue to reference the AI-PM business artifact identity and be linked to the generic Artifact/Version through stable mapping/reference data.
 
 This snapshot must be rechecked before implementation; it is not a runtime deployment claim.
+
+
+## 11. ART-04A contract addendum
+
+The independent review findings AR04-01 and AR04-02 now have a concrete additive API proposal in [ART-04A](ART-04A-durable-request-correlation-and-version-result-contract.md):
+
+- `caller_request_id` is a durable business-operation identity; `Idempotency-Key` remains a bounded HTTP retry cache.
+- A caller-scoped lookup endpoint allows AI-PM to reconcile uncertain Job creation after the idempotency retention window.
+- The public GenerationJob response exposes the existing internal `target_version_id`; successful Jobs require a stable exact Version reference and committed READY Output.
+- This is still a proposal. No OpenAPI, DTO, migration, SDK, or runtime behavior has been changed by this addendum.
+
+ART-04 remains **Draft / Changes Required / Not approved for implementation** until ART-04A receives independent review and the proposed persistence/API invariants are verified against the implementation.
