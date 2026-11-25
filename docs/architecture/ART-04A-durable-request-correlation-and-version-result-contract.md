@@ -52,7 +52,7 @@ For a repeated create request:
 - Same scope + same caller_request_id + same canonical request fingerprint: return the original GenerationJob with HTTP 200 and an explicit replay marker (for example `X-Idempotent-Replay: true`). Do not return 202 as though a new Job were created.
 - Same scope + same caller_request_id + different fingerprint: return 409 `CALLER_REQUEST_ID_REUSED`.
 - Same caller_request_id under a different tenant/project: it is a separate scope and MUST NOT disclose the other Job.
-- Concurrent requests with the same identity must serialize on the unique constraint and converge on exactly one Job. The caller_request_id lookup/insert and GenerationJob insert must occur in one database transaction; the unique-constraint loser must re-read and return the winning Job after comparing the canonical fingerprint.
+- Concurrent requests with the same identity must serialize on the unique constraint and converge on exactly one Job. The caller_request_id lookup/insert and GenerationJob insert must occur in one database transaction; the unique-constraint loser must re-read and return the winning Job after comparing the canonical fingerprint. A stale/incomplete `idempotency_record` reservation MUST NOT permanently block this durable caller identity from being resolved: when no Job exists for caller_request_id, the server must allow the request to re-enter the create transaction under the caller_request_id uniqueness lock, even if the short-lived Idempotency-Key record is still marked in progress. The durable caller identity is the correctness boundary; the response-cache reservation is secondary.
 
 The durable record MUST NOT expire with the 24-hour idempotency cache. Its retention must be at least as long as the referenced Job can be queried or audited. If Job archival/deletion is introduced later, the correlation tombstone must remain for the documented reconciliation/audit horizon and must never silently become reusable.
 
@@ -171,7 +171,7 @@ AI-PM implementation will need to:
 | Lookup A in same tenant/project | Original Job returned |
 | Lookup A in another tenant/project | 404; no existence disclosure |
 | Lost create response, lookup finds Job | AI-PM resumes existing Job |
-| Lost create response, lookup 404, retry races original | Unique constraint converges to one Job |
+| Lost create response, lookup 404, retry races original | Unique constraint converges to one Job |\n| Process crashes after Idempotency-Key reservation but before Job insert | Same caller_request_id can safely re-enter; stale cache reservation cannot wedge the operation |
 | Job queued/running before target Version allocation | target_version_id may be null |
 | Job succeeds | target_version_id is non-null, immutable, same-scope, READY Version |
 | Current pointer changes after Job success | target_version_id remains unchanged |
