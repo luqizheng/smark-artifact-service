@@ -205,3 +205,66 @@ The proposal is grounded in the current `main` schema/model, but the required be
 - The current SeeCode generation path remains unavailable/fail-closed, so the actual point at which a target Version is allocated cannot yet be verified against a working end-to-end generator.
 
 Consequently, ART-04A is an additive contract proposal, not evidence of a working recovery path. During implementation, the team must inspect the complete create/commit transaction and prove that the caller_request_id uniqueness record and Job row commit atomically, and that the target Version is allocated exactly once and remains stable through retries, cancellation, and completion.
+
+
+## 8. Logical Artifact creation recovery by stable artifact_key
+
+ART-04B identified the same lost-response problem one step earlier in the AI-PM saga: creating the logical slot Artifact can also succeed while the response is lost. GenerationJob `caller_request_id` does not solve that earlier call.
+
+The existing Artifact model already has a project-scoped unique `artifact_key`, and `CreateArtifactRequest` already accepts it. The current list API, however, has no exact artifact_key filter. Add the following additive contract:
+
+### 8.1 Stable key
+
+For one AI-PM Visualization slot, AI-PM derives:
+
+`artifact_key = "viz-slot:" + lowercase_hex_sha256(UTF8(slot_key))`
+
+The key is stable for the lifetime of the slot and unique within the authenticated tenant/project scope. A changed slot_key is a different logical Artifact. A deleted/archived key is not silently reusable.
+
+### 8.2 Lookup
+
+Add an exact-match `artifact_key` query parameter to:
+
+`GET /v1/artifacts?artifact_key={artifact_key}`
+
+- `X-Project-Id` and validated delegation are required.
+- Lookup is exact-match and scoped to the authenticated tenant/project.
+- Because the database key is unique, the response contains zero or one matching Artifact.
+- A missing key returns an empty page, not a cross-project existence signal.
+- The response includes the existing `artifact_key` field and full Artifact ID.
+
+### 8.3 Create conflict / replay
+
+For `POST /v1/artifacts` with a non-null artifact_key:
+
+- If the key is new, create the Artifact normally.
+- If the key already exists in the same tenant/project and the immutable identity fields (at minimum artifact_type) match, return the existing Artifact with HTTP 200 and an explicit replay marker; do not create another logical Artifact.
+- If the key exists but immutable identity fields conflict, return 409 `ARTIFACT_KEY_REUSED`.
+- If the existing Artifact is deleted, return a stable conflict such as `ARTIFACT_KEY_RETIRED`; do not resurrect or reuse the key.
+- Concurrent creates with the same key must converge on one Artifact under the existing unique constraint; the unique-constraint loser re-reads and returns the winner after checking identity compatibility.
+
+Name, description and category remain mutable metadata and must be changed through PATCH, not by replaying create with a different payload.
+
+### 8.4 AI-PM recovery
+
+Before calling create, AI-PM persists the intended stable artifact_key in its slot-binding/saga record.
+
+After an uncertain create response:
+1. GET by exact artifact_key.
+2. If found, persist the returned artifact_id and continue.
+3. If absent, retry POST with the same artifact_key and the same immutable identity fields.
+4. If a concurrent create wins, the API returns the same Artifact or the subsequent lookup finds it.
+5. Never generate a new artifact_key to work around a timeout or conflict.
+
+This removes the dependency on the finite Idempotency-Key cache for recovering the logical slot Artifact. Idempotency-Key remains useful for short-window HTTP response replay.
+
+### 8.5 Implementation impact
+
+This is still a proposal. Implementation requires:
+- OpenAPI query parameter and stable 200/409 semantics;
+- API list filter and exact-match query test;
+- create conflict recovery under concurrent requests;
+- tests for lost response, same key/same type, same key/different type, deleted key, and cross-project isolation;
+- SDK typed list filter or a dedicated `get_artifact_by_key` convenience method.
+
+The `artifact_key` database uniqueness already exists; this proposal does not require a new database column or a new identity table in Artifact Service.
