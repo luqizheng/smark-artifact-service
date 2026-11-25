@@ -33,7 +33,7 @@ Add required `caller_request_id` to `CreateGenerationJobRequest`:
 - One ID represents exactly one intended GenerationJob creation, not a whole Task, Run, or multi-step orchestration.
 - AI-PM MUST reuse the same ID for every retry/reconciliation of that intended Job.
 - If AI-PM intentionally requests a new generation after a terminal Job, it MUST create a new caller_request_id and a new Idempotency-Key.
-- The request fingerprint MUST cover the authenticated tenant/project scope, artifact_id, generator_id, and canonical semantic request body (including input, options, and expected_current_version_id). Transport-only fields and trace IDs are excluded.
+- The durable request fingerprint MUST cover the authenticated tenant/project scope, artifact_id, generator_id, and canonical semantic request body (including input, options, and expected_current_version_id). Transport-only fields and trace IDs are excluded. The Idempotency-Key fingerprint MUST additionally include caller_request_id, so one short-lived key cannot accidentally replay a Job registered under a different durable caller identity.
 
 The Artifact Service MUST derive tenant/project scope from its validated request/delegation context, not trust caller-supplied scope fields.
 
@@ -52,7 +52,7 @@ For a repeated create request:
 - Same scope + same caller_request_id + same canonical request fingerprint: return the original GenerationJob with HTTP 200 and an explicit replay marker (for example `X-Idempotent-Replay: true`). Do not return 202 as though a new Job were created.
 - Same scope + same caller_request_id + different fingerprint: return 409 `CALLER_REQUEST_ID_REUSED`.
 - Same caller_request_id under a different tenant/project: it is a separate scope and MUST NOT disclose the other Job.
-- Concurrent requests with the same identity must serialize on the unique constraint and converge on exactly one Job.
+- Concurrent requests with the same identity must serialize on the unique constraint and converge on exactly one Job. The caller_request_id lookup/insert and GenerationJob insert must occur in one database transaction; the unique-constraint loser must re-read and return the winning Job after comparing the canonical fingerprint.
 
 The durable record MUST NOT expire with the 24-hour idempotency cache. Its retention must be at least as long as the referenced Job can be queried or audited. If Job archival/deletion is introduced later, the correlation tombstone must remain for the documented reconciliation/audit horizon and must never silently become reusable.
 
