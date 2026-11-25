@@ -241,3 +241,17 @@ Before AS-1 can be approved for implementation:
 7. Re-review the revised specification and its cutover sequence.
 
 This review does not authorize implementation. It does not approve ART-04B/AS-2/AS-3/AS-4, Worker runtime, SeeCode activation, or production generation.
+
+
+## 9. Follow-up specification convergence (2026-11-25)
+
+ART-04E has since been revised to close the design gaps identified in F-01..F-07. The following decisions are now explicit:
+
+- **Expiry:** `expires_at` is only cleanup eligibility. Completed records replay while physically present; cleanup physically deletes only completed expired rows under row locking. Incomplete rows are never TTL-deleted and require post-drain reconciliation.
+- **Legacy incomplete records:** after old writers are drained, reconcile only when the durable Artifact identity and raw Idempotency-Key request hash prove the same operation. No Artifact/no identity may be abandoned only through an explicit operator-approved action. Artifact without identity or inconsistent evidence remains blocked.
+- **Old-writer cutover:** gate keyed writes on every instance, drain in-flight requests, remove old instances, apply identity migration/invariant backstop, deploy the new build while gated, verify schema/build compatibility, reconcile legacy records, run DB-backed smoke tests, then reopen traffic. If the platform cannot prove the drain, rollout is blocked.
+- **Application port:** a purpose-built `create_or_resolve_keyed` operation owns one SQLx transaction and returns typed outcomes (`Created`, `ResolvedExisting`, `ReplayedByIdempotency`, typed conflicts, retryable failure). Existing unkeyed create remains on its current path in V1.
+- **Replay integrity:** a completed Idempotency-Key row is not blindly replayed; its resource_id must resolve to an Artifact and matching durable identity/fingerprint in the currently authorized scope.
+- **Acceptance:** ART-04E now defines 56 acceptance cases, including cleanup races, incomplete-row reconciliation, replay integrity, old-writer drain evidence, and response semantics.
+
+These are specification corrections, not implementation evidence. The source-review findings remain historically valid. **Disposition remains Changes Required until a final independent review of the revised ART-04E confirms that these policies are mutually consistent and implementable against the repository's current schema and deployment model.** No implementation is authorized by this follow-up.
