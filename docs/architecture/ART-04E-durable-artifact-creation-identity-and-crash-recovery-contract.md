@@ -300,6 +300,7 @@ V1 policy:
    - Artifact exists without identity, or evidence is inconsistent: keep the row blocked and require operator investigation; do not infer a fingerprint.
 5. Once a completed row is physically deleted, that Idempotency-Key may be used again under the existing retention contract. The durable `artifact_key` still prevents a duplicate logical Artifact and checks the semantic fingerprint.
 6. The cleanup job must not delete or mutate `artifact_creation_identity` rows. Durable identity retention is independent of Idempotency-Key retention.
+7. The cleanup worker must not receive broad table DELETE privileges. Expose a narrowly scoped maintenance function (or equivalent privileged maintenance path) that deletes only completed, expired Idempotency-Key rows in bounded batches under the required row-lock semantics. Revoke PUBLIC execution and grant only the designated maintenance principal. Incomplete-row reconciliation is a separate operator-controlled operation and must not be callable as routine TTL cleanup.
 
 The cleanup/reconciliation mechanism, metrics, and operator runbook are required implementation artifacts. The exact cleanup batch size is operational configuration, not an API contract.
 
@@ -307,15 +308,19 @@ The cleanup/reconciliation mechanism, metrics, and operator runbook are required
 
 The current implementation reserves Idempotency-Key in a separate operation before inserting the Artifact. An old handler may therefore still be in flight while a new handler tries to recover its stale reservation.
 
-Before enabling the new keyed-create transaction path, perform a controlled, observable cutover:
+Before enabling the new keyed-create transaction path, perform a controlled, observable cutover. The current old binary has no keyed-create maintenance gate, so the gate MUST NOT assume that an old handler can honor a newly introduced application flag.
 
-1. Activate a keyed-create write gate on every serving instance; the old handler must reject new keyed requests with a stable retryable maintenance response. Unkeyed creates remain available if operationally safe.
-2. Wait for the in-flight keyed-create count on every instance to reach zero; then stop and remove every old application instance. Verify the deployment inventory contains no old binary and no old process can receive traffic.
+Preferred V1 cutover:
+
+1. At the ingress/API gateway, temporarily disable the entire `POST /v1/artifacts` create route and return a stable retryable maintenance response. This intentionally pauses unkeyed creates too; it avoids relying on code that does not yet contain the gate.
+2. Wait for the in-flight POST create request count across all instances to reach zero. Stop and remove every old application instance. Verify the deployment inventory contains no old binary and no old process can receive traffic.
 3. Apply the identity migration and DB grants/revokes only after the old writers are drained. The deferred invariant trigger then provides a database backstop: any residual old binary attempting a keyed Artifact insert without an identity row must fail at commit.
-4. Deploy the new binary with keyed creation still gated. Verify all instances report the new build/schema compatibility version and the new transactional port is active.
+4. Deploy the new binary with the create route still gated. Verify all instances report the new build/schema compatibility version and the new transactional keyed-create port is active.
 5. Reconcile pre-existing incomplete Idempotency-Key records under §6.2 and inventory legacy keyed Artifacts without identity rows.
-6. Run a scoped smoke test and verify Artifact + identity + completed idempotency state in the database.
-7. Reopen keyed-create traffic only after all checks pass. Record deployment versions, gate transitions, drain metrics, migration version, and reconciliation counts as rollout evidence.
+6. Run scoped keyed and unkeyed smoke tests through a controlled internal route, verifying Artifact + identity + completed idempotency state for keyed requests.
+7. Reopen `POST /v1/artifacts` only after all checks pass. Record deployment versions, gate transitions, drain metrics, migration version, and reconciliation counts as rollout evidence.
+
+If a full route pause is operationally unacceptable, first deploy a gate-capable compatibility release to every instance, verify all instances run it, then enable its keyed-create gate and drain keyed requests before proceeding. Do not assume old binaries honor a gate they were never built to support.
 
 If the platform cannot prove the old-writer drain or prevent old binaries from returning, do not apply the migration or enable the new path. A database trigger is a final invariant backstop, not a substitute for draining old writers.
 
@@ -374,7 +379,7 @@ All tests below are required before AS-1 can be marked implementation-complete.
 9. Crash after identity insert but before commit: transaction rollback leaves neither row.
 10. Commit succeeds but HTTP response is lost: retry with same key/fingerprint returns the same Artifact ID.
 11. Idempotency reservation exists but process dies before Artifact transaction: retry bypasses stale reservation using durable key resolution and creates exactly one Artifact.
-12. Artifact transaction commits but Idempotency-Key completion fails: retry still resolves the same Artifact.
+12. Writing the completed Idempotency-Key response fails before transaction commit: Artifact, identity, and idempotency reservation all roll back; retry can safely create or resolve the same key.
 13. Idempotency-Key cache expires: same artifact_key/fingerprint still resolves the same Artifact.
 14. Same artifact_key with a new Idempotency-Key and same fingerprint returns the same Artifact.
 15. Same artifact_key with a new Idempotency-Key and a different fingerprint returns 409.
@@ -423,8 +428,8 @@ All tests below are required before AS-1 can be marked implementation-complete.
 49. TTL cleanup never deletes incomplete Idempotency-Key rows.
 50. Post-drain reconciliation completes an incomplete row only when matching Artifact identity and raw request hash are proven.
 51. Post-drain reconciliation does not auto-delete or reuse a row when an Artifact exists without durable identity.
-52. A keyed-create request under the write gate is rejected consistently by every old serving instance.
-53. The drain procedure records zero in-flight keyed creates and verifies no old application instance remains before migration.
+52. The ingress gate rejects all POST /v1/artifacts creates consistently during the migration window, including unkeyed creates, unless every instance has first been upgraded to a gate-capable compatibility release.
+53. The drain procedure records zero in-flight create requests and verifies no old application instance remains before migration.
 54. The database deferred invariant rejects a residual old binary's keyed Artifact insert without a matching identity row.
 55. The new application build remains gated until schema compatibility and atomic keyed-create smoke checks pass.
 56. New and existing-key responses use the frozen 201/200 semantics and a stable resolution indicator/header.
@@ -463,7 +468,7 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 
 1. **HTTP replay semantics:** new Artifact is 201; durable key resolution or completed idempotency replay is 200. Both return the same Artifact representation and an explicit `resolution` field (`created`, `existing_key`, or `idempotency_replay`) if consistent with the API response conventions. If the current response envelope cannot add this field compatibly, use a response header rather than changing existing required fields.
 2. **Fingerprint defaults:** canonicalization is computed from the validated DTO after applying deterministic server defaults. Before implementation, record the actual defaults in golden test vectors from `CreateArtifactRequest`; no default may depend on wall-clock time, random values, or request order.
-3. **Old-writer drain:** use the per-instance write gate, in-flight drain, old-instance removal, migration invariant backstop, new-build verification, and gated smoke test defined in §6.1. If the deployment platform cannot prove these steps, rollout is blocked.
+3. **Old-writer drain:** use the ingress-level POST route pause (or first deploy a gate-capable compatibility release), drain in-flight create requests, remove old instances, apply the migration invariant backstop, verify the new build, and run gated smoke tests as defined in §6.1. If the deployment platform cannot prove these steps, rollout is blocked.
 4. **Idempotency expiry:** `expires_at` is retention eligibility only. Completed rows are replayable until physically deleted by the locked cleanup process; incomplete rows are never TTL-deleted and require explicit post-drain reconciliation under §6.2.
 5. **Keyed-create port:** implement the purpose-built `create_or_resolve_keyed` operation and typed outcomes defined in §5.7. Keep unkeyed create on its existing path in V1.
 
