@@ -37,7 +37,7 @@ One AI-PM Task/Run step may create one or more GenerationJobs. Each GenerationJo
 AI-PM must persist the external correlation in its own database, at minimum:
 
 - AI-PM task/run identifier and stable step identifier;
-- Artifact Service `artifact_id` and `generation_job_id`; the committed `version_id` is recorded after the successful Job result exposes the created Version through the Artifact/Version API. V1 GenerationJob response does not itself promise a `version_id` field;
+- Artifact Service `artifact_id` and `generation_job_id`; the internal Job model has `target_version_id`, but the current public GenerationJob response does not expose it. AI-PM therefore cannot yet persist an authoritative Job-to-Version mapping from the V1 response;
 - stable `Idempotency-Key` used for creation;
 - request hash or immutable request reference;
 - last observed GenerationJob status and observation timestamp (a local read model, not an authority);
@@ -71,7 +71,7 @@ No indefinite dual-write between legacy `viz.*` storage and Artifact Service is 
    `POST /v1/artifacts/{artifact_id}/generation-jobs`
 
 4. AI-PM supplies a stable `Idempotency-Key` derived from a durable AI-PM run-step identity. It must reuse the same key and exact request body when retrying an uncertain request.
-5. Artifact Service validates the request and generator availability, creates the Job and immutable input snapshot, and returns `202` with the GenerationJob identity when the creation path is enabled. The request may carry `expected_current_version_id` as a current-pointer concurrency precondition; it is not a Job revision or a target Version ID. The GenerationJob response schema does not promise a `version_id`; the output Version is created on successful generation and must then be discovered through the Artifact/Version API.
+5. Artifact Service validates the request and generator availability, creates the Job and immutable input snapshot, and returns `202` with the GenerationJob identity when the creation path is enabled. The request may carry `expected_current_version_id` as a current-pointer concurrency precondition; it is not a Job revision or a target Version ID. ART-01's internal Job model includes `target_version_id`, but the public GenerationJob response currently omits it. This is a consumer-contract gap: before AI-PM needs exact version-level provenance, the API should expose `target_version_id` (or an equivalent terminal result reference) as an additive response field. AI-PM must not guess the output Version by reading the Artifact's current pointer, because concurrent generation or later pointer changes can make that association ambiguous.
 6. AI-PM persists the returned Job identity and moves its own Run step into a waiting-for-external-execution state.
 
 If the HTTP response is lost after the server accepted the request, AI-PM retries with the same Idempotency-Key and byte-equivalent semantic request body while the server's idempotency record is guaranteed to be retained. The OpenAPI currently promises retention of at least 24 hours, not an unlimited lifetime, and provides no lookup-by-idempotency-key endpoint. Therefore, after the documented minimum retention window has elapsed, AI-PM must not blindly replay an uncertain create: it must hold the Run step for reconciliation/manual resolution until a durable request-correlation lookup contract exists. This is an open integration gap, not a solved recovery guarantee.
