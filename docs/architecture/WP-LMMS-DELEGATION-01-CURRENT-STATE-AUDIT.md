@@ -1,12 +1,13 @@
-# WP-LMMS-DELEGATION-01 — 跨服务授权委托：现状审计（只读）
+# WP-LMMS-DELEGATION-01 — 跨服务授权委托：现状审计（只读，R1 修订版）
 
 | | |
 |---|---|
 | 工作包 | WP-LMMS-DELEGATION-01 |
 | 阶段 | 第一阶段：只读审计（本文档不含任何协议裁决，协议草案见 AUTHORIZATION-CONTRACT） |
-| 审计日期 | 2026-11-25 |
-| 审计基线 | lmms `main` @ tag `v1.8.2`（提交 `3dd6ced1` bump + `258cce3a` 钉版）；ai-pm `origin/master` @ `6f317176`；smark-artifact-service `origin/main` @ `b5095cf`（PR #8 AS-1 + PR #9 AS-2 已合并后的真实主干） |
-| 审计方法 | 逐仓库检查真实 Handler / Service / Domain / Migration / 测试 / OpenAPI / compose 部署配置；所有结论附文件路径与函数名；"缺失"结论附检索关键词。标注（复核）的条目为审计人二次抽查确认；其余为逐文件阅读取证 |
+| 审计日期 | 2026-11-25（R1 修订：独立安全评审后全量重核，基线修正 + F-22 事实更正 + 新增 F-27/F-28） |
+| 审计基线 | lmms tag `v1.8.2` @ `93fc3a2e`（本地检出 `92691f33` = tag 后 2 个 SDK dist 提交，`git diff v1.8.2..HEAD -- services/` 为空，服务代码与 tag 一致）；ai-pm **GitHub 权威** `master` @ `d0e72fa6`（`origin` 为内部同步副本 `origin/master@6f317176`，已落后，不作为基线）；smark-artifact-service `origin/main` @ `b5095cf`（PR #8 AS-1 + PR #9 AS-2 已合并后的真实主干） |
+| 证据分级 | **A 类**（用户提供的部署环境事实：LMMS 1.8.2 已在私有网络发布）、**B 类**（Git 源码证据：上述基线的源码与测试）、**C 类**（实际部署证据：运行镜像 digest、启动版本、运行行为）——本文档全部结论为 B 类；**C 类证据缺失**（见 F-27），A 类不用于推导任何代码结论 |
+| 审计方法 | 逐仓库检查真实 Handler / Service / Domain / Migration / 测试 / OpenAPI / compose 部署配置；所有结论附文件路径与函数名；"缺失"结论附检索关键词。R1 修订对上一轮全部（复核）条目抽查重验（本轮抽验：`middleware/mod.rs:265` aud=None、`revoke_svc::is_revoked` 无生产调用方、`token.router.toml:19-23` public=true、`auth_svc.rs:209-215` claims、`service_jwt.rs:41` TTL=3600、`issuer.rs:194` aud 常量、`file.rs:90-91`、`issuer.rs:253` as u64——全部属实），并修正 F-22 的事实错误（见 §5） |
 | 约束遵守 | 未修改 lmms 仓库；未运行任何 Migration；未连接任何数据库 |
 
 ---
@@ -25,7 +26,7 @@
 |---|---|
 | 用户身份认证 + 可验证 JWT | ✅ LMMS 已具备 |
 | 服务到服务认证（aud 绑定 service-jwt） | ✅ LMMS 已具备，AI-PM 已在 file-service 上实战使用 |
-| 文件存储 + 租户隔离 | ✅ 具备（有信任边界注意事项，见 §2.6） |
+| 文件存储 + 租户隔离 | ⚠️ 常规路径具备；`unwrap_or(1)` 回落 + user_id 自声明限制其安全表述（F-24，见 §1.6） |
 | 委托 Token 签发（LMMS 侧） | ❌ 不具备可用实现（resource token 端点未鉴权 + claims 不全 + 无消费者） |
 | 委托 Token 验证（AS 侧） | ❌ 端口契约已定义，生产实现 fail-closed（等待可信签发方出现） |
 | 业务授权决策（AI-PM 侧） | ✅ 授权模型完备；缺"把决策固化为可验证凭证"的签发器 |
@@ -39,7 +40,8 @@
 
 ### 1.1 版本与部署形态
 
-- 版本 1.8.2 属实：`lmms/Cargo.toml` `[workspace.package] version = "1.8.2"`（8 个 services 继承）；tag `v1.8.2` 存在；`examples/docker-deploy/.image.env` 与 `examples/docker-deploy-full/.image.env` 钉版 `1.8.2`。（复核）
+- 版本 1.8.2 属实：`lmms/Cargo.toml` `[workspace.package] version = "1.8.2"`（8 个 services 继承）；tag `v1.8.2` @ `93fc3a2e` 存在；`examples/docker-deploy/.image.env` 与 `examples/docker-deploy-full/.image.env` 钉版 `1.8.2`。（复核）
+- **C 类证据缺口（F-27）**：上述钉版只是**仓库内的配置文件**，不能证明运行中的镜像与 `v1.8.2` 源码一致。实际部署产物一致性需要：运行镜像 digest、容器启动日志中的版本号、运行服务的实际行为探测——当前三者均无记录。本文档所有"已具备/未具备"结论均指 **tag `v1.8.2` 源码形态**（B 类证据），不声称实际部署产物已与源码一致。
 - 服务清单（`services/`）：`api-gateway`、`token-service`、`iam-service`、`iam-outbox-publisher`、`audit-service`、`notification-service`、`file-service`、`prue_backend`；共享库 `libs/`（`common-jwt`、`jwt-ctx`、`authz`、`common-crypto` 等）；SDK `sdk/rust`、`sdk/java`、`sdk/iam-services`（TS）、`sdk/file-services`（npm）。
 - 部署：`docs/deploy-topologies.md`（2026-11-06）定义三种内网拓扑（单机 / 合并模板 / 多机分置），全部为纯内网 HTTP——`grep "listen 443|ssl_certificate"` 于 examples/infrastructure 为 0 命中，nginx 配置 `listen 80`。**无 TLS、无 vault/KMS**，密钥经 `.env` / compose env 注入。
 - JWT 签名密钥：`services/token-service/config/config.yaml` 指向 `/app/keys/private.pem|public.pem`（compose 命名卷 `token-keys` 持久化）；keystore（`services/token-service/src/keystore.rs`）支持多 kid、损坏 fail-closed；轮换为 API 触发（`POST /admin/keys/rotate`，`routes/keys_admin.rs:133`），kid-strict 验签（`libs/common-jwt/src/verify.rs:71-83`）。**无自动轮换**。仓库根 `keys/private.pem`/`public.pem` 为历史遗留密钥对且**已提交进 git**（复核：`git ls-files keys/` 命中）——见 SECURITY-REVIEW 附加发现 F-21。
@@ -47,10 +49,13 @@
 ### 1.2 用户身份认证
 
 - 登录链：`POST /iam/auth/login`（`services/iam-service/src/routes/auth.rs:24,65`）→ `AuthService::login`（`service/auth_svc.rs:26-194`，租户解析、密码验证、`iam_login_logs`、outbox 事件）→ `issue_session`（:198-255）→ iam 不自签 token，经 `TokenForwardClient::issue_user_jwt`（`service/token_forward.rs:53-85`）以 service-jwt 调 token-service `POST /tokens/user-jwt`。
-- 用户访问令牌为 **RS256 JWT**（非 opaque）：`TokenIssuer::issue_user_jwt`（`services/token-service/src/issuer.rs:183-239`）。claims：`sub`（用户 id）、`jti`（uuid v4）、`iss=superpowers-token-service`、**`aud` 硬编码 `"coder-micro-services"`**（issuer.rs:194）、`exp`、`scope="access"`、`purpose="user_login"`（调用方不可覆盖，保留 claims 过滤 + 复盖，测试 `issue_user_jwt_sets_audience_and_filters_reserved`）、业务 claims `tid`（租户 i64）、`ct`（跨租户布尔，仅 platform_admin 为 true）、`username`、`roles[]`、`permissions[]`（`auth_svc.rs:209-215`）。
+- 用户访问令牌为 **RS256 JWT**（非 opaque）：`TokenIssuer::issue_user_jwt`（`services/token-service/src/issuer.rs:183-239`）。claims：`sub`（用户 id）、`jti`（uuid v4）、`iss=superpowers-token-service`、**`aud` 硬编码 `"coder-micro-services"`**（issuer.rs:194）、`exp`、`scope="access"`、`purpose="user_login"`（调用方不可覆盖：保留 claims 过滤 `issuer.rs:211` + 签发侧复盖 `issuer.rs:223-235`，测试 `issue_user_jwt_sets_audience_and_filters_reserved`）、业务 claims `tid`（租户 i64）、`ct`（跨租户布尔，仅 platform_admin 为 true）、`username`、`roles[]`、`permissions[]`（`auth_svc.rs:209-215`，复核）。
+- **aud 值的可证明性（P0-02 输入）**：`aud="coder-micro-services"` 是签发代码内**硬编码常量**（issuer.rs:194），token-service 配置目录无任何 audience 覆盖项（grep config/ 0 命中）——该值在 v1.8.2 **可证明**；但它同时是**全平台共享值**（所有用户 JWT 唯一 audience），**v1.8.2 不存在 AI-PM 专用 audience**，且 `issue_access_token`（issuer.rs:104-144）、`issue_resource_token`（:241-280）、`issue_refresh_token`（:146-181）均不设置标准 `aud`。用户 JWT 的 audience 隔离只能靠"共享 aud + `purpose=user_login` 强制"组合实现（AI-PM 侧验证链设计，见契约 §3.0）；AI-PM 专用 audience 需 LMMS 改版（本工作包禁止）→ 列为契约 §3.0 的**实施阻断项**。
 - 刷新会话：opaque `nanoid!(64)` SHA-256 落库 `iam_refresh_tokens`（`V001__init.sql:129-142`），30 天 TTL，**refresh 不轮换**（`auth_svc.rs:257-328`）；`logout` 撤销该用户全部 refresh 行并把当前 access jti 写入 Redis 黑名单（:330-350）。
 - 身份提取：`Principal::from_token`（`libs/jwt-ctx/src/principal.rs:79-92`）→ `digua_common_jwt::verify_token`（`libs/common-jwt/src/verify.rs:65-105`，RS256、kid-strict JWKS、可选 `expected_aud`）；`Principal` 携带 `jti/user_id/user_code/tenant_id(tid, 必填)/cross_tenant/roles/permissions`。另有 `Principal::from_headers`（principal.rs:97-108）为**纯解码不验签**、信任网关已验的路径。**平台内无 `X-User-*` 头身份传播机制**（grep `X-User` 于 services+libs 为 0 命中）。
-- 网关鉴权：`services/api-gateway/src/middleware/mod.rs:229-327`——验签 `expected_aud=None`（:265，**不校验 aud**）、强制 `tid` claim（:275-277）、Redis jti 黑名单检查**失败即放行（fail-open）**（:280-288，复核）、permission-epoch 令权限变更后旧 token 失效（:292-314）。网关**只有认证没有逐路由授权**（`RouteConfig` 仅 public/ws/headers/timeout）。
+- 验签库行为细节（AS/AI-PM 验证器与 JWKS 策略设计输入，P1-01/P1-02）：`verify_token` 的第三参即 `expected_aud: Option<&str>`（verify.rs:65-69）——**API 已支持 audience 强制，未启用是调用方选择**；`Some(aud)` → `set_audience` 精确匹配，`None` → `validate_aud=false`（:86-94）；header `kid` 缺失时**回退 `default_key()`**（:80-82，"kid 必须存在"在当前库上不成立，AS 验证器必须显式拒绝缺失 kid）；未知 kid 直接报错**不触发刷新**（:76-79）；`Validation::new(Algorithm::RS256)` 固定算法（算法降级被 jsonwebtoken 拒绝），但 leeway 为 jsonwebtoken 默认 60s 未显式配置、`validate_nbf` 默认 **false**、`iat` 不校验（:84）——AS 验证器必须显式补齐。
+- JWKS 缓存行为（Q5 设计输入）：`JWKSCache` 默认 `refresh_interval=3600s`（`libs/common-jwt/src/cache.rs:36`）；刷新失败 **"keeping stale"** 无限期继续用旧键（:146）；`fetched_at` 有记录但**无任何读取方强制陈旧上限**（:44,86-91）；缓存为空/过期均不阻断验签——即**当前库无最大陈旧时间概念**。AI-PM 实际消费的 kellnr 发布版 `digua_common_jwt 1.8.1`（ai-pm 根 `Cargo.toml:85`）行为与上述完全一致（已核对其 registry 缓存源码 `~/.cargo/registry/src/192.168.2.12-*/digua_common_jwt-1.8.1/src/{verify,cache}.rs`）。
+- 网关鉴权：`services/api-gateway/src/middleware/mod.rs:229-327`——验签 `expected_aud=None`（:265，**不校验 aud**，复核）、强制 `tid` claim（:275-277）、Redis jti 黑名单检查**失败即放行（fail-open）**（:280-288，复核）、permission-epoch 令权限变更后旧 token 失效（:292-314）。网关**只有认证没有逐路由授权**（`RouteConfig` 仅 public/ws/headers/timeout）。
 
 ### 1.3 Token Service 实际接口清单
 
@@ -75,6 +80,7 @@ TTL：access 3600s、refresh 30 天、resource 默认 300s、service-jwt 硬编�
 **LMMS 1.8.2 存在 resource token 的"铸造形状"，但端到端不可用，且铸造端点未受保护。**（复核）
 
 - 铸造：`TokenIssuer::issue_resource_token`（`issuer.rs:241-280`，复核）签出 claims：`sub`（路由硬编码 `"resource-service"`，`resource.rs:30`）、`jti`、`iss`、`exp`、`scope="resource"`、`resource_type`、`resource_id`、`permission`（单字符串）、`purpose="resource"`。**没有 `aud`、没有 `tid`、没有 project/action 细粒度 scope、没有业务操作绑定。**
+- **TTL 输入缺陷（F-28，R1 新增）**：`ResourceRequest.ttl_sec: Option<i64>`（`routes/resource.rs:12`）→ `req.ttl_sec.unwrap_or(state.default_resource_ttl_sec)`（:25，缺省 300，`config.rs:128`）——**全链路无边界校验**：负数、零、超大值均原样传入 `issue_resource_token`，在 `issuer.rs:253` 经 `Duration::from_secs(ttl_sec as u64)` 转换——**负 i64 经 `as u64` 回绕为天文数字**（如 -1 → 18446744073709551615 秒），签出实际永不过期的 token；`expires_in` 原样回显（:40）。当前无消费者故无实害，但该端点 `public=true`（`token.router.toml:19-23`），任何未来接入方（含候选 A 场景）若直接消费即引入"永不过期能力凭证"风险。详见 SECURITY-REVIEW §11 F-28。
 - 铸造端点 `POST /tokens/resource` **无任何鉴权**：handler 无提取器（`resource.rs:21-24`），挂在开放路由器（`main.rs:188-191`，无 layer），网关路由 `public = true`（`token.router.toml:19-23`）。任何能到达内网者可为自己铸造任意 resource_type/resource_id/permission 的 token。
 - **无消费者**：grep `purpose::RESOURCE|scope=="resource"|resource_type` 于 services+libs 仅命中签发器与其测试；api-gateway / file-service / iam-service 均不读取。且因缺少 `tid`，该 token 无法通过 `Principal::from_claims`（`tid` 必填）与网关 `tid` 强制检查——**铸造出的 token 被平台内所有验证路径拒绝**。
 - OpenAPI 缺口：`/tokens/resource` 与 `/tokens/service-jwt` 均未列入 `services/token-service/openapi.yaml` 与 `src/openapi.rs` 路径清单。
@@ -113,13 +119,13 @@ TTL：access 3600s、refresh 30 天、resource 默认 300s、service-jwt 硬编�
 | 用户登录 + RS256 JWT 访问令牌 | ✅ | `iam-service/auth_svc.rs`；`token-service/issuer.rs:183-239` |
 | JWKS 分发 + kid-strict 验签 | ✅ | `routes/jwks.rs`；`libs/common-jwt/src/verify.rs` |
 | claims：sub/tid/roles/permissions/jti/exp | ✅ | issuer.rs:190-236 |
-| aud 受限（用户令牌） | ⚠️ 部分：aud 硬编码 `coder-micro-services`，网关与 Principal 提取器**不校验 aud**；aud 仅在内部端点中间件强制 | issuer.rs:194；`middleware/mod.rs:265`；`verify_aud.rs` |
+| aud 受限（用户令牌） | ⚠️ 部分：aud 硬编码 `coder-micro-services`（全平台共享，**无 AI-PM 专用值**），网关与 Principal 提取器**不校验 aud**，其他 token 类型无标准 aud；aud 仅在内部端点中间件强制 | issuer.rs:194；`middleware/mod.rs:265`；`verify_aud.rs`；§1.2 |
 | 刷新/登出 | ⚠️ 部分（refresh 不轮换） | `auth_svc.rs:223-328` |
 | 在线撤销 | ❌ 实质不可用：`/tokens/revoke` 公开且撤销表无生产读取方；Redis 黑名单仅 logout 写入且 fail-open | 复核：`revoke_svc::is_revoked` 无生产调用；`middleware/mod.rs:280-288` |
 | introspection | ❌ | grep 0 命中 |
 | 服务间认证（aud 绑定 service-jwt） | ✅ | `service_jwt.rs`；`libs/common-jwt/src/service_jwt.rs`；`libs/authz/src/verify_aud.rs` |
 | **资源委托 Token（可用）** | ❌ 铸造形状存在但端点未鉴权、claims 缺 aud/tid/scope、无消费者 | `resource.rs`；`issuer.rs:241-280`；`token.router.toml:19-23` |
-| 文件租户隔离 | ✅ | `qb.and_tenant`；`tenant_isolation_test.rs` |
+| 文件租户隔离 | ⚠️ **有条件成立（R1 修订，不得表述为"已就绪"）**：常规 `Single(tenant)` 调用路径下 `qb.and_tenant` 隔离有效；但 scope 缺失/`CrossTenant` 时上传回落租户 **1**（`file.rs:90` `unwrap_or(1)`）、`user_id` 归属由调用方 metadata 任意声明（:91）、FILE_* 权限码全平台未消费——"所有调用方式都安全"不成立（§1.6、F-24） | `qb.and_tenant`；`tenant_isolation_test.rs`；`file.rs:90-91` |
 | 文件 per-user 归属/权限码/ACL | ❌ | `services/file.rs:90-91`（复核） |
 | upload-intent / finalize 两段协议 | ❌ | grep 0 命中；presign PUT 存在（仅 S3） |
 | 签名密钥轮换 | ⚠️ API 手动轮换、无自动调度 | `keys_admin.rs:133-226` |
@@ -127,7 +133,9 @@ TTL：access 3600s、refresh 30 天、resource 默认 300s、service-jwt 硬编�
 
 ---
 
-## 2. AI-PM 审计（origin/master @ 6f317176）
+## 2. AI-PM 审计（GitHub 权威 master @ d0e72fa6）
+
+> 基线说明（R1 修正）：上一轮审计使用 `origin/master@6f317176`。GitHub 权威 `master` 已推进至 `d0e72fa6`（3 个 docs 提交：ART-01 errata 增删 + docs 索引），`apps/`、`crates/` 代码在两基线间**逐字节一致**（`git diff 6f317176..d0e72fa6 -- apps/ crates/` 为空），故本轮以权威基线重标注，代码引用行号不受影响。
 
 ### 2.1 技术栈与结构
 
@@ -138,6 +146,7 @@ Rust 2021 workspace：`pm-domain / pm-application / pm-infrastructure / pm-ai / 
 - **AI-PM 不做登录**：登录/刷新/登出由前端直连 `/gw`（lmms api-gateway → iam-service）。AI-PM 对每个请求做**本地 JWKS 验签**（`apps/pm-api/src/auth.rs:1-34`；`main.rs:44-67`）：`AI_PM_AUTH_MODE=jwks` 时从 `AI_PM_JWKS_URL` 拉 JWKS，启动期未就绪则全部请求 401 `IAM_AUTH_1004`（fail-closed）。
 - 凭证形态：每请求 `Authorization: Bearer <RS256 JWT>`（唯一例外：SSE `/v1/pm/events/stream` 接受 `?access_token=`，`auth.rs:549,685-690`）。**用户 JWT 不落库、不向下游转发**（migration 中仅有 `token_hash` 类列：lease token、cpk 设备凭证、邀请链接）。
 - claims 解析（`AuthenticatedIdentity`，`auth.rs:91-107`）：`tid/sub/roles/permissions/aud/client_id/purpose/ct/username/nickname`；purpose 白名单含 token-service v1.7.0 的 `user_login/api_key/auth_code/service/resource`，未知 purpose fail-closed（:136-152）；service 角色令牌拒绝（:329-334 `IAM_PERM_3003`）、跨租户令牌拒绝（:335-337 `IAM_PERM_3004`）。
+- **⚠️ R1 关键缺口（P0-02 证据）**：`require_bearer` 调用 `verify_token(token, jwks, None)`（`auth.rs:289`）——**未传 expected_aud，用户 JWT 的 audience 不被校验**；`aud` claim 被解析进 `AuthenticatedIdentity`（:117）但仅用于存量旧令牌的 `auth_mode` 推断（:142-150：有 aud → interactive、有 client_id → api_key）。即当前 AI-PM 仅凭"签名有效 + `tid` 存在"放行 token，api_key/service/resource（无 aud）与 user_login（aud=`coder-micro-services`）在验签层**不可区分**，区分完全依赖 purpose 解析。delegation 签发链路必须建立独立验证链（aud 强制 + purpose=user_login + ct=false + roles 排除），见契约 §3.0 与 §3.3。
 
 ### 2.3 身份上下文传递
 
@@ -149,7 +158,8 @@ Rust 2021 workspace：`pm-domain / pm-application / pm-infrastructure / pm-ai / 
 ### 2.4 租户/项目授权模型
 
 - 数据模型（`migrations/0001_baseline.sql`）：`core.tenant`、`core.principal`（kind: human|dev_agent|ai_pm|service）、`core.principal_identity`、`core.tenant_member`（owner|admin|member）、`core.project`、`core.project_member`（owner|member|ai_pm|architect|developer|tester）、后加 `core.product_member`（0040）、agent registry（0041）。
-- 检查函数：`project_visible/require_project_visible`（`apps/pm-api/src/support.rs:252-286`，SQL join project+project_member，不可见即 404 不泄露存在性）；MCP `ensure_member/authorize → require_project_member`（`crates/pm-mcp/src/caller.rs:58-99`，全部写工具挂接）；项目关闭闸门 `project_gate.rs:46-103`；人工确认闸门 `ensure_trusted_context` + `require_human_decision_context`（`support.rs:109-160`，human 身份以 **DB lookup** 验证而非 token）。
+- 检查函数：`project_visible/require_project_visible`（`apps/pm-api/src/support.rs:252-286`，SQL join project+project_member，不可见即 404 不泄露存在性；R1 复核 `require_project_visible` :266-277）；MCP `ensure_member/authorize → require_project_member`（`crates/pm-mcp/src/caller.rs:58-99`，全部写工具挂接）；项目关闭闸门 `project_gate.rs:46-103`；人工确认闸门 `ensure_trusted_context` + `require_human_decision_context`（`support.rs:109-160`，human 身份以 **DB lookup** 验证而非 token）。
+- **⚠️ R1 边界澄清（P0-03 证据）**：`require_project_visible` 只回答"该 principal 是否为该租户该项目的（任意）成员"——它**不是** Artifact 动作授权：AS 的 15 个精确 Action（`artifact-domain/src/action.rs:6-22`）与 AI-PM 的 project 角色（owner/member/ai_pm/architect/developer/tester）之间**不存在任何映射**。若把"项目可见"直接等价为"可签发全部 15 个 Action"，等于把 `artifact:delete`、`generation:cancel` 等破坏性动作授予全体成员。R1 裁决：签发必须走 AI-PM 内部**受控业务意图接口**（见契约 §3.3），每意图映射精确 Action 集，禁止调用方提交任意 actions。
 - 生成触发与验收：run 由执行体经 claim/lease 领取（ADR-0002 lease token）；MCP 写工具需 JWT 权限码 `PM_MCP_READ/DOCUMENT_WRITE/AGENT_REPORT/COMMAND`（`auth.rs:567-580`）；任务产物正式验收 `POST /v1/pm/tasks/{task_id}/product-acceptances` 要求 DB 验证的人类 + 目标产品成员资格（`crates/pm-application/src/task_products.rs:409-436`，DR-PA-06）；viz 审批 `decide_approval` 挂 `require_project_visible`。
 
 ### 2.5 服务端委托能力
@@ -164,8 +174,8 @@ Rust 2021 workspace：`pm-domain / pm-application / pm-infrastructure / pm-ai / 
 
 ### 2.7 密钥存储
 
-- 全部 env 注入：长时服务凭证 `SERVICE_BOOTSTRAP_TOKEN`（token-service bootstrap 白名单 `SERVICE_BOOTSTRAP_TOKENS`）；主加密密钥 `AI_PM_SECRET_KEY` → AES-256-GCM 加密 LLM key/SSH 私钥（AAD 绑定 project id，`crates/pm-application/src/secret.rs`，缺钥 fail-closed）；DB 只存哈希（cpk sha256、`lease_token_hash`、邀请 `token_hash`）。
-- **发现**：仓库根 `.test-env.md` 提交了明文基础设施凭据（SSH/root 密码、DeepSeek API key、GitLab 凭据）——见 SECURITY-REVIEW 附加发现 F-22。
+- 全部 env 注入：长时服务凭证 `SERVICE_BOOTSTRAP_TOKEN`（token-service bootstrap 白名单 `SERVICE_BOOTSTRAP_TOKENS`）；主加密密钥 `AI_PM_SECRET_KEY` → AES-256-GCM 加密 LLM key/SSH 私钥（AAD 绑定 project id，`crates/pm-application/src/secret.rs`，缺钥 fail-closed）；DB 只存哈希（cpk sha256、`lease_token_hash`、邀请 `token_hash`）。**delegation 签名密钥必须使用独立环境变量/安全注入（如 `AI_PM_DELEGATION_SIGNING_KEY`），不得复用 `AI_PM_SECRET_KEY`**（前者是数据加密密钥，后者用途不同、轮换周期不同——契约 §4）。
+- **发现（R1 事实更正，原 F-22 表述有误）**：仓库根存在 `.test-env.md`（1193 字节，2026-11-24）含明文基础设施凭据（类别：SSH/root、LLM API key、GitLab——**本审计不复述其内容**）。R1 重核结论：该文件**未被 git 跟踪**（`git log --all -- .test-env.md` 零命中；`git cat-file -e <ref>:.test-env.md` 在 `github/master@d0e72fa6`、`origin/master@6f317176`、本地分支 HEAD 均不存在），且被 `.gitignore:20` 显式忽略——**上一轮"已提交进 git"的表述是错误的**。评级维持 **P0**（独立评审指定），但理由修正：不再是"远端 git 历史暴露"，而是①活跃明文凭据以文件形式存在于工作树，防护仅依赖单行 `.gitignore`（`git add -f` 或 ignore 规则回归即暴露）；②无法证明凭据未经其他渠道（同步盘/聊天/备份）泄露。处置要求不变：**立即轮换全部凭据 + 移出工作树**；轮换前不得视其为可继续使用的凭据。
 
 ### 2.8 Artifact Job / Task / Run 关联
 
@@ -198,6 +208,7 @@ Rust 2024 workspace，六边形分层：`artifact-domain`（`Artifact/ArtifactVe
 - **生产验证器 fail-closed**：`ClosedDelegationVerifier`（`crates/artifact-infrastructure/src/delegation.rs:15-33`，复核）无条件拒绝一切 token，拒绝理由明确引用 ART-02 P0（resource token 端点未鉴权、缺 aud/tid）；`apps/artifact-api/src/state.rs:28-30` 默认装配并有测试 `default_verifier_is_fail_closed` 锁定。**无任何运行时绕过开关**（`.env.example` 明示；CI 发布构建不含 `test-doubles` feature，`.github/workflows/ci.yml:53-58`）→ **当前全部业务端点 401 deny-by-default**（测试 `default_deny::all_business_endpoints_denied_without_credentials`）。
 - 端口契约（`crates/artifact-application/src/port/auth.rs:1-22`，复核）：`DelegationVerifier::verify(bearer) -> Delegation`，实现方**必须**验证受信签发方签名、`aud`（固定 = Artifact Service）、有效期、tenant/project/actions 范围，且"不得信任任何请求体字段"。
 - 领域模型（复核引用文件）：`Delegation { delegation_id, jti, scope: TenantScope{tenant_id, project_id}, actor: Actor{subject, actor_type: User|Agent|Service}, actions: HashSet<Action>(15 种细粒度动作), expires_at }`（`crates/artifact-domain/src/action.rs:80-87`）；授权原语 `Delegation::require(action, scope)`（:95-113）——scope 不匹配或动作缺失即 `SCOPE_DENIED`。**租户恒取自凭证**（`auth.rs:79`），body/header 中的 id 仅是"资源定位输入，不是授权证明"（`scope.rs:3-4`）。
+- **⚠️ R1 关键缺口（P0-01/P0-04 证据）**：① `TenantScope.tenant_id` 类型为 `Uuid`（`scope.rs:10-13`），而 LMMS `tid` 为数值 i64（`libs/jwt-ctx/src/scope.rs:10-15` `Single(i64)`）——**类型不兼容是刻意边界**：委托 token 若携带 LMMS 数值 tid，AS 无法也不得将其装入 `TenantScope`，tenant 必须来自 AI-PM 内部 tenant UUID（`AuthedPrincipal.tenant_id`，`auth.rs:174`）；② `Delegation` 领域模型**没有任何操作绑定字段**（无 artifact_id/generation_job_id/operation_id/caller_request_id），`require()` 只判 scope+action——同一项目内一枚有效 token 在 TTL 内可对**任意**目标执行**任意**已授权动作，可重复用于不同操作（P0-04）。operation-bound 绑定必须由验证层新增 claim（契约 §3.1）并在服务层比对目标，或扩展领域模型（实施计划阶段 1 任务）。
 - 401/403 作为拒绝事件写入审计（`apps/artifact-api/src/error.rs:65-112`）。
 - AS-1：`ValidatedCreateArtifactRequest` + 规范化指纹 v1（`service/creation_fingerprint.rs:32-82`，域分隔符 `artifact-create:v1`，冻结黄金向量测试）；持久化 `artifact.artifact_creation_identity`（migration 0004）。
 - AS-2：`caller_request_id` 三元组（`caller_request_id/request_fingerprint/fingerprint_version`）不可变持久化（migration 0005）+ 查询端点 `GET /v1/generation-jobs/by-caller-request/{caller_request_id}`（`routes/mod.rs:63-66`；跨 scope 命中不可区分，统一 404）。
@@ -273,13 +284,19 @@ Rust 2024 workspace，六边形分层：`artifact-domain`（`Artifact/ArtifactVe
 
 ## 5. 审计附加发现（非挑战项，但必须记录）
 
-| # | 发现 | 位置 | 影响 |
-|---|---|---|---|
-| F-20 | migration 0005 与 AS-2 实施报告引用的唯一规范契约 `docs/architecture/ART-04G-independent-review-as2-generation-job-caller-identity.md` **不在仓库中**（全树 find/git ls-files 均无；仅存未跟踪工作笔记 `.trae/documents/as2-durable-caller-identity-plan.md`） | smark-artifact-service | 契约溯源断链；建议补交或以本 WP 文档族替代引用 |
-| F-21 | LMMS 仓库根 `keys/private.pem`/`keys/public.pem` 历史密钥对已提交 git（legacy kid="default" 导入路径仍在 `main.rs:95-111`） | lmms | 私钥泄露面；建议从 git 历史移除并轮换 |
-| F-22 | ai-pm 仓库根 `.test-env.md` 含明文 SSH/root 密码、DeepSeek API key、GitLab 凭据 | ai-pm | 凭据泄露；建议立即轮换并移出 git |
-| F-23 | `/tokens/revoke` 公开无鉴权且撤销表无生产读取方（§1.3）；网关黑名单 fail-open | lmms | 在线撤销实质不可用，影响 §安全评审挑战 1/5 |
-| F-24 | file-service：跨租户回落租户 1（`unwrap_or(1)`）、`user_id` 调用方任意声明 | lmms | 未来接入 AS 文件链路时的信任边界决策输入 |
+评级为 R1 独立安全评审指定；F-27/F-28 为 R1 新增。F-21/F-22 涉及的凭据内容在任何报告、PR 评论、测试输出中**不得复述**。
+
+| # | 等级 | 发现 | 位置 | 影响 |
+|---|---|---|---|---|
+| F-20 | P2（流程） | migration 0005 与 AS-2 实施报告引用的唯一规范契约 `docs/architecture/ART-04G-independent-review-as2-generation-job-caller-identity.md` **不在仓库中**（全树 find/git ls-files 均无；仅存未跟踪工作笔记 `.trae/documents/as2-durable-caller-identity-plan.md`） | smark-artifact-service | 契约溯源断链；建议补交或以本 WP 文档族替代引用 |
+| F-21 | P0（LMMS 运维，非本 WP 代码） | LMMS 仓库根 `keys/private.pem`/`keys/public.pem` 已提交进**远端** git（`git ls-files keys/` 于 v1.8.2 基线命中，复核；legacy kid="default" 导入路径仍在 `main.rs:95-111`） | lmms | **凭据曾进入远端 Git 历史，按已暴露处理**：必须轮换/吊销该密钥对并从历史移除；仅删除当前文件不构成处置完成（LMMS 侧行动项，本 WP 不执行） |
+| F-22 | P0（AI-PM 运维） | `.test-env.md` 含明文 SSH/root、LLM API key、GitLab 凭据（内容不复述）。**R1 事实更正：文件未被 git 跟踪、从未进入任何远端历史**（§2.7），原"已提交进 git"表述错误 | ai-pm | 评级维持 P0，理由修正为"活跃明文凭据 + 无法证明未泄露 + ignore 依赖脆弱"：**立即轮换全部凭据 + 移出工作树**（§2.7） |
+| F-23 | P1（LMMS） | `/tokens/revoke` 公开无鉴权且撤销表无生产读取方（§1.3）；网关黑名单 fail-open | lmms | 在线撤销实质不可用，影响 §安全评审挑战 1/5 |
+| F-24 | P1（LMMS） | file-service：跨租户回落租户 1（`unwrap_or(1)`）、`user_id` 调用方任意声明 | lmms | 未来接入 AS 文件链路时的信任边界决策输入 |
+| F-25 | **P0（AI-PM delegation issuer 启用前）** | LMMS 网关与 `Principal` 提取器不校验用户 JWT `aud`（`middleware/mod.rs:265`、`principal.rs`）；同一缺口的 AI-PM 侧形态：`require_bearer` 传 `None`（`auth.rs:289`） | lmms + ai-pm | delegation issuer 启用的**前置条件**：AI-PM 侧验证链必须先行强制 aud（契约 §3.0，P0-02）；LMMS 侧修复列为后续需求 |
+| F-26 | P2 | LMMS 签名密钥轮换仅手动 API；无自动调度 | lmms | 运维 runbook 补轮换节奏 |
+| F-27 | P1（证据缺口，R1 新增） | **部署产物一致性证据缺失**：无运行镜像 digest、无启动版本记录、无运行行为探测记录；"1.8.2 已在私有网络发布"为 A 类用户陈述，不能替代 C 类证据 | 部署面 | 在提供 C 类证据前，任何"部署环境已与源码一致"的声明都不成立；delegation 上线检查单必须包含 C 类取证步骤 |
+| F-28 | P1（LMMS 缺陷，R1 新增） | `POST /tokens/resource` 的 `ttl_sec` 输入无边界校验（`resource.rs:12,25`），`issuer.rs:253` `ttl_sec as u64` 使负值回绕为超大正数 → 可签出**实际永不过期**的 resource token；端点本身 `public=true` 且当前**全平台无消费者**（grep 仅命中签发器与测试） | lmms | 当前无实害（无消费者）；未来任何消费方接入前必须先修复（边界校验 + 拒绝非正值 + 移除 as 转换）。LMMS 后续需求，本 WP 不修改 |
 
 ## 6. 与 WP 问题清单的对应（§三 的 8 个核心问题→答案所在）
 
@@ -292,4 +309,4 @@ Rust 2024 workspace，六边形分层：`artifact-domain`（`Artifact/ArtifactVe
 | 5 Token 限定维度 | AS 领域模型已备 15 动作 + tenant/project/jti/exp；签发侧待建 | §3.2、CONTRACT |
 | 6 AS 如何用 File Service | 未实现（协议 P0）；过渡路线见 PLAN | §3.4 |
 | 7 防重放/越权/跨项目/扩权 | AS 已有：request_hash + caller_request_id 唯一索引 + scope 谓词 + require()；AI-PM 侧无信任客户端 id | §3.5-3.6 |
-| 8 过期/撤销/不可用/长任务 | 撤销三方皆缺（P0 评审项）；**长任务与 Token 解耦已被 AS-2 架构消解**（worker 不持用户凭证、输入已快照） | SECURITY-REVIEW、CONTRACT §时序 |
+| 8 过期/撤销/不可用/长任务 | 撤销三方皆缺（代码现状；**Q1 已冻结设计**：写路径在线撤销 + fail-closed，见契约 §5）；**长任务与 Token 解耦已被 AS-2 架构消解**（worker 不持用户凭证、输入已快照） | SECURITY-REVIEW、CONTRACT §5 |
