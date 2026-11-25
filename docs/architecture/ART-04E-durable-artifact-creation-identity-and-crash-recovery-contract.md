@@ -111,9 +111,14 @@ A separate append-only identity table provides a clear boundary between mutable 
 
 Use an explicit `fingerprint_version` (initially `1`). The canonicalization algorithm is part of the public integration contract and must have golden test vectors.
 
-The fingerprint is:
+The Artifact creation fingerprint is:
 
 `lowercase_hex(SHA-256(UTF-8(canonical_json_v1)))`
+
+This is distinct from the existing endpoint Idempotency-Key `request_hash`, which is currently computed over the raw HTTP JSON body bytes. AS-1 MUST preserve that byte-sensitive Idempotency-Key behavior for compatibility; it must not silently replace it with semantic canonicalization. The keyed-create transaction therefore handles two independent hashes:
+
+- `idempotency_request_hash`: the existing raw-body SHA-256 used only for Idempotency-Key reuse/conflict semantics;
+- `artifact_creation_fingerprint`: this versioned semantic hash used for stable artifact_key identity.
 
 The canonical document includes:
 
@@ -160,17 +165,17 @@ The authenticated tenant/project scope is authoritative. `created_by` is audit m
 
 For a new keyed Artifact, one database transaction MUST:
 
-1. validate that the tenant/project scope is authorized and active;
-2. insert the Artifact row with its stable `artifact_key`;
-3. insert the matching immutable `artifact_creation_identity` row with fingerprint version/hash;
-4. write the relevant audit event, if the existing audit policy requires it for Artifact creation;
-5. commit.
+1. Validate the request DTO and re-check current delegation authorization for the tenant/project scope. Tenant ID comes from verified delegation; project ID is the validated project locator from the request.
+2. Insert the Artifact row with its stable `artifact_key`.
+3. Insert the matching immutable `artifact_creation_identity` row with fingerprint version/hash.
+4. If an Idempotency-Key is supplied, atomically resolve/reserve its endpoint-scoped record and write its completed response snapshot/resource_id in this same transaction.
+5. Commit once.
 
-The Artifact and identity row either both exist or neither exists. No externally visible intermediate state is permitted.
+The Artifact, identity row, and (when supplied) Idempotency-Key record + completed response either all commit or all roll back. No externally visible intermediate state is permitted.
 
-For keyed requests that carry an `Idempotency-Key`, the idempotency reservation, Artifact, creation identity, and completed response snapshot/resource_id MUST also be committed in this same transaction. This prevents a second race in which two different artifact keys reuse the same Idempotency-Key concurrently. A keyed create must not use the current two-transaction "reserve first, create later, complete last" flow.
+**Audit is intentionally excluded from this transaction.** The current AuditSink contract is best-effort and states that audit failure must not change the business result. After commit, attempt the existing audit write; log failures without rolling back or changing the successful create response.
 
-The old reservation-first flow is the known stale-reservation crash window. The new keyed path must replace it with one transaction, not merely reorder two separate transactions.
+For keyed requests, the existing two-transaction "reserve first, create later, complete last" flow MUST be replaced by one transaction owner. A keyed request must not commit a standalone reservation before its Artifact operation. This also prevents two different artifact keys from being created concurrently under the same endpoint-scoped Idempotency-Key.
 
 ### 5.2 Request algorithm
 
@@ -208,6 +213,18 @@ A serialization failure/deadlock may be retried with a strict bounded retry poli
 - The Idempotency-Key remains a transport replay optimization; it is not the durable authority for whether the Artifact exists.
 - Requests without `artifact_key` retain the existing Idempotency-Key behavior in AS-1; they are outside this durable-key recovery contract.
 - Do not silently repurpose an existing Idempotency-Key with a different request hash. Preserve the existing idempotency conflict semantics, including concurrent reuse of one Idempotency-Key for two different artifact keys.
+
+## 5.6 Application port and transaction ownership
+
+The current `ArtifactService`, `ArtifactRepository`, and `IdempotencyStore` are separate ports. The current PostgreSQL implementations each use pool-backed operations; `PgIdempotencyStore::reserve` begins and commits its own transaction. Therefore the current calls cannot be made atomic by simply adding a transaction around the application service.
+
+For keyed requests, introduce one purpose-built application port/use case (name to follow repository conventions, e.g. `KeyedArtifactCreatePort::create_or_resolve`) whose PostgreSQL implementation owns the complete SQLx transaction. It must coordinate idempotency reservation/resolution, durable identity resolution, Artifact + identity insertion, and completed idempotency response in one transaction. Do not leak a SQLx Transaction through unrelated repository traits.
+
+Recommended V1 compatibility split:
+- `artifact_key IS NOT NULL`: use the new atomic keyed-create use case;
+- `artifact_key IS NULL`: preserve the existing unkeyed create behavior and existing Idempotency-Key contract, unless a separate migration decision broadens scope.
+
+The split must be explicit in tests and telemetry. The new keyed path must still perform fresh authorization before returning a replayed Artifact.
 
 ## 5.5 Deferred database invariants
 
@@ -268,11 +285,16 @@ A dedicated lookup endpoint is optional, not required for the core create-recove
 OpenAPI must document that `artifact_key` is immutable, tenant/project scoped, and never reusable. Document the 200 replay behavior and 409 mismatch behavior. Keep response fields and error envelope consistent with the existing API.
 
 ## 8. Authorization, RLS, and audit
+### 8.1 Audit transaction boundary
+
+The current AuditSink contract is best-effort: audit failure must not change the business result. Audit is not part of the keyed-create atomic transaction in AS-1. Attempt the audit write after the database commit; log failures. A transactional audit guarantee would require a separate explicit policy change (for example, a transactional outbox) and is outside AS-1.
+
 
 - Authenticate and authorize on every create/replay request, including requests that resolve an existing key.
 - The caller must have current access to the requested tenant/project before the service reveals the Artifact representation.
 - Every identity lookup includes both tenant_id and project_id derived from trusted authenticated context; never trust caller-supplied scope without the existing authorization boundary.
-- RLS/controlled-function policies must cover the new identity table consistently with existing Artifact tables. Do not grant broad table access to application roles merely to simplify the feature.
+- The current reviewed schema does not establish RLS as the tenant-isolation boundary. Current access relies on explicit tenant_id/project_id query predicates, delegation checks, and composite constraints. Do not claim RLS protection unless a separate RLS design is introduced and tested.
+- The current db-roles script grants APP SELECT/INSERT/UPDATE on all Artifact schema tables, including future tables through default privileges. The new identity table MUST explicitly REVOKE UPDATE and DELETE from APP and WORKER roles and grant only required SELECT/INSERT (or exact controlled-function EXECUTE). Ensure default privileges do not re-grant mutation rights.
 - A 404/403 policy may be used to avoid cross-scope existence disclosure; it must match the service's established authorization contract.
 - Audit records must not contain raw input bodies, secrets, signed URLs, or credentials. Record key/fingerprint identifiers only if the existing audit data classification permits them.
 
