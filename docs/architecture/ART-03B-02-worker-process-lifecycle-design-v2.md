@@ -1,3 +1,5 @@
+> **复审状态（2026-11-25）：NOT APPROVED / Changes Required。** 本文仍保留 v2 原始设计论证以供追溯，但不得作为实施基线。具有约束力的修订见 [ART-03B-02-v2.1-architecture-corrections.md](./ART-03B-02-v2.1-architecture-corrections.md)。若本文与 v2.1 修订冲突，以 v2.1 为准。主要阻断：DB-BLOCKER-01（deadline×cancel 后 retry_wait 不可领取）、DB-BLOCKER-02（短 deadline 缺少 DB 时间锚点）、TIMING-BLOCKER-03（INV-1/INV-2 不成立）、PROCESS-BLOCKER-04（Linux 进程树依赖 03B-03）、FSM-BLOCKER-05（状态边与不确定路径未闭合）。
+
 # ART-03B-02 — Worker 执行进程生命周期架构设计 v2
 
 > 状态：**v2 设计基线（待人工评审）**。取代 `ART-03B-02-worker-process-lifecycle-design-v1-draft.md`（该稿已标记 superseded，仅保留历史记录）。
@@ -426,3 +428,20 @@ SIGTERM / Ctrl-C:
 - 本设计经人工评审通过后，才进入实施（PR #4 仅含文档）。
 - 实施验收 = 测试策略 v2 全部用例通过 + 状态转换矩阵逐行覆盖 + 故障场景文档中的全部注入场景闭环。
 - **不把"文档写完"等同于"设计通过"**；评审待决项见决策记录（DR-3 环境白名单、DR-6 EXECUTOR_KILLED 移除、DR-7 只读探针提案等）。
+
+
+---
+
+## 11. v2.1 复审约束（优先级高于本文原文）
+
+本设计于 2026-11-25 经独立架构复审，结论为 **Changes Required**。不得将 §0 中的“完整 FSM”“终态提交协议正确”“先停后失约已证明”“双平台可信进程树回收”等表述视为已验证结论。必须按 `ART-03B-02-v2.1-architecture-corrections.md` 修订：
+
+- deadline_exceeded 路径仍为 KillOnly + 零 DB 写，但须处理 Migration 0003 中 deadline 与 cancel_requested_at 竞争导致 retry_wait Job 不可 claim 的 DB-BLOCKER-01。
+- 终态提交 Uncertain 必须区分传输不确定、明确 DB 拒绝和本地协议错误；probe renewed 后只允许一次冻结快照补交，补交时 lease 过期可合法失败。
+- 补齐 claim RPC 不确定、spawn 不确定、confirm not_requested、死亡确认失败、补交 lease 过期等 FSM 状态。
+- INV-1 改用 heartbeat 请求发出时的单调时钟锚点；INV-2 在 Delay 调度下至少按 K×(H+T) 计算。原参数组 60/15/10/2/12 不成立。
+- claim 当前未返回 DB now/started_at/剩余 deadline duration，故 max_execution_seconds=1 的安全停止无法由本文公式证明。
+- PID 1 仅回收孤儿僵尸，不会杀死仍运行的进程；Linux 全树回收依赖 03B-03 cgroup/容器硬边界。Windows Job Object 论证须显式禁止 breakaway、处理句柄继承与嵌套 Job。
+- 纯计算/无凭据不足以证明无外部副作用；必须等 03B-03 网络与文件系统隔离实测，并由 03D 独占业务副作用。
+
+在上述 BLOCKER 全部关闭并重新评审前，本设计仅为讨论稿。
