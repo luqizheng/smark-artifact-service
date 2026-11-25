@@ -47,10 +47,10 @@ ART-03B-02 v2.2 已定义 Supervisor 的 RPC/Lease/Heartbeat/FSM 行为，但明
 采用三个独立进程边界：
 
 - **Artifact Worker / Supervisor**：领取 Attempt、运行 Supervisor FSM、调用 DB 受控函数、请求启动/终止隔离单元、在 death-confirm 后读取输出并继续 Artifact 提交流程。
-- **Artifact Runtime Controller（ARC）**：宿主机级或节点级服务，独立于 Worker 生命周期；唯一持有 container runtime 控制 socket 与 cgroup 管理权限；执行受限的 Create / Start / Kill / Inspect / FreezeOutput / Cleanup 操作。
-- **Node Runtime Guardian（NRG）**：独立于 Worker 与 ARC 的节点级 fail-safe 服务；不创建/启动 sandbox，不处理 Job/Attempt 业务状态，只负责撤销 ARC Start admission、在 ARC 失联时对受管 Attempt 执行 KillOnly，并由独立节点服务管理器监督。NRG 是本设计首轮复审新增的强制候选依赖，尚未选型或实现。
+- **Artifact Runtime Controller（ARC）**：宿主机级或节点级服务，独立于 Worker 生命周期；负责 Attempt 生命周期协调、DB authority 验证、输出与清理编排。其是否持有 containerd socket 取决于 §7.7 方案 A/B；任何方案下 ARC 都不得拥有 NRG 独占的 cgroup.freeze/cgroup.kill 写权限。
+- **Node Runtime Guardian（NRG）**：独立于 Worker 与 ARC 的节点级 fail-safe 服务；不处理 Job/Attempt 业务状态。方案 A 下仅独占 cgroup freeze/kill 与 admission fencing；方案 B 下升级为最小权限 runtime broker。具体权限拓扑尚未裁决，必须按 §7.7 完成原型与独立复审。
 
-ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Service，不决定 Job succeeded/failed/cancelled。它只管理“某个 Attempt 对应的隔离单元是否存在、运行、已终止、可安全读取、可清理”。
+ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Service，不决定 Job succeeded/failed/cancelled。它编排“某个 Attempt 对应的隔离单元是否存在、运行、已终止、可安全读取、可清理”；实际 runtime/cgroup 控制权限按 §7.7 方案 A/B 分配。
 
 **禁止**：
 - Worker 直接连接 Docker/containerd socket；
@@ -61,7 +61,7 @@ ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Se
 
 ### 3.2 Linux 生产基线：每 Attempt 一个 OCI 容器 + cgroup v2
 
-生产首选 Linux 节点上的 OCI runtime，由 ARC 调用 containerd（或经独立、受限的节点 runtime shim）创建每 Attempt 一个容器。
+生产首选 Linux 节点上的 OCI runtime。按 §7.7 选定方案 A 时由 ARC 调用受限 containerd 接口创建容器、NRG 独占 cgroup freeze/kill；选定方案 B 时由 NRG 作为唯一 runtime broker 执行 Create/Start/Stop/Delete。未选定前不得实现。
 
 每个 Attempt 必须拥有：
 - 独立 PID namespace；
@@ -72,7 +72,7 @@ ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Se
 - 固定且按 digest pin 的只读 Executor 镜像；
 - 不可继承宿主机文件描述符、socket、凭据或宿主目录。
 
-cgroup v2 是进程树资源和生命周期边界；OCI container 提供 namespace、mount、seccomp 等隔离组合。**容器名称、PID、进程组、PID 1、PDEATHSIG 都不能单独作为进程树死亡证明。**
+cgroup v2 是进程树资源和生命周期边界；OCI container 提供 namespace、mount、seccomp 等隔离组合。cgroup.freeze/cgroup.kill 的唯一写入者必须是 NRG（方案 A）或其选定的 runtime broker 边界（方案 B），不得由 ARC 与 NRG 双写。**容器名称、PID、进程组、PID 1、PDEATHSIG 都不能单独作为进程树死亡证明。**
 
 若目标节点不支持统一 cgroup v2、runtime 无法将容器放入 ARC 管理的专属 cgroup，或无法证明进程不能迁移/逃逸，则节点健康检查失败，ARC 不得启动生产 Attempt。
 
@@ -150,7 +150,7 @@ ARC 与 Worker 位于同一节点但不同进程身份。ARC 由 systemd/节点�
 
 所有请求有 request_id、worker_session_id、job_id、attempt_id、attempt_number、protocol_version。ARC 从服务端配置推导镜像 digest、资源配额、seccomp profile、mount allowlist、网络策略，不接受 Worker 覆盖安全配置。
 
-ARC 必须对同一 runtime identity 的 Create/Start/Kill/Inspect/Freeze/Cleanup 操作提供线性化裁决：使用 per-attempt durable operation journal + 单一状态转换锁/CAS。KillRequested 一旦持久化即成为不可逆 fencing point；所有尚未完成的 Start/Create completion 在继续前必须重新检查 generation/state，不能在 KillRequested 之后启动 Executor。多个 ARC 实例若部署在同一节点，必须由节点级单实例锁或共享一致性协调保证只有一个控制者；首版推荐每节点单 ARC active instance。
+ARC 与 NRG 必须对同一 runtime identity 的 Create/Start/Kill/Inspect/Freeze/Cleanup 操作提供线性化裁决：使用 per-attempt durable operation journal + 单一状态转换锁/CAS，并将 Start admission fencing 与 cgroup freeze/kill 的权限边界按 §7.7 固定。KillRequested 一旦持久化即成为不可逆 fencing point；所有尚未完成的 Start/Create completion 在继续前必须重新检查 generation/state，不能在 KillRequested 之后启动 Executor。多个 ARC 实例若部署在同一节点，必须由节点级单实例锁或共享一致性协调保证只有一个控制者；首版推荐每节点单 ARC active instance。
 
 ### 5.2 Worker 身份与 Attempt capability
 
@@ -260,7 +260,7 @@ DB-BLOCKER-02 的 remaining-duration + monotonic anchor 契约是 ARC 计算本�
 Kill 流程必须由 ARC 执行，不依赖 Worker 仍在线：
 
 1. 原子记录 KillRequested；禁止 Start/Resume/新 IPC。
-2. 调用 runtime kill 整个 container，并使用 cgroup v2 的整组终止能力（如 cgroup.kill）；不只 kill 主 PID/进程组。
+2. 先由 NRG freeze Attempt cgroup，再调用 runtime task stop/delete，并由 NRG 使用 cgroup v2 整组终止能力（如 cgroup.kill）；不只 kill 主 PID/进程组。
 3. 在有界 deadline 内等待 runtime task exit、cgroup `cgroup.events populated=0`，并确认 cgroup 不再允许新进程加入。
 4. 关闭/撤销容器控制通道，移除可执行 runtime task；记录 runtime inspect 证据。
 5. 满足所有 death predicate 后转 DeathConfirmed；否则 DeathUnconfirmed，保留隔离资源并告警。
@@ -650,6 +650,6 @@ CLOCK_MONOTONIC 在 Linux 系统 suspend 期间不计时；生产契约必须使
 | Linux cgroup v2 + OCI runtime | 硬隔离与进程树终止 | 目标平台待选型/实测 |
 | LMMS delegation P0 / File Service finalize P0 | Artifact 正式提交与 READY | 独立生产 P0，不能由本设计绕过 |
 
-**推荐架构候选：独立节点级 ARC + 独立 NRG admission-revoke/KillOnly fail-safe + 每 Attempt 一个 OCI sandbox/cgroup v2；Worker 只通过受限 UDS RPC 控制；ARC 使用专属只读 DB authority 验证；DeathConfirmed 之前禁止读取输出、提交结果和清理目录。NRG 的 Start-admission revoke 与故障上界尚未验证。**
+**推荐方向仍是独立 ARC + NRG + 每 Attempt 一个 OCI sandbox/cgroup v2；但 ARC/NRG 的 runtime socket、Start admission 与 cgroup freeze/kill 权限拓扑尚未裁决。必须先完成 §7.7 方案 A/B 原型与真实 runtime 并发测试；在此之前不得实现。**
 
 **当前状态：Architecture proposal / Not approved for implementation。** 本文没有证明当前环境已部署 cgroup v2/OCI runtime，也没有真实平台故障注入证据。PR 必须保持 Draft，等待独立架构评审；不得把设计条目标记为已实现或已关闭。
