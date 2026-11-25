@@ -571,8 +571,16 @@ async fn as2_17_dual_index_race_resolves_without_500(pool: PgPool) {
     let (id1, res1) = r1.expect("no 500-class error under dual index race");
     let (id2, res2) = r2.expect("no 500-class error under dual index race");
     assert_eq!(id1, id2, "both must resolve to the same job");
-    assert_eq!(res1, "created");
-    assert_eq!(res2, "caller_request_replay");
+    // 哪一方赢得 caller 唯一索引竞争由数据库与调度决定，契约（矩阵 AS2-17）
+    // 只要求：恰好一方 created、另一方按 caller 解析、无 500、无重复。
+    // 断言与 join! 的轮询顺序无关（R1 期间在 CI 上发现的潜在 flake）。
+    let mut outcomes = [res1, res2];
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        ["caller_request_replay", "created"],
+        "exactly one party creates; the loser must resolve by caller identity"
+    );
     assert_eq!(job_count(&pool).await, 1);
 }
 

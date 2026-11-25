@@ -286,5 +286,8 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 | P2-02 `.trae` 本地计划文件入库 | 确认为 TRAE 本地执行计划（正式记录已由本报告与 ART-04G v3 覆盖）：从 PR 变更中移除（本地文件保留），`.gitignore` 增加 `.trae/`；无正式内容需迁移 |
 
 受本次修复影响的既有测试：`as2_10_*`（拆分为三阶段）、`as2_23`（增强断言）、
-`as2_50`（重写）、`as2_37`/`as2_38`（保持不变，新增独立枚举 parity 测试）。
+`as2_50`（重写）、`as2_37`/`as2_38`（保持不变，新增独立枚举 parity 测试）、
+`as2_17`（R1 回归期间在 CI 上暴露的潜在 flake：原断言钉死 `tokio::join!` 的轮询顺序，
+即假设第一方必为 created；改为顺序无关断言——恰好一方 created、另一方按 caller 解析，
+与矩阵 AS2-17 语义一致，连续 8 次本地复跑通过）。
 其余 AS-2 与 AS-1 测试不受影响，全量回归通过。
