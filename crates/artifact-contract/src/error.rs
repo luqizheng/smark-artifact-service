@@ -70,12 +70,15 @@ impl ErrorEnvelope {
             "UNAUTHENTICATED" => 401,
             "SCOPE_DENIED" => 403,
             "RESOURCE_NOT_FOUND" => 404,
-            "VERSION_CONFLICT" | "IDEMPOTENCY_KEY_REUSED" => 409,
+            "VERSION_CONFLICT"
+            | "IDEMPOTENCY_KEY_REUSED"
+            | "ARTIFACT_KEY_CONFLICT"
+            | "ARTIFACT_KEY_LEGACY_UNVERIFIABLE" => 409,
             "PAYLOAD_TOO_LARGE" => 413,
             "UNSUPPORTED_MEDIA_TYPE" => 415,
             "GENERATOR_VALIDATION_FAILED" => 422,
             "RATE_LIMITED" => 429,
-            "STORAGE_UNAVAILABLE" | "GENERATOR_UNAVAILABLE" => 503,
+            "STORAGE_UNAVAILABLE" | "GENERATOR_UNAVAILABLE" | "PERSISTENCE_UNAVAILABLE" => 503,
             "GENERATION_TIMEOUT" => 504,
             _ => 500,
         }

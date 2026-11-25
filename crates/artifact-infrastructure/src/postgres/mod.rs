@@ -19,8 +19,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod keyed_create;
 pub mod worker;
 
+pub use keyed_create::PgKeyedArtifactCreator;
 pub use worker::PgWorkerCoordination;
 
 // ── 行类型 ──────────────────────────────────────────────────────────────

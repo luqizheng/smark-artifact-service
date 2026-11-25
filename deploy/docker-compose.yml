@@ -58,6 +58,7 @@ services:
       ARTIFACT_APP_DB_PASSWORD: ${ARTIFACT_APP_DB_PASSWORD:?set ARTIFACT_APP_DB_PASSWORD}
       ARTIFACT_WORKER_DB_USER: artifact_worker
       ARTIFACT_WORKER_DB_PASSWORD: ${ARTIFACT_WORKER_DB_PASSWORD:?set ARTIFACT_WORKER_DB_PASSWORD}
+      ARTIFACT_MAINTENANCE_DB_USER: artifact_maintenance
     volumes:
       - ./db-roles.sql:/deploy/db-roles.sql:ro
       - ./dev-grants.sh:/deploy/dev-grants.sh:ro

@@ -24,10 +24,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${ARTIFACT_APP_DB_PASSWORD:?ARTIFACT_APP_DB_PASSWORD is required}"
 : "${ARTIFACT_WORKER_DB_USER:?ARTIFACT_WORKER_DB_USER is required}"
 : "${ARTIFACT_WORKER_DB_PASSWORD:?ARTIFACT_WORKER_DB_PASSWORD is required}"
+# 清理主体（Idempotency-Key 过期清理）。默认值保持本地 compose 无需额外配置。
+ARTIFACT_MAINTENANCE_DB_USER="${ARTIFACT_MAINTENANCE_DB_USER:-artifact_maintenance}"
 
 sed -e "s/__MIGRATOR_ROLE__/${ARTIFACT_MIGRATOR_DB_USER}/g" \
     -e "s/__APP_ROLE__/${ARTIFACT_APP_DB_USER}/g" \
     -e "s/__WORKER_ROLE__/${ARTIFACT_WORKER_DB_USER}/g" \
+    -e "s/__MAINTENANCE_ROLE__/${ARTIFACT_MAINTENANCE_DB_USER}/g" \
     "${here}/db-roles.sql" | psql -v ON_ERROR_STOP=1
 
 # db-roles.sql 不设置口令；本地 dev 的口令来自 compose env。

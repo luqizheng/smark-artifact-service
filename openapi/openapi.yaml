@@ -103,18 +103,33 @@ paths:
           description: 创建成功（ETag 头返回并发锚）
           headers:
             ETag: { $ref: "#/components/headers/ETag" }
+            X-Artifact-Resolution: { $ref: "#/components/headers/ArtifactResolution" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Artifact" }
         "200":
-          description: "幂等重放（X-Idempotent-Replay: true）"
+          description: >-
+            未新建资源：`existing_key` 表示同 artifact_key 同创建指纹；
+            `idempotency_replay` 表示完成的 Idempotency-Key 重放（同时携带
+            X-Idempotent-Replay: true）。
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            X-Artifact-Resolution: { $ref: "#/components/headers/ArtifactResolution" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Artifact" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
-        "409": { $ref: "#/components/responses/Error" }
+        "409":
+          description: >-
+            `IDEMPOTENCY_KEY_REUSED`（同 Idempotency-Key 不同请求体）、
+            `ARTIFACT_KEY_CONFLICT`（同 artifact_key 不同创建指纹）或
+            `ARTIFACT_KEY_LEGACY_UNVERIFIABLE`（历史 key 无持久化身份）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Error" }
     get:
       operationId: listArtifacts
       tags: [artifacts]
@@ -473,6 +488,11 @@ components:
     ETag:
       description: 并发锚，格式 "r<row_revision>"；更新请求以 If-Match 回传。
       schema: { type: string, example: '"r3"' }
+    ArtifactResolution:
+      description: 创建解析语义。created=新建；existing_key=同 artifact_key 同创建指纹；idempotency_replay=完成的 Idempotency-Key 重放。
+      schema:
+        type: string
+        enum: [created, existing_key, idempotency_replay]
 
   parameters:
     ArtifactId:
@@ -609,7 +629,16 @@ components:
         artifact_type:
           type: string
           enum: [document, report, image, diagram, visualization, presentation, dataset, media, file]
-        artifact_key: { type: string }
+        artifact_key:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: >-
+            可选的稳定创建键。创建后不可变、按 tenant/project 作用域唯一且永不复用；
+            同 key 同语义载荷返回原 Artifact（200），同 key 不同载荷返回
+            ARTIFACT_KEY_CONFLICT（409）。历史 key 无持久化身份时返回
+            ARTIFACT_KEY_LEGACY_UNVERIFIABLE（409）并需人工对账。
+            空串、首尾空白或控制字符返回 400。
         description: { type: string }
         category: { type: string }
 

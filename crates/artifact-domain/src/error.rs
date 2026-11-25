@@ -12,6 +12,10 @@ pub enum DomainError {
     VersionConflict(String),
     #[error("idempotency key reused: {0}")]
     IdempotencyKeyReused(String),
+    #[error("artifact key conflict: {0}")]
+    ArtifactKeyConflict(String),
+    #[error("artifact key cannot be verified: {0}")]
+    ArtifactKeyLegacyUnverifiable(String),
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
     #[error("payload too large: {0}")]
@@ -22,6 +26,8 @@ pub enum DomainError {
     GeneratorUnavailable(String),
     #[error("generator validation failed: {0}")]
     GeneratorValidationFailed(String),
+    #[error("persistence unavailable: {0}")]
+    PersistenceUnavailable(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -35,11 +41,14 @@ impl DomainError {
             DomainError::NotFound => "RESOURCE_NOT_FOUND",
             DomainError::VersionConflict(_) => "VERSION_CONFLICT",
             DomainError::IdempotencyKeyReused(_) => "IDEMPOTENCY_KEY_REUSED",
+            DomainError::ArtifactKeyConflict(_) => "ARTIFACT_KEY_CONFLICT",
+            DomainError::ArtifactKeyLegacyUnverifiable(_) => "ARTIFACT_KEY_LEGACY_UNVERIFIABLE",
             DomainError::UnsupportedMediaType(_) => "UNSUPPORTED_MEDIA_TYPE",
             DomainError::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             DomainError::StorageUnavailable(_) => "STORAGE_UNAVAILABLE",
             DomainError::GeneratorUnavailable(_) => "GENERATOR_UNAVAILABLE",
             DomainError::GeneratorValidationFailed(_) => "GENERATOR_VALIDATION_FAILED",
+            DomainError::PersistenceUnavailable(_) => "PERSISTENCE_UNAVAILABLE",
             DomainError::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -50,6 +59,7 @@ impl DomainError {
             self,
             DomainError::StorageUnavailable(_)
                 | DomainError::GeneratorUnavailable(_)
+                | DomainError::PersistenceUnavailable(_)
                 | DomainError::Internal(_)
         )
     }

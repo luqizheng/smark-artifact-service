@@ -65,8 +65,10 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -115,6 +117,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "tokio",
  "tracing",
  "uuid",
 ]
