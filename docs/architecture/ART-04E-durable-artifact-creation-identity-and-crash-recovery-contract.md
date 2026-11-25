@@ -226,6 +226,39 @@ Recommended V1 compatibility split:
 
 The split must be explicit in tests and telemetry. The new keyed path must still perform fresh authorization before returning a replayed Artifact.
 
+## 5.7 Keyed-create application port contract
+
+The application layer must expose one purpose-built operation for keyed creates. The name may follow repository conventions, but its semantics must be equivalent to:
+
+```rust
+async fn create_or_resolve_keyed(
+    scope: AuthorizedTenantProjectScope,
+    request: ValidatedCreateArtifactRequest,
+    idempotency: Option<IdempotencyInput>,
+) -> Result<KeyedArtifactCreateOutcome, KeyedArtifactCreateError>;
+```
+
+Where:
+
+- `AuthorizedTenantProjectScope` is built only after current delegation authorization; tenant_id is credential-derived and project_id is the validated requested project.
+- `ValidatedCreateArtifactRequest` contains the normalized DTO and stable non-null artifact_key.
+- `IdempotencyInput` contains the endpoint-scoped key and the existing raw-body request hash; it does not contain a caller-selected tenant.
+- The PostgreSQL adapter owns one SQLx transaction for the entire keyed operation. It must not call the existing pool-committing `PgIdempotencyStore::reserve/complete` or `PgArtifactRepository::insert` methods inside that transaction.
+
+The outcome must distinguish at least:
+
+- `Created { artifact }`: this transaction created the Artifact and durable identity.
+- `ResolvedExisting { artifact }`: same artifact_key and semantic fingerprint already existed; this request resolved it (including after Idempotency-Key cache expiry or with a rotated Idempotency-Key).
+- `ReplayedByIdempotency { artifact }`: a matching completed Idempotency-Key response was found and safely resolved to the same scoped Artifact.
+- typed conflicts: Idempotency-Key request-hash mismatch, artifact_key semantic-fingerprint mismatch, and legacy-unverifiable key.
+- retryable persistence failure after bounded transaction retries.
+
+For every successful outcome with an Idempotency-Key, the transaction must leave a completed idempotency row whose response snapshot/resource_id resolves to the same Artifact. If an existing durable Artifact is resolved under a new Idempotency-Key, the transaction must complete that new idempotency record before commit. No success response may be returned before commit.
+
+The port returns domain outcomes, not raw SQLx errors. Unique-constraint races are resolved by rollback and fresh transaction; the port must never continue in a PostgreSQL transaction after a constraint error. The handler maps outcomes to the HTTP behavior in §7.
+
+The unkeyed path remains on the existing application ports in V1 and is not silently routed through this new port.
+
 ## 5.5 Deferred database invariants
 
 The migration must enforce both directions of the identity relationship:
@@ -252,17 +285,39 @@ Required migration behavior:
 
 The repository's current product context says there are no real customers or historical business data, but that is not a substitute for checking the actual target database at rollout. If unexpected non-test data is found, stop rollout and obtain an explicit product decision; do not run a guessed backfill.
 
+### 6.2 Idempotency-Key retention, expiry, and reconciliation
+
+For AS-1, `expires_at` is a retention eligibility timestamp, not an automatic logical deletion or permission to reuse a key.
+
+V1 policy:
+
+1. A completed Idempotency-Key row remains authoritative for transport replay while it physically exists, including after `expires_at`. Matching raw-body hash replays its stored response; a different hash retains the existing conflict behavior.
+2. A cleanup job may physically delete only completed rows with `expires_at <= now()`. Deletion must be bounded and use row-level locking / `FOR UPDATE SKIP LOCKED` (or equivalent) so it cannot race a request currently resolving the same key.
+3. Incomplete rows are never deleted automatically by TTL cleanup. They require reconciliation after the old-writer drain.
+4. For an incomplete legacy row after the old-writer drain, the reconciler checks the durable Artifact identity and the legacy Artifact table in the same scoped context:
+   - matching identity and matching raw request hash: complete the idempotency response with that Artifact;
+   - no Artifact and no identity: mark the record as safely abandoned or delete it under an explicit operator-approved reconciliation action, after which a retry may reserve the key;
+   - Artifact exists without identity, or evidence is inconsistent: keep the row blocked and require operator investigation; do not infer a fingerprint.
+5. Once a completed row is physically deleted, that Idempotency-Key may be used again under the existing retention contract. The durable `artifact_key` still prevents a duplicate logical Artifact and checks the semantic fingerprint.
+6. The cleanup job must not delete or mutate `artifact_creation_identity` rows. Durable identity retention is independent of Idempotency-Key retention.
+
+The cleanup/reconciliation mechanism, metrics, and operator runbook are required implementation artifacts. The exact cleanup batch size is operational configuration, not an API contract.
+
 ### 6.1 Cutover gate for old reservation-first writers
 
 The current implementation reserves Idempotency-Key in a separate operation before inserting the Artifact. An old handler may therefore still be in flight while a new handler tries to recover its stale reservation.
 
-Before enabling the new keyed-create transaction path:
+Before enabling the new keyed-create transaction path, perform a controlled, observable cutover:
 
-1. deploy/operate a write-quiescence gate for keyed Artifact creation;
-2. stop admitting new keyed creates through the old handler and drain all in-flight old create handlers;
-3. confirm no old handler can subsequently insert an Artifact without a creation-identity row;
-4. reconcile pre-existing incomplete Idempotency-Key records under the explicit policy below;
-5. only then enable the new handler/database invariant.
+1. Activate a keyed-create write gate on every serving instance; the old handler must reject new keyed requests with a stable retryable maintenance response. Unkeyed creates remain available if operationally safe.
+2. Wait for the in-flight keyed-create count on every instance to reach zero; then stop and remove every old application instance. Verify the deployment inventory contains no old binary and no old process can receive traffic.
+3. Apply the identity migration and DB grants/revokes only after the old writers are drained. The deferred invariant trigger then provides a database backstop: any residual old binary attempting a keyed Artifact insert without an identity row must fail at commit.
+4. Deploy the new binary with keyed creation still gated. Verify all instances report the new build/schema compatibility version and the new transactional port is active.
+5. Reconcile pre-existing incomplete Idempotency-Key records under §6.2 and inventory legacy keyed Artifacts without identity rows.
+6. Run a scoped smoke test and verify Artifact + identity + completed idempotency state in the database.
+7. Reopen keyed-create traffic only after all checks pass. Record deployment versions, gate transitions, drain metrics, migration version, and reconciliation counts as rollout evidence.
+
+If the platform cannot prove the old-writer drain or prevent old binaries from returning, do not apply the migration or enable the new path. A database trigger is a final invariant backstop, not a substitute for draining old writers.
 
 An incomplete legacy idempotency row with no matching Artifact identity is not automatically proof that no old request is still executing. It may be reused only after the old writer drain is proven. If that cannot be proven, keep the key blocked and require operator reconciliation; do not race old and new writers.
 
@@ -392,11 +447,12 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 
 **AS-1 remains not implemented until all acceptance evidence exists.** Completing this document does not approve production code, SeeCode, Worker rollout, or the wider ART-04 implementation. AS-2, AS-3, AS-4, and AI-PM PM-1..PM-3 remain separate gates.
 
-## 12. Open questions to resolve during independent review
+## 12. Decisions frozen for the next review
 
-1. Confirm the exact API response convention for a durable key replay (recommended: 200 with explicit replay indicator).
-2. Confirm any server-generated defaults in CreateArtifactRequest before freezing fingerprint golden vectors.
-3. Define the operational mechanism proving old keyed-create writers are drained before new handler activation.
-4. Define explicit cleanup/reconciliation semantics for expired idempotency rows; an `expires_at` timestamp alone does not make a conflicting row reusable.
+1. **HTTP replay semantics:** new Artifact is 201; durable key resolution or completed idempotency replay is 200. Both return the same Artifact representation and an explicit `resolution` field (`created`, `existing_key`, or `idempotency_replay`) if consistent with the API response conventions. If the current response envelope cannot add this field compatibly, use a response header rather than changing existing required fields.
+2. **Fingerprint defaults:** canonicalization is computed from the validated DTO after applying deterministic server defaults. Before implementation, record the actual defaults in golden test vectors from `CreateArtifactRequest`; no default may depend on wall-clock time, random values, or request order.
+3. **Old-writer drain:** use the per-instance write gate, in-flight drain, old-instance removal, migration invariant backstop, new-build verification, and gated smoke test defined in §6.1. If the deployment platform cannot prove these steps, rollout is blocked.
+4. **Idempotency expiry:** `expires_at` is retention eligibility only. Completed rows are replayable until physically deleted by the locked cleanup process; incomplete rows are never TTL-deleted and require explicit post-drain reconciliation under §6.2.
+5. **Keyed-create port:** implement the purpose-built `create_or_resolve_keyed` operation and typed outcomes defined in §5.7. Keep unkeyed create on its existing path in V1.
 
-No open question permits weakening the atomic Artifact + creation-identity transaction or treating the Idempotency-Key cache as durable authority.
+These decisions close the design questions for the next independent review; they do not approve implementation.
