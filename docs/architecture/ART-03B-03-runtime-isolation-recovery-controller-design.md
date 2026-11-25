@@ -44,10 +44,11 @@ ART-03B-02 v2.2 已定义 Supervisor 的 RPC/Lease/Heartbeat/FSM 行为，但明
 
 ### 3.1 独立 Runtime Controller，不在 Worker 内直接管理容器
 
-采用两个独立进程边界：
+采用三个独立进程边界：
 
 - **Artifact Worker / Supervisor**：领取 Attempt、运行 Supervisor FSM、调用 DB 受控函数、请求启动/终止隔离单元、在 death-confirm 后读取输出并继续 Artifact 提交流程。
 - **Artifact Runtime Controller（ARC）**：宿主机级或节点级服务，独立于 Worker 生命周期；唯一持有 container runtime 控制 socket 与 cgroup 管理权限；执行受限的 Create / Start / Kill / Inspect / FreezeOutput / Cleanup 操作。
+- **Node Runtime Guardian（NRG）**：独立于 Worker 与 ARC 的节点级 fail-safe 服务；不创建/启动 sandbox，不处理 Job/Attempt 业务状态，只负责撤销 ARC Start admission、在 ARC 失联时对受管 Attempt 执行 KillOnly，并由独立节点服务管理器监督。NRG 是本设计首轮复审新增的强制候选依赖，尚未选型或实现。
 
 ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Service，不决定 Job succeeded/failed/cancelled。它只管理“某个 Attempt 对应的隔离单元是否存在、运行、已终止、可安全读取、可清理”。
 
@@ -551,7 +552,7 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 ### Phase 0 — 节点能力探测与威胁模型确认
 - 固定 Linux 生产支持矩阵；
 - 验证 cgroup v2、containerd、LSM、seccomp、network isolation；
-- 明确 ARC service identity、Worker UDS identity 和 DB authority validation 接口。
+- 明确 ARC/NRG service identity、Worker UDS identity、Start admission generation 和 DB authority validation 接口。
 
 ### Phase 1 — ARC 最小控制面
 - 只实现 Create / Start / Inspect / Kill / WaitForDeath；
@@ -560,7 +561,7 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 - 无网络、无凭据、只读 root、资源限额。
 
 ### Phase 2 — 崩溃恢复与 DB authority
-- 独立 ARC service lifecycle；
+- 独立 ARC/NRG service lifecycle 与节点 watchdog；
 - runtime labels + durable journal reconciliation；
 - DB 只读 authority validation function 与专属 role；
 - ARC restart / Worker restart / DB partition 故障注入。
@@ -593,6 +594,6 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 | Linux cgroup v2 + OCI runtime | 硬隔离与进程树终止 | 目标平台待选型/实测 |
 | LMMS delegation P0 / File Service finalize P0 | Artifact 正式提交与 READY | 独立生产 P0，不能由本设计绕过 |
 
-**推荐架构裁决：独立节点级 Artifact Runtime Controller + 每 Attempt 一个 OCI sandbox + cgroup v2；Worker 只通过受限 UDS RPC 控制；ARC 使用专属只读 DB authority 验证；DeathConfirmed 之前禁止读取输出、提交结果和清理目录。**
+**推荐架构候选：独立节点级 ARC + 独立 NRG admission-revoke/KillOnly fail-safe + 每 Attempt 一个 OCI sandbox/cgroup v2；Worker 只通过受限 UDS RPC 控制；ARC 使用专属只读 DB authority 验证；DeathConfirmed 之前禁止读取输出、提交结果和清理目录。NRG 的 Start-admission revoke 与故障上界尚未验证。**
 
 **当前状态：Architecture proposal / Not approved for implementation。** 本文没有证明当前环境已部署 cgroup v2/OCI runtime，也没有真实平台故障注入证据。PR 必须保持 Draft，等待独立架构评审；不得把设计条目标记为已实现或已关闭。
