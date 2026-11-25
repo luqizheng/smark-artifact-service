@@ -455,7 +455,7 @@ AS-2 PR 中出现任何 `target_version_id` 暴露/分配/约束代码即为越�
 
 冻结原则：caller identity 用于确定候选 Job；它无权静默吞掉一个已绑定到其他 Job 的 Idempotency-Key 冲突。身份冲突优先于 key 冲突；但任何成功 replay 返回前，都必须验证当前 key 没有与其他 Job 发生冲突。
 
-将 §5.3.1 原 step 2 替换为以下逻辑（变量名须与最终 SQL 签名一致）：
+将 §5.3.1 原 step 2 替换为以下逻辑（v_existing / v_holder 须声明为 generation_job 行类型变量；p_idempotency_key 与 p_request_hash 沿用函数参数）：
 
     -- caller identity 读前查：先判定持久身份是否冲突
     IF p_caller_request_id IS NOT NULL THEN
@@ -476,12 +476,12 @@ AS-2 PR 中出现任何 `target_version_id` 暴露/分配/约束代码即为越�
             END IF;
 
             -- 指纹一致：成功返回前执行 key 冲突硬门禁
-            IF v_idempotency_key IS NOT NULL THEN
+            IF p_idempotency_key IS NOT NULL THEN
                 SELECT * INTO v_holder
                   FROM artifact.generation_job
                  WHERE tenant_id = p_tenant_id
                    AND project_id = p_project_id
-                   AND idempotency_key = v_idempotency_key;
+                   AND idempotency_key = p_idempotency_key;
 
                 IF FOUND AND v_holder.id <> v_existing.id THEN
                     IF v_holder.request_hash <> p_request_hash THEN
