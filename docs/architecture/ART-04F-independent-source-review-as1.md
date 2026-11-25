@@ -255,3 +255,12 @@ ART-04E has since been revised to close the design gaps identified in F-01..F-07
 - **Acceptance:** ART-04E now defines 56 acceptance cases, including cleanup races, incomplete-row reconciliation, replay integrity, old-writer drain evidence, and response semantics.
 
 These are specification corrections, not implementation evidence. The source-review findings remain historically valid. **Disposition remains Changes Required until a final independent review of the revised ART-04E confirms that these policies are mutually consistent and implementable against the repository's current schema and deployment model.** No implementation is authorized by this follow-up.
+
+
+### Additional adversarial clarification
+
+The original cutover wording assumed the old binary could honor a new per-instance keyed-create gate. That is not a safe assumption. ART-04E now requires an ingress-level pause of the entire `POST /v1/artifacts` route during cutover (temporarily pausing unkeyed creates as well), unless a gate-capable compatibility release is deployed to every instance first. The migration is not applied until in-flight create requests are zero and all old instances are removed.
+
+The Idempotency-Key cleanup worker is also explicitly prohibited from receiving broad table DELETE privileges. Cleanup must use a narrowly scoped maintenance function that deletes only completed expired rows in bounded batches; incomplete-row reconciliation remains operator-controlled.
+
+One acceptance case was corrected: failure to write the completed idempotency response occurs before commit and therefore rolls back Artifact, identity, and reservation together. The prior wording that allowed Artifact commit followed by a separate idempotency completion failure contradicted the required single-transaction boundary.
