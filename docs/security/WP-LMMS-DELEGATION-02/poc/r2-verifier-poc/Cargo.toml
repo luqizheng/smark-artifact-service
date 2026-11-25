@@ -1,0 +1,33 @@
+# ⚠️ 非生产实现 — WP-LMMS-DELEGATION-02 独立评审 PoC ⚠️
+#
+# 用途：对 PR #12 的 AiPmDelegationVerifier 做"测试有效性变异验证"——
+# 针对交付测试矩阵未覆盖的负面路径（V6 jti UUID / V7 purpose / V8 actions
+# 形状 / V4 数组 aud）与配置弱化点（TrustedIssuer.audience 可配置为非契约
+# 固定值）逐项铸造 token 并断言验证器行为。
+#
+# 本 crate 是独立 workspace（不加入主仓库 workspace members），仅供评审复核，
+# 不得用于生产，不得据此修改业务代码。
+[workspace]
+
+[package]
+name = "r2-verifier-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde_json = "1"
+base64 = "0.22"
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+rsa = "0.9"
+rand = "0.8"
+uuid = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+artifact-infrastructure = { path = "../../../../../crates/artifact-infrastructure" }
+artifact-application = { path = "../../../../../crates/artifact-application" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
