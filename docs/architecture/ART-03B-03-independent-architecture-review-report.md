@@ -167,9 +167,9 @@ PR #6 必须保持 Open / Draft。不得创建 Worker/ARC/NRG 业务代码、Mig
 
 **问题**
 
-当前拓扑仍让 ARC 直接持有 containerd socket 与 cgroup 管理权限，同时要求 NRG 在 ARC 失联时撤销 ARC 的 Start admission。关闭 UDS、关闭客户端 socket、更新 generation 或发送 gRPC cancel，都不能证明已经进入 containerd 的 Start 请求不会迟到生效。
+当前方案 A 仍允许 ARC 直接持有 containerd socket，同时要求 NRG 在 ARC 失联时撤销 ARC 的 Start admission。虽然已把 cgroup.freeze/cgroup.kill 写权限划给 NRG，但关闭 UDS、关闭客户端 socket、更新 generation 或发送 gRPC cancel，都不能证明已经进入 containerd 的 Start 请求不会迟到生效。
 
-NRG 若只有 KillOnly 权限，就不能撤销 ARC 的 runtime socket 能力；若 NRG 直接拥有 runtime socket，则它已不再是 KillOnly 组件。首轮设计没有裁决这两者的权限冲突。
+NRG 若只有 cgroup freeze/kill 权限，就不能撤销 ARC 的 runtime socket 能力；若 NRG 直接拥有 runtime socket，则它已不再是纯 KillOnly 组件。首轮设计没有裁决这两者的权限冲突。
 
 **必须修正**
 - 在 §7.7 明确两种可验证候选：A) NRG 独占 cgroup freeze/kill execution fence，ARC 保留受限 runtime API；B) NRG 成为唯一最小权限 runtime broker，ARC 不持 runtime socket。
