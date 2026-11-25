@@ -1,6 +1,6 @@
 # ART-04G — AS-2（GenerationJob Durable Caller Identity）独立架构评审与实施契约
 
-> **Status:** 独立架构评审结论 + AS-2 implementation-ready contract（冻结候选）
+> **Status:** ART-04H 挑战后修订版（v2，待独立复核；原 §5 冻结候选已由 §9 修订条款覆盖）
 > **Date:** 2026-11-25
 > **Reviewer:** 独立架构评审（基于源码与迁移的真实核查，非仅静态审计转述）
 > **Baseline:** `main` + AS-1 分支 `feat/as-1-durable-artifact-creation-identity` @ `5541d3be8c90cfcf9283b6e59426c8a3c2bfe099`（PR #8，Draft，未合并）
@@ -14,7 +14,7 @@
 | 对象 | 结论 |
 |---|---|
 | **AR04-01（ART-04A §2 设计文本）** | **CHANGES REQUIRED** — 设计方向正确，但有 5 处必须先冻结的规格缺口/缺陷（见 §4）。全部缺口在本文件 §5 中给出冻结解。 |
-| **AR04-01 → AS-2 代码实施** | **APPROVED（有条件）** — 条件：AS-2 PR 必须以本文件 §5 的冻结契约为唯一实施规格，并在 PR 中落地 ART-04A §2.2 的修订（P1-1）；不得偏离 §5 任何冻结项。 |
+| **AR04-01 → AS-2 代码实施** | **暂缓启动（CHANGES REQUIRED）** — ART-04H 新增 C-1 P1 与 C-2..C-5 P2 已按 §9 修订；须先由独立评审确认 §9 修订完整、无新 P1，再另行冻结并授权 AS-2 实施。 |
 | **AR04-02（target_version_id 暴露与完成不变量）** | **NOT APPROVED / DEFERRED to AS-3** — 详见 §7.2。不得在 AS-2 中实施任何 AR04-02 内容。 |
 
 **无 P0 缺陷。** 5 个 P1、5 个 P2，全部可通过本契约冻结解决，不需要推翻设计方向。
@@ -442,4 +442,130 @@ AS-2 PR 中出现任何 `target_version_id` 暴露/分配/约束代码即为越�
 6. **Phase 5** §6 矩阵 46 项全量执行 + AS-1 回归（AS2-31）+ 独立审查（对齐 ART-04E §11 先例）。
 7. PR 说明必须附：本评审文档、全部验收项状态、未解决 P0/P1 标记（目标为无）、迁移证据（§5.7.3）、Draft 状态提交。
 
-**批准状态：批准 AS-2 按本契约启动代码实施。** 本批准不解除任何既有门禁：不启用生成、不动 Worker、不触碰 LMMS/File Service、不合并 PR #8、不启动 AS-3/AS-4/PM-1..3。
+**当前状态：AS-2 实施尚未获授权。** ART-04H 已裁定 CHANGES REQUIRED；本文件 §9 为针对该裁决的规范性修订稿，须经独立复核确认后，才可将 AS-2 标记为 implementation-ready 并另行启动实施。任何情况下均不解除既有门禁：不启用生成、不动 Worker、不触碰 LMMS/File Service、不合并 PR #8、不启动 AS-3/AS-4/PM-1..PM-3。
+
+---
+
+## 9. ART-04H 挑战后规范性修订（v2，优先级高于 §§5–8 的冲突表述）
+
+> 修订依据：ART-04H-independent-challenge-review-as2-frozen-contract.md。
+> 效力：本节是 ART-04G §5 的组成部分。若本节与 §§5–8 任何旧文字冲突，以本节为准；实现者不得只阅读旧 §5。此修订不改变 AS-3 / AS-4 边界，也不构成代码实施授权。
+
+### 9.1 C-1（P1）：caller 命中后的 Idempotency-Key 冲突硬门禁
+
+冻结原则：caller identity 用于确定候选 Job；它无权静默吞掉一个已绑定到其他 Job 的 Idempotency-Key 冲突。身份冲突优先于 key 冲突；但任何成功 replay 返回前，都必须验证当前 key 没有与其他 Job 发生冲突。
+
+将 §5.3.1 原 step 2 替换为以下逻辑（变量名须与最终 SQL 签名一致）：
+
+    -- caller identity 读前查：先判定持久身份是否冲突
+    IF p_caller_request_id IS NOT NULL THEN
+        SELECT * INTO v_existing
+          FROM artifact.generation_job
+         WHERE tenant_id = p_tenant_id
+           AND project_id = p_project_id
+           AND caller_request_id = p_caller_request_id;
+
+        IF FOUND THEN
+            IF v_existing.fingerprint_version <> p_fingerprint_version THEN
+                RAISE EXCEPTION USING ERRCODE = 'P0001',
+                    MESSAGE = 'CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH';
+            END IF;
+            IF v_existing.request_fingerprint <> p_request_fingerprint THEN
+                RAISE EXCEPTION USING ERRCODE = '23505',
+                    MESSAGE = 'CALLER_REQUEST_ID_REUSED';
+            END IF;
+
+            -- 指纹一致：成功返回前执行 key 冲突硬门禁
+            IF v_idempotency_key IS NOT NULL THEN
+                SELECT * INTO v_holder
+                  FROM artifact.generation_job
+                 WHERE tenant_id = p_tenant_id
+                   AND project_id = p_project_id
+                   AND idempotency_key = v_idempotency_key;
+
+                IF FOUND AND v_holder.id <> v_existing.id THEN
+                    IF v_holder.request_hash <> p_request_hash THEN
+                        RAISE EXCEPTION USING ERRCODE = '23505',
+                            MESSAGE = 'IDEMPOTENCY_KEY_REUSED';
+                    END IF;
+                    RAISE EXCEPTION USING ERRCODE = 'P0001',
+                        MESSAGE = 'IDEMPOTENCY_KEY_CROSS_IDENTITY';
+                END IF;
+            END IF;
+
+            RETURN QUERY SELECT v_existing.id, 'caller_request_replay';
+            RETURN;
+        END IF;
+    END IF;
+
+    -- caller 未命中：继续既有 Idempotency-Key 读前查逻辑。
+    -- 同 key + 同 raw request_hash => idempotency_replay；
+    -- 同 key + 不同 raw request_hash => IDEMPOTENCY_KEY_REUSED。
+
+异常块 step 7 必须执行同一门禁：unique_violation 子事务回滚后，以新语句快照重读 caller。若命中，依次检查 fingerprint_version、request_fingerprint，再对当前请求 Idempotency-Key 执行与读前查完全相同的 holder 检查；key 绑定他行且 raw request_hash 不同，必须返回 IDEMPOTENCY_KEY_REUSED，不得 replay。caller 未命中时，保留原有按 Idempotency-Key 重读逻辑。step 2 与 step 7 的 key 门禁必须共用同一 SQL helper 或等价实现，避免逻辑漂移。
+
+优先级冻结：
+- caller 命中但 fingerprint/version 冲突：caller 冲突优先；
+- caller 命中且 fingerprint/version 一致，但 key 绑定其他 Job 且 raw hash 不同：Idempotency-Key 冲突；
+- caller 命中且 key 未绑定、绑定自身，或请求未带 key：允许 caller replay；
+- caller 未命中：继续原 Idempotency-Key 解析；之后才检查 generator availability。
+同 caller + 未绑定新 key、同 caller + 无 key 的恢复语义不变。Lookup 不受 Idempotency-Key 影响。
+
+### 9.2 C-2（P2）：Fingerprint 版本演进与失败关闭
+
+1. AS-2 v1 实施时，数据库函数比较传入 fingerprint_version 与存储版本；不相等即失败关闭。v1-only 阶段该分支是完整性防御，不是跨版本恢复机制。
+2. 版本不匹配映射为 5xx 完整性错误，不可自动重试；调用方应改用 caller lookup 获取既有 Job，并告警/人工处理，不得更换 caller_request_id 绕过。
+3. 若未来引入 v2，Rust 端必须保留所有仍有存活 Job 使用的 canonicalizer，并按存储行的版本重算后比较；版本升级前必须有独立迁移/兼容设计与验收。移除仍被存活记录引用的 canonicalizer 属于 P0 完整性事件。
+4. 当前 v1 SQL 函数在数据库内比较版本，不能声称它已支持“按存储版本重算”；该能力仅是未来版本升级必须实现的规则。
+
+### 9.3 C-3（P2）：Canonical JSON 的实现约束与三链路差异
+
+1. v1 canonicalizer 使用固定版本 serde_json 默认 Map 排序语义；必须禁用 preserve_order 与 arbitrary_precision。若未来依赖树改变这些特性，必须显式对所有 payload object key 按 Unicode code point 顺序重排，并通过全部 golden vectors；不得静默改变 v1 输出。
+2. payload 字符串按解析后的 Unicode 字符串内容原样编码，不做 NFC/NFD 归一化；数组保序；对象键排序；DTO 层 absent options 等同 null，但 payload 内部 absent 与 null 保持区分；非有限数拒绝。数字行为以锁定的 serde_json 版本和 golden vectors 为准：1e2 与 100.0 同指纹，整数 100 与浮点 100.0 不同指纹。
+3. request_fingerprint、request_hash、input_sha256 是三条独立链路。1e2 与 100.0 可产生相同语义 fingerprint，但经 JSONB 保存/渲染后产生不同 input_sha256；这不是矛盾，不得把其中任一 hash 替代另一条链路。
+
+### 9.4 C-4（P2）：指纹写入信任边界与 DB 权限
+
+1. Rust typed DTO/canonicalizer 是 request_fingerprint 内容正确性的唯一计算与信任边界；DB 负责配对 CHECK、格式 CHECK、作用域唯一性、不可变性和事务收敛，不验证语义 fingerprint 是否由 payload 正确计算。
+2. 因 APP 当前对 generation_job 具有表级 INSERT/UPDATE，实施 PR 必须明确回答是否将 APP 的直接 INSERT/UPDATE 收窄为仅通过受控 SECURITY DEFINER create function 写入/更新。优先方案是撤销 APP 对该表的直接 INSERT/UPDATE，只保留业务实际需要的最小列级/函数级权限；但不得在未盘点所有 repository、worker、测试和维护路径前盲目撤权。
+3. 必须证明生产写入路径不能绕过 Rust 指纹计算；任何保留的直接 SQL 写入路径必须有明确调用者、最小权限、测试和审计证据。AS2-42 应验证经受控函数可创建，并验证 APP 直连 INSERT 按最终权限策略被拒绝或严格受控，不能只验证触发器拦截 UPDATE。
+
+### 9.5 C-5（P2）：SQLSTATE 与稳定消息 token 的错误映射
+
+1. SQL 函数为新增业务错误显式指定稳定 message token 与 SQLSTATE，不得依赖 PostgreSQL 默认异常码。
+2. 冻结映射：
+   - CALLER_REQUEST_ID_REUSED：SQLSTATE 23505；
+   - IDEMPOTENCY_KEY_REUSED：SQLSTATE 23505；
+   - CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH：SQLSTATE P0001；
+   - IDEMPOTENCY_KEY_CROSS_IDENTITY（结构不变量防御）：SQLSTATE P0001；
+   - 输入/格式校验错误：SQLSTATE 22023，沿用现有校验语义。
+   现有 GENERATOR_UNAVAILABLE / UNKNOWN_GENERATOR token 与 SQLSTATE 语义不得因本修订改变。
+3. Rust 端口错误分类必须 token-first：先识别稳定 message token，再看 SQLSTATE。否则现有分类器可能把带 P0001 的 GENERATOR_UNAVAILABLE 归入 IntegrityFailure，或把带 23505 的业务冲突误归入可重试错误。
+4. 仅未命中任何已知业务 token 的 23505、40001、40P01 才进入有界重试/并发冲突分类；其余按完整性/未知错误处理。不得将所有 23505 一律 Retry。
+
+### 9.6 验收矩阵增补：总数修正为 52 项
+
+ART-04H 的“46 → 51”总数存在算术错误：原 AS2-28 拆成 28a/28b 净增 1 项，再新增 AS2-47..AS2-51 共 5 项，故总数为 52 项（不是 51）。以下项目纳入 §6 的强制验收矩阵：
+
+| ID | 场景 | 预期 |
+|---|---|---|
+| AS2-28a | caller_request_id 未命中时，同 key + 不同 raw body hash | 409 IDEMPOTENCY_KEY_REUSED |
+| AS2-28b | caller_request_id 命中且 fingerprint 一致，但当前 key 绑定其他 Job 且 raw hash 不同 | 409 IDEMPOTENCY_KEY_REUSED |
+| AS2-47 | Job A(caller A, K1) 与 Job B(caller B, K2) 已存在；POST caller A + F_A + K2 | 409；无新行；A/B 的 key/hash/fingerprint 均不变 |
+| AS2-48 | 与 AS2-47 对称：POST caller B + F_B + K1 | 409；无新行；两 Job 均不变 |
+| AS2-49 | 并发混合提交 {caller A + F_A + K2} 与 {caller B + F_B + K1} | 两请求均不得成功 replay；按已提交 key holder 返回 409；无行/身份/key 改写 |
+| AS2-50 | unique_violation 异常块 caller 命中且指纹一致，同时当前 key 竞争性绑定到其他 Job | 异常块必须执行同一 key 门禁并返回 409，不得 replay |
+| AS2-51 | token-first 映射：GENERATOR_UNAVAILABLE 使用既有 P0001 时 | 映射为现有 503 业务语义，不得落入 IntegrityFailure |
+
+原 AS2-28 删除并由 28a/28b 取代；AS2-01..27、AS2-29..46 保持。实施 PR 必须按 52 项逐项编号、给出测试位置与执行证据；未执行不得标记 PASS。
+
+### 9.7 迁移与实施前新增检查
+
+1. §5.7 的“无 ingress drain”仅在 F-3 仍成立时有效；实施 PR 必须重新验证没有生产调用方，并检查迁移窗口内无 in-flight create transaction。任何生产调用方出现即停止并升级完整 drain。
+2. APP 对 generation_job 的直接 INSERT/UPDATE 权限必须按 §9.4 做调用路径盘点与最小权限裁决；不得把“触发器保护 UPDATE”误写成“指纹内容不可伪造”。
+3. AS-2 实施 PR 必须附 AS2-01..AS2-52 逐项矩阵、真实 PostgreSQL 并发/故障注入证据、OpenAPI/SDK parity 证据、migration checksum 与角色权限证据；保持 Draft，等待独立代码评审。
+4. 本修订不改变 AS-3 / AR04-02 的 NOT APPROVED / DEFERRED，也不允许合并 PR #8、启用 Generator、修改 Worker、LMMS/File Service 或 SeeCode。
+
+### 9.8 修订后的冻结状态
+
+ART-04H 的 C-1 P1 已在文档层给出明确修订方案；C-2..C-5 P2 已纳入规范性约束。但文档作者不能自行把独立挑战评审改判为 APPROVED：本版仅作为修订候选，必须由独立评审针对 §9 复核 C-1 的读前查/异常块并发语义、SQLSTATE/token 映射及权限信任边界。复核通过后，另行签发 AS-2 implementation-ready 冻结结论。
