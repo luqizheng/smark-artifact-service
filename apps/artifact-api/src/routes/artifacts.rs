@@ -160,8 +160,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn parse_path_uuid(raw: &str, field: &str) -> Result<Uuid, ApiError> {
-    Uuid::parse_str(raw)
-        .map_err(|_| DomainError::InvalidRequest(format!("invalid {field} '{raw}'")).into())
+    Uuid::parse_str(raw).map_err(|_| {
+        // 稳定原因码 + 400；错误消息不回显用户提交的原始路径参数。
+        DomainError::InvalidRequest(format!(
+            "invalid {field}: the path parameter must be a valid UUID"
+        ))
+        .into()
+    })
 }
 
 fn parse_if_match_revision(headers: &HeaderMap) -> Result<i64, ApiError> {

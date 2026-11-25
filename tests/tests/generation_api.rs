@@ -505,13 +505,16 @@ async fn as2_21_lookup_requires_project_authorization(pool: PgPool) {
 }
 
 /// AS2-23：非法路径参数 → 400 稳定原因码。
+/// P2-01（独立审查修复）：错误响应不得回显用户提交的原始路径参数。
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_23_lookup_rejects_invalid_uuid(pool: PgPool) {
     let _ = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
     let base = spawn(&pool).await;
+    // 哨兵值带有唯一标记，确保任何回显都能被检出。
+    let malicious = "not-a-uuid-MARKER-9f3a";
     let res = auth(
         reqwest::Client::new().get(format!(
-            "{base}/v1/generation-jobs/by-caller-request/not-a-uuid"
+            "{base}/v1/generation-jobs/by-caller-request/{malicious}"
         )),
         PROJECT_1,
     )
@@ -527,6 +530,18 @@ async fn as2_23_lookup_rejects_invalid_uuid(pool: PgPool) {
     assert!(
         reason.contains("invalid caller_request_id"),
         "stable reason for a malformed path uuid, got {reason}"
+    );
+    let raw = serde_json::to_string(&body).unwrap_or_default();
+    assert!(
+        !raw.contains(malicious),
+        "the error response must not echo the raw path parameter, got {raw}"
+    );
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(malicious),
+        "the error message must not echo the raw path parameter"
     );
 }
 
