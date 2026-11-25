@@ -20,6 +20,8 @@ pub const TENANT_OTHER: Uuid = Uuid::from_u128(0x0002);
 pub const PROJECT_OTHER: Uuid = Uuid::from_u128(0x0201);
 /// LMMS 数字租户镜像（契约 v0.2 P0-01，仅审计语义）。
 pub const LMMS_TID: i64 = 42;
+/// /v1/generators 授权测试用替身凭证（WP-03：该端点要求 generation:read）。
+pub const GENERATORS_TOKEN: &str = "test-generators-token";
 
 /// 构造一个（可选携带操作绑定的）测试 Delegation，供声明层一致性判定使用。
 pub fn delegation_for(

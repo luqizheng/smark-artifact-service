@@ -12,10 +12,6 @@ pub enum DomainError {
     VersionConflict(String),
     #[error("idempotency key reused: {0}")]
     IdempotencyKeyReused(String),
-    /// 同一 delegation jti 被绑定到指纹不同的第二个请求（WP 契约 v0.2 §3.4）。
-    /// 409，确定性业务冲突，不重试；仅在 jti 绑定存储原子判定后返回。
-    #[error("delegation token reused: {0}")]
-    DelegationTokenReused(String),
     /// caller_request_id 已绑定到指纹不同的操作（ART-04G v3 §9.1）。
     /// 409，确定性业务冲突，不重试。
     #[error("caller request id reused: {0}")]
@@ -61,7 +57,6 @@ impl DomainError {
             DomainError::NotFound => "RESOURCE_NOT_FOUND",
             DomainError::VersionConflict(_) => "VERSION_CONFLICT",
             DomainError::IdempotencyKeyReused(_) => "IDEMPOTENCY_KEY_REUSED",
-            DomainError::DelegationTokenReused(_) => "DELEGATION_TOKEN_REUSED",
             DomainError::CallerRequestIdReused(_) => "CALLER_REQUEST_ID_REUSED",
             DomainError::FingerprintVersionMismatch(_) => {
                 "CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH"

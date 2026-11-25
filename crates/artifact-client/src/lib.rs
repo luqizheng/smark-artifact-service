@@ -158,7 +158,7 @@ impl ArtifactClient {
         })
     }
 
-    /// 无凭证只读面：健康、就绪、Generator 注册表。
+    /// 无凭证只读面：健康、就绪探针。
     pub async fn health(&self) -> Result<HealthResponse, SdkError> {
         self.get("/v1/health", &CallContext::new()).await
     }
@@ -167,12 +167,17 @@ impl ArtifactClient {
         self.get("/v1/ready", &CallContext::new()).await
     }
 
-    pub async fn generators(&self) -> Result<Vec<artifact_contract::GeneratorResponse>, SdkError> {
+    /// Generator 注册表（WP-03：需委托凭证 + `generation:read` 动作；
+    /// ctx.bearer_token 为空时服务端 401）。
+    pub async fn generators(
+        &self,
+        ctx: &CallContext,
+    ) -> Result<Vec<artifact_contract::GeneratorResponse>, SdkError> {
         #[derive(serde::Deserialize)]
         struct Generators {
             generators: Vec<artifact_contract::GeneratorResponse>,
         }
-        let wrapped: Generators = self.get("/v1/generators", &CallContext::new()).await?;
+        let wrapped: Generators = self.get("/v1/generators", ctx).await?;
         Ok(wrapped.generators)
     }
 

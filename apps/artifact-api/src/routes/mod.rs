@@ -13,6 +13,7 @@ use std::time::Duration;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::auth::Authed;
 use crate::error::{ApiError, audit_and_enrich_layer, request_id_layer};
 use crate::state::AppState;
 
@@ -114,9 +115,16 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 /// /v1/generators：注册表实况（未实现 Adapter 如实上报 unavailable）。
+/// 认证 + 授权（WP-03 R2-F-03 修复，Q3）：无有效委托 → 401；缺
+/// `generation:read` 动作 → 403；均前置于任何数据读取。
 async fn list_generators(
     State(state): State<AppState>,
+    req: Authed,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let generators = state.generators.list().await.map_err(ApiError::Domain)?;
+    let generators = state
+        .generators
+        .list_authorized(&req.delegation)
+        .await
+        .map_err(ApiError::Domain)?;
     Ok(Json(serde_json::json!({ "generators": generators })))
 }

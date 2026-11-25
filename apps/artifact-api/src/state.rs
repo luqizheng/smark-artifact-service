@@ -45,7 +45,6 @@ pub fn verifier_from_config(
         .map(|entry| artifact_infrastructure::delegation::TrustedIssuer {
             issuer: entry.issuer.clone(),
             jwks_url: entry.jwks_url.clone(),
-            audience: entry.audience.clone(),
         })
         .collect();
     match artifact_infrastructure::delegation::AiPmDelegationVerifier::new(trusted) {

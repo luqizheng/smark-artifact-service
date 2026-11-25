@@ -3,8 +3,8 @@
 //! 实现契约 §3.2 的全部验证步骤（任何一步失败即拒绝，绝不降级）：
 //! 1. RS256 验签（kid-strict，JWKS 缓存见 [`jwks`]；`alg` 必须恰为 RS256）；
 //! 2. `iss` ∈ 受信 issuer 清单（按**已验证后**的 iss 匹配配置；peek 只用于
-//!    选配置，iss 本身由签名验证强制）且 `aud == 配置受众`（默认
-//!    `artifact-service`，显式比较）；
+//!    选配置，iss 本身由签名验证强制）且 `aud == DELEGATION_AUDIENCE` 常量
+//!    （`artifact-service`，编译期固定，配置不可覆盖——WP-03 裁决）；
 //! 3. 时间验证（P0-04，见 [`time`] 模块内常量与 `validate_time_claims`）；
 //! 4. `purpose == "delegation"`；`actions` 非空且逐项 ∈ AS Action 枚举；
 //!    租户映射按 P0-01：`tenant_id`（AS 原生 UUID）+ `tid`（LMMS 数字镜像）
@@ -12,7 +12,8 @@
 //! 5. 组装 [`Delegation`]：scope = (tenant_id, project_id) 均来自凭证；
 //!    `X-Project-Id` 一致性由 Scoped 提取器 + `Delegation::require` 校验；
 //! 6. `require(action, scope)` 仍由服务层入口执行（现状不变）；
-//! 7. jti 单次绑定由 [`crate::postgres::delegation_binding`]（AS-4 接线调用）。
+//! 7. jti 单次消费仲裁由既有业务幂等机制承接（AS-1 artifact_key/Idempotency、
+//!    AS-2 caller 三元组部分唯一索引，WP-03 O-5 裁决：AS 不加表）。
 //!
 //! 错误消息只含判定原因，绝不包含 token 本体（SECURITY-REVIEW 挑战 10）。
 
@@ -26,7 +27,7 @@ use uuid::Uuid;
 
 use super::jwks::{JwksCache, JwksLookup};
 
-/// 契约 v0.2 §3.1：委托 Token 固定受众。
+/// 契约 v0.2 §3.1：委托 Token 固定受众（WP-03：常量钉死，无配置面）。
 pub const DELEGATION_AUDIENCE: &str = "artifact-service";
 /// 契约 v0.2 §3.1：purpose 固定值。
 pub const DELEGATION_PURPOSE: &str = "delegation";
@@ -36,14 +37,17 @@ pub const MAX_TOKEN_TTL_SECS: i64 = 300;
 pub const CLOCK_SKEW_LEEWAY_SECS: i64 = 60;
 
 /// 受信签发方配置（来自 `ARTIFACT_API_DELEGATION_ISSUERS`，见 api config）。
+///
+/// 信任边界（WP-03 audience 固定裁决）：期望受众**不是**本结构的字段——
+/// 验证器内部恒以 [`DELEGATION_AUDIENCE`] 常量比对，配置层无法改变受众
+/// 信任根（R2-F-06 修复；构造后不存在可被外部输入改变受众的路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedIssuer {
-    /// `iss` claim 的精确值（如 `ai-pm`）。
+    /// `iss` claim 的精确值（如 `ai-pm`）。受信 issuer 清单机制（Q6）按设计
+    /// 可配置，且恰一项 active（受信根本体；受众是契约常量，两者边界不同）。
     pub issuer: String,
     /// 固定 JWKS URL（https；回环 http 豁免仅在 dev 配置解析层放行）。
     pub jwks_url: String,
-    /// 期望 `aud`（默认 `artifact-service`）。
-    pub audience: String,
 }
 
 impl TrustedIssuer {
@@ -51,7 +55,6 @@ impl TrustedIssuer {
         Self {
             issuer: issuer.into(),
             jwks_url: jwks_url.into(),
-            audience: DELEGATION_AUDIENCE.to_string(),
         }
     }
 }
@@ -117,10 +120,16 @@ struct BizClaim {
     #[allow(dead_code)]
     #[serde(default)]
     task_run_id: Option<String>,
-    /// 扩展（O-5）：签发方对规范化请求的 SHA-256 指纹；与顶层
-    /// `caller_request_id` 配对存在（契约 §3.1.1 条件必填的强化）。
+    /// 扩展（O-6，WP-03 修订后保留）：签发方对规范化请求的 SHA-256 指纹；
+    /// 与顶层 `caller_request_id` 配对存在（契约 §3.1.1 配对红线）。
+    /// AS-4/V10 接线前仅做形状与配对校验，不作为放行依据。
     #[serde(default)]
     request_hash: Option<String>,
+    /// 指纹算法版本（PC-O6-2）：缺省 = `v1`；存在时仅接受
+    /// [`artifact_application::REQUEST_HASH_ALGORITHM_V1`]，未知算法拒绝
+    /// （fail-closed：新算法上线必须先扩展本验证器）。
+    #[serde(default)]
+    request_hash_alg: Option<String>,
 }
 
 /// P1：ActorType 确定性映射。缺省 = user；白名单外拒绝。
@@ -169,11 +178,13 @@ fn validate_time_claims(claims: &DelegationClaims, now: i64) -> Result<(), Verif
     Ok(())
 }
 
-/// 操作绑定形状校验（契约 §3.1.1 条件必填 + 本实现扩展 O-5）：
+/// 操作绑定形状校验（契约 §3.1.1 + WP-03 修订 PC-O6-1/2）：
 /// * 顶层 `caller_request_id`（存在时）必须是合法 UUID（AS-2 类型要求）；
 /// * 扩展 `biz.request_hash` 存在时：必须与顶层 `caller_request_id` 配对，
 ///   且为 64 位小写十六进制（规范化请求指纹，冻结规范见
-///   `artifact_application::canonical_request_fingerprint`）。
+///   `artifact_application::canonical_request_fingerprint`，算法 v1）；
+/// * `biz.request_hash_alg`（存在时）必须为受支持的算法版本（当前仅 `v1`）；
+///   alg 与 hash 同空同非空（半配对视为形状异常，fail-closed）。
 fn validate_operation_binding(claims: &DelegationClaims) -> Result<(), VerificationError> {
     // 顶层 caller_request_id 存在时必须是合法 UUID（AS-2 caller identity 类型）。
     if let Some(raw) = claims.caller_request_id.as_deref()
@@ -200,6 +211,19 @@ fn validate_operation_binding(claims: &DelegationClaims) -> Result<(), Verificat
             return Err(VerificationError::Unauthenticated(
                 "biz.request_hash must be lowercase 64-hex sha256".into(),
             ));
+        }
+    }
+    if let Some(alg) = biz.request_hash_alg.as_deref() {
+        if biz.request_hash.is_none() {
+            return Err(VerificationError::Unauthenticated(
+                "biz.request_hash_alg without biz.request_hash (pairing required)".into(),
+            ));
+        }
+        if alg != artifact_application::REQUEST_HASH_ALGORITHM_V1 {
+            return Err(VerificationError::Unauthenticated(format!(
+                "unsupported biz.request_hash_alg '{alg}' (this build supports only '{}')",
+                artifact_application::REQUEST_HASH_ALGORITHM_V1
+            )));
         }
     }
     Ok(())
@@ -238,6 +262,7 @@ pub struct AiPmDelegationVerifier {
 
 impl AiPmDelegationVerifier {
     /// `issuers` 必须非空且 issuer 互异（配置解析层已保证；这里防御性再查）。
+    /// 受众不在本层校验：它是 [`DELEGATION_AUDIENCE`] 编译期常量，无配置面。
     pub fn new(issuers: Vec<TrustedIssuer>) -> Result<Self, String> {
         let mut seen = std::collections::HashSet::new();
         for issuer in &issuers {
@@ -246,12 +271,6 @@ impl AiPmDelegationVerifier {
             }
             if !seen.insert(issuer.issuer.clone()) {
                 return Err(format!("duplicate trusted issuer '{}'", issuer.issuer));
-            }
-            if issuer.audience.is_empty() {
-                return Err(format!(
-                    "trusted issuer '{}' must configure a non-empty audience",
-                    issuer.issuer
-                ));
             }
         }
         if issuers.is_empty() {
@@ -315,9 +334,10 @@ impl DelegationVerifier for AiPmDelegationVerifier {
         let decoding_key = DecodingKey::from_jwk(&jwk)
             .map_err(|e| invalid_token("jwk is not usable for RS256 verification", e))?;
 
-        // ④ 验签 + iss/aud/exp/nbf（leeway = 60s）。
+        // ④ 验签 + iss/aud/exp/nbf（leeway = 60s）。受众恒为契约常量
+        // `artifact-service`（WP-03：不可被任何配置覆盖）。
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[trusted.audience.as_str()]);
+        validation.set_audience(&[DELEGATION_AUDIENCE]);
         validation.set_issuer(&[trusted.issuer.as_str()]);
         validation.leeway = CLOCK_SKEW_LEEWAY_SECS as u64;
         validation.validate_exp = true;
@@ -327,11 +347,12 @@ impl DelegationVerifier for AiPmDelegationVerifier {
             .map_err(|e| invalid_token("token signature or standard claims rejected", e))?;
         let claims = token_data.claims;
 
-        // ⑤ 契约级校验（aud 已由验证强制为受信受众；这里复核固定语义）。
-        if claims.aud != trusted.audience {
-            return Err(VerificationError::Unauthenticated(
-                "token audience does not match the trusted issuer configuration".into(),
-            ));
+        // ⑤ 契约级校验（aud 已由验证强制为契约常量受众；这里复核固定语义，
+        // 与库校验双保险；数组型 aud 在 claims 反序列化层即被拒绝）。
+        if claims.aud != DELEGATION_AUDIENCE {
+            return Err(VerificationError::Unauthenticated(format!(
+                "token audience must be exactly '{DELEGATION_AUDIENCE}' (single string)"
+            )));
         }
         if claims.purpose != DELEGATION_PURPOSE {
             return Err(VerificationError::Unauthenticated(format!(
@@ -359,6 +380,17 @@ impl DelegationVerifier for AiPmDelegationVerifier {
                 VerificationError::Unauthenticated(format!("unknown action '{raw}'"))
             })?;
             actions.insert(action);
+        }
+        // PC-O5-1（WP-03 契约红线，O-5 移除的强制前置条件）：授予写动作的
+        // delegation 必须携带顶层 caller_request_id（操作绑定）。缺失即拒绝
+        // （fail-closed）；并发仲裁由业务幂等层（AS-1/AS-2 唯一约束）承接，
+        // 不依赖签发方自律，也不引入 AS 侧持久化绑定状态。
+        if actions.iter().any(|a| a.is_write()) && claims.caller_request_id.is_none() {
+            return Err(VerificationError::Unauthenticated(
+                "delegation grants write actions but carries no caller_request_id \
+                 (operation binding is mandatory for write paths, contract §3.1.1)"
+                    .into(),
+            ));
         }
         // V6：jti 必须为合法 UUID（撤销查询主键；非 UUID 拒绝）。
         let jti_uuid = claims.jti.parse::<Uuid>().map_err(|_| {
@@ -497,6 +529,7 @@ mod tests {
             biz: Some(BizClaim {
                 task_run_id: None,
                 request_hash: hash.map(str::to_string),
+                request_hash_alg: None,
             }),
         };
         // 无指纹扩展：任意 caller_request_id（含缺省）都合法。
@@ -520,6 +553,52 @@ mod tests {
         let mut bad_caller = mk(None, None);
         bad_caller.caller_request_id = Some("not-a-uuid".into());
         assert!(validate_operation_binding(&bad_caller).is_err());
+
+        // ── PC-O6-2：算法版本标识 ──────────────────────────────────────
+        // 已知算法 v1 + hash：合法。
+        let mut ok_alg = mk(Some(Uuid::new_v4()), Some(&"a".repeat(64)));
+        ok_alg.biz.as_mut().unwrap().request_hash_alg =
+            Some(artifact_application::REQUEST_HASH_ALGORITHM_V1.into());
+        assert!(validate_operation_binding(&ok_alg).is_ok());
+        // 未知算法拒绝（fail-closed：新算法必须先扩展验证器）。
+        let mut bad_alg = mk(Some(Uuid::new_v4()), Some(&"a".repeat(64)));
+        bad_alg.biz.as_mut().unwrap().request_hash_alg = Some("v2".into());
+        assert!(validate_operation_binding(&bad_alg).is_err());
+        // alg 无 hash 半配对拒绝。
+        let mut orphan_alg = mk(Some(Uuid::new_v4()), None);
+        orphan_alg.biz.as_mut().unwrap().request_hash_alg =
+            Some(artifact_application::REQUEST_HASH_ALGORITHM_V1.into());
+        assert!(validate_operation_binding(&orphan_alg).is_err());
+    }
+
+    #[test]
+    fn write_actions_require_caller_request_id() {
+        // PC-O5-1 红线的判定矩阵：11 写动作 / 4 读动作分类冻结。
+        for action in [
+            "artifact:create",
+            "artifact:update_metadata",
+            "artifact:archive",
+            "artifact:delete",
+            "version:create",
+            "version:commit",
+            "version:set_current",
+            "reference:write",
+            "reference:remove",
+            "generation:request",
+            "generation:cancel",
+        ] {
+            let action = Action::parse(action).unwrap();
+            assert!(action.is_write(), "{action} must classify as write");
+        }
+        for action in [
+            "artifact:read",
+            "version:read",
+            "generation:read",
+            "output:download",
+        ] {
+            let action = Action::parse(action).unwrap();
+            assert!(!action.is_write(), "{action} must classify as read");
+        }
     }
 
     #[test]

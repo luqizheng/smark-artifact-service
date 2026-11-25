@@ -1,11 +1,12 @@
-# WP-LMMS-DELEGATION-01 — AI-PM → Artifact Service 授权委托契约（R1 修订草案 v0.2）
+# WP-LMMS-DELEGATION-01 — AI-PM → Artifact Service 授权委托契约（R1 修订草案 v0.3）
 
 | | |
 |---|---|
-| 状态 | **草案（DRAFT）/ WAITING FOR INDEPENDENT SECURITY REVIEW**——本文档是**第二轮独立安全评审**的送审对象；评审通过前**不得标记 FINAL**、不得据以实现或对外宣称"已支持"。 |
+| 状态 | **草案（DRAFT）/ WAITING FOR INDEPENDENT SECURITY REVIEW**——评审通过前**不得标记 FINAL**、不得据以对外宣称"已支持"或开放生产写路径。 |
 | 修订 | v0.1 → v0.2（2026-11-25，R1）：按独立安全评审修正 P0-01～P0-05、补齐 P1-01～P1-07、冻结 Q1–Q6 裁决、更新 F-20～F-28。全部修订点附源码证据（见 CURRENT-STATE-AUDIT）。 |
-| 前置 | 现状证据见 [CURRENT-STATE-AUDIT](WP-LMMS-DELEGATION-01-CURRENT-STATE-AUDIT.md)（基线：lmms tag `v1.8.2`@`93fc3a2e`、ai-pm GitHub `master`@`d0e72fa6`、as `main`@`b5095cf`）；安全挑战见 [SECURITY-REVIEW](WP-LMMS-DELEGATION-01-SECURITY-REVIEW.md)；落地步骤见 [IMPLEMENTATION-PLAN](WP-LMMS-DELEGATION-01-IMPLEMENTATION-PLAN.md) |
-| 输入约束 | LMMS 1.8.2 只读不改；不假设其存在未证实接口；AS 不复制 AI-PM 项目角色体系；AS 不查 AI-PM 数据库 |
+| 修订 | v0.2 → v0.3（2026-11-26，WP-LMMS-DELEGATION-03）：落实 R2 裁决——O-5 绑定表**移除**（迁移 0006 与 `PgDelegationBindingStore` 已删除，§5.1"AS 不加表"恢复一致）；O-6 request_hash **修订后保留**（版本化 `biz.request_hash_alg`、v1 规范冻结于 §3.1.3、交叉向量入库，**尚未接线**）；`caller_request_id` 升级为写路径必填红线（PC-O5-1）；`audience` 钉死为常量（配置覆盖即启动失败）；读端点动作映射表（Q3 补全）；`actor_type` 并入 claims 表；V5 补 leeway 语义；§9 证据表以真实测试重建（R2-F-12）。Q1–Q6 冻结裁决原文未改动。 |
+| 前置 | 现状证据见 [CURRENT-STATE-AUDIT](WP-LMMS-DELEGATION-01-CURRENT-STATE-AUDIT.md)（基线：lmms tag `v1.8.2`@`93fc3a2e`、ai-pm GitHub `master`@`d0e72fa6`、as `main`@`b5095cf`）；安全挑战见 [SECURITY-REVIEW](WP-LMMS-DELEGATION-01-SECURITY-REVIEW.md)；落地步骤见 [IMPLEMENTATION-PLAN](WP-LMMS-DELEGATION-01-IMPLEMENTATION-PLAN.md)；R2 评审见 AS 仓库 `docs/security/WP-LMMS-DELEGATION-02/` |
+| 输入约束 | LMMS 1.8.2 只读不改；不假设其存在未证实接口；AS 不复制 AI-PM 项目角色体系；AS 不查 AI-PM 数据库；**AS 不加表（§5.1，O-5 裁决重申）** |
 
 ---
 
@@ -86,17 +87,18 @@ AI-PM 在完成业务意图授权判断后，用**自有的短密钥签名服务
 | `project_id` | uuid | ✅ | 目标项目 | AI-PM DB 验证过的成员关系，非客户端裸传 |
 | `artifact_id` | uuid | 条件必填 | 操作绑定：限定单 Artifact 的委托 | 绑定规则见 §3.1.2；存在时 AS 校验目标一致性 |
 | `operation_id` | string | 条件必填 | 操作绑定：稳定操作标识（如 `generation_job:{uuid}`、`version-commit:{artifact}:{n}`） | 绑定规则见 §3.1.2 |
-| `caller_request_id` | string | 条件必填 | 操作绑定：调用方请求幂等键（AS-2 语义） | 创建 Job 时必填；与 `operation_id` 二选一或并存 |
+| `caller_request_id` | **uuid** | **写路径必填**（v0.3，PC-O5-1 红线） | 操作绑定：调用方请求幂等键（AS-2 语义） | **actions 含任一写动作时必填**（§5.3 写动作清单）；格式 = 合法 UUID（小写连字符形式，AS-2 caller identity 类型）；缺失 → AS 验证层直接拒绝（401，fail-closed，不依赖签发方自律）；纯读动作 token 不要求；与 `operation_id` 二选一或并存 |
 | `actions` | string[] | ✅ | 允许的 AS 动作，⊆ AS `Action` 集（15 个精确动作，`action.rs:6-22`） | 由 §3.3 意图映射决定，**禁止发通配、禁止客户端提交**；非空、无重复 |
 | `iat` / `exp` | int | ✅ | 签发/过期 | **TTL 建议 120 秒，硬上限 300 秒**（Q1 裁决）：`exp - iat ≤ 300` |
 | `nbf` | int | 可选 | 生效时间 | 存在时 AS 必须校验 |
 | `jti` | **uuid** | ✅ | 委托唯一标识（格式必须为 UUID） | 撤销查询主键；AS 审计记录 |
 | `delegation_id` | uuid | ✅ | 委托记录 ID（与 AS `Delegation.delegation_id` 对齐） | AI-PM 侧签发记录外键 |
 | `act` | object | 可选 | `{"sub":"ai-pm-service"}` 委托链（谁代表谁） | 区分服务代理与用户直发 |
-| `biz` | object | 可选 | 来源业务标识：`{"task_run_id":...}` | 与 AS-2 durable caller identity 串联；不承担授权语义 |
+| `actor_type` | string | 可选 | 主体类别声明（v0.3 并入，R2-F-12 关联项）：`user` \| `agent` \| `service` | 缺省 = `user`；白名单外值 AS 拒绝；**不改变授权归属**——动作与 scope 仍归 `sub` 所指主体 |
+| `biz` | object | 可选 | 来源业务标识与请求指纹：`{"task_run_id":..., "request_hash":"<64hex>", "request_hash_alg":"v1"}` | `task_run_id` 与 AS-2 durable caller identity 串联（不承担授权语义）；`request_hash` 为规范化请求指纹（v1 规范见 §3.1.3，O-6 修订后保留），**必须与顶层 `caller_request_id` 配对出现**（`request_hash_alg` 与 `request_hash` 同空同非空；未知算法 AS fail-closed 拒绝） |
 | `purpose` | string | ✅ | `delegation`（固定） | 与 LMMS purpose 命名空间区分，AS 验证其值 |
 
-示例 payload（注意 `tenant_id` 为 UUID；`lmms_tid` 仅追溯）：
+示例 payload（注意 `tenant_id` 为 UUID；`lmms_tid` 仅追溯；写动作 token 必带 `caller_request_id`；`biz.request_hash` 与 `request_hash_alg` 配对）：
 
 ```json
 {
@@ -106,7 +108,7 @@ AI-PM 在完成业务意图授权判断后，用**自有的短密钥签名服务
   "caller_request_id": "0b2e...",
   "actions": ["generation:request"],
   "iat": 1764030000, "exp": 1764030120, "jti": "9a77...", "delegation_id": "d-31...",
-  "biz": {"task_run_id": "run-..."},
+  "biz": {"task_run_id": "run-...", "request_hash": "<64位小写hex>", "request_hash_alg": "v1"},
   "purpose": "delegation"
 }
 ```
@@ -136,7 +138,45 @@ AI-PM 在完成业务意图授权判断后，用**自有的短密钥签名服务
 | ④ Job 取消后继续使用原 Token | 该 job 的写入被状态机阻断；token 对**其他**操作的残余能力按 §5.3 撤销策略收敛（取消成功时 AI-PM 撤销本次 delegation 的 jti） |
 | ⑤ Worker 重试与新的业务操作 | Worker 不持有 delegation token（§3.3 红线 4）；新业务操作必须重新经 AI-PM 意图授权签发新 token |
 
-**`caller_request_id` 的边界声明**：AS-2 的 caller 三元组幂等**仅覆盖 Job 创建路径**，不是所有 Artifact API 的通用重放防护；其余写路径的防重放 = 操作绑定 + 各自幂等机制 + TTL/撤销窗口。文档与实现不得宣称"caller_request_id 已提供全局防重放"。
+**`caller_request_id` 的边界声明**（v0.3 扩充，PC-O5-1 落地文本）：
+
+1. **红线**：授予任一写动作（§5.3 清单的 11 个动作）的 delegation **必须**携带顶层 `caller_request_id`（合法 UUID）；缺失由 AS 验证层拒绝（401 fail-closed）——本红线是 O-5"移除绑定表"裁决的强制前置条件，签发侧（AI-PM）不得签发违反红线的 token。
+2. **格式约束**：合法 UUID（AS-2 caller identity 类型）；非 UUID 在 claims 形状校验即拒绝。
+3. **缺失时拒绝**：写动作 + 无 caller_request_id → 401（验证层，先于任何授权/写入判定）；纯读 token 不要求。
+4. **重复请求的处理**：同 `caller_request_id` + 同指纹 → 合法网络重试，走端点幂等语义（Job 创建 = `caller_request_replay` 零写入返回原 job；AS-1 创建路径 = 幂等重放返回原对象）。
+5. **并发仲裁**：并发同键请求由 **DB 唯一约束原子仲裁**（migration 0005 `(tenant_id, project_id, caller_request_id)` 部分唯一索引 + `create_generation_job_with_input` v2）——恰一个请求 Fresh 创建，其余收敛为幂等重放或 409 `CALLER_REQUEST_ID_REUSED`；O-5 移除绑定表后，该仲裁职责**完全由既有业务幂等机制承担**（AS-1 `artifact_key`/Idempotency 单事务、AS-2 caller 部分唯一索引，等价强度）。
+6. **与普通幂等键的关系**：`caller_request_id`（claim，签发方驱动）与 `Idempotency-Key`（HTTP 头，调用方驱动）是**两条独立的幂等轴**，不互相替代、不共享存储；AS-2 caller 三元组幂等仅覆盖 Job 创建路径，artifact 创建的幂等由 AS-1 承担。文档与实现不得宣称"caller_request_id 已提供全局防重放"。
+7. **隔离性**：caller 幂等身份是 (tenant_id, project_id, caller_request_id[, 指纹]) 三元组——不同租户、不同项目、不同调用主体之间**不存在任何跨身份共享幂等结果**的路径（migration 0005 约束谓词强制；as2 回归测试覆盖并发/跨身份拒绝）。
+8. `caller_request_id` 是**幂等与绑定键，不是授权凭证**：它不参与身份认证，也不能扩大 actions/scope；身份认证仅由签名 + §3.2 验证矩阵决定。
+
+### 3.1.3 request_hash 规范（v1，O-6 修订后保留；本节随 WP-03 并入）
+
+**状态声明**：`biz.request_hash` 已并入本契约（§3.1.1），AS 侧完成解析、形状/配对/算法校验与测试向量；但**目标一致性校验（重算比对）属 V10/AS-4 接线**，在接线完成前 request_hash 不得被宣称为任何已生效的防线，其校验仅作为形状拒绝（fail-closed）存在。
+
+**算法标识**：claim `biz.request_hash_alg`，当前唯一合法值 `"v1"`；缺省视为 v1；显式给出未知值 → AS 拒绝（fail-closed，新算法上线必须先扩展 AS 验证器并修订本节）。
+
+**v1 规范（冻结，禁止原地演进）**：
+
+```text
+request_hash(v1) = lower_hex(sha256(
+    METHOD_UPPER || "\n" || PATH || "\n" || CALLER || "\n" || CANONICAL_JSON(body)
+))
+```
+
+| 成分 | 规则 |
+|---|---|
+| METHOD_UPPER | HTTP method 的 ASCII 大写形式；method 参与指纹（跨 method 混淆不可能） |
+| PATH | 请求目标路径（含 `/v1` 前缀），**实例化形态**（路径参数以实际值代入，UUID 用小写连字符形式）；UTF-8 字节原样参与；不做百分号解码/重编码、不归一化大小写；**不含 query 与 fragment**；同一路径的两种编码形态按字节比对即不同（fail-closed） |
+| CALLER | 顶层 `caller_request_id` 的小写连字符 UUID 字符串；无则空串 |
+| CANONICAL_JSON | `serde_json::Value` 紧凑序列化：对象键按 UTF-8 字节序排序（BTreeMap）；无空白；整数按十进制、浮点按 ryu 最短往返（**签发方必须拒签含浮点的 body**）；字符串 UTF-8 原样、**不做 Unicode NFC/NFD 规范化**；`null`/缺失键/空串是三个不同值；body 为空取字面量 `null` |
+
+**其余冻结规则**：
+
+1. **query 不参与 v1 指纹，且 v1 全部写端点不得携带 query**；未来引入带 query 的写端点必须先将规范升版 v2 并修订本节——这是契约红线，不是实现建议。
+2. **重复键**：签发方必须拒签原始 JSON 含重复对象键的请求（AS 解析后 last-wins，无法检测，属签发侧义务）。
+3. **配对**：`request_hash` 必须与顶层 `caller_request_id` 同时出现（半配对在 AS 形状校验即拒绝）。
+4. **签发-执行一致性**：请求由 AI-PM 构造后签发（同源）；代理层任何 body 重序列化差异会触发 AS 拒绝（fail-closed 方向，属可用性代价而非安全缺口）。
+5. **跨实现一致性（PC-O6-3）**：AI-PM 签发侧必须实现同一算法，并以 AS 仓库 `crates/artifact-application/src/service/delegation_request.rs` 测试中的**冻结向量**（v1 最小 body / null body / Unicode / 数值语义 / method 混淆五组常量）为交叉基准，同输入必须得到同 64 位小写十六进制。
 
 ### 3.2 AS 验证矩阵（实现 `DelegationVerifier` 时必须全部执行，任一失败 → 401/403）
 
@@ -148,7 +188,7 @@ AI-PM 在完成业务意图授权判断后，用**自有的短密钥签名服务
 | V2 | kid | header `kid` **必须存在**（缺失即拒绝，**不得回退 default key**——`digua_common_jwt` 现行为有回退，验证器必须覆盖）；`kid` 不在 JWKS → 拒绝；**未知 kid 触发一次强制刷新后复检，仍未知 → 拒绝**（§4.1） |
 | V3 | issuer | `iss == "ai-pm"` 精确匹配（受信清单恰一项，Q6） |
 | V4 | audience | `aud == "artifact-service"` 精确单值字符串匹配（数组/缺失/异值/类型错误拒绝） |
-| V5 | 时间 | `exp > now`；`exp - iat ≤ 300s`；`iat ≤ now + 60s`（时钟偏差上限 **±60 秒**，超界拒绝——签发侧 iat 显著晚于当前时间的 token 拒绝）；`nbf` 存在时必须校验（`nbf > now + 60s` 拒绝） |
+| V5 | 时间 | `exp > now`；`exp - iat ≤ 300s`；`iat ≤ now + 60s`（时钟偏差上限 **±60 秒**，超界拒绝——签发侧 iat 显著晚于当前时间的 token 拒绝）；`nbf` 存在时必须校验（`nbf > now + 60s` 拒绝）。**leeway 语义（v0.3 补记）**：jsonwebtoken 的 exp/nbf 判定含 60s leeway（`now < exp + 60` 放行），叠加 TTL ≤ 300s，单 token 最长实际接受窗 ≈ iat+360s——属知情设计，不得误读为"TTL=300 严格截断" |
 | V6 | jti | 存在且为合法 UUID 格式（非 UUID 拒绝） |
 | V7 | purpose | `purpose == "delegation"` |
 | V8 | actions | 非空、无重复、逐项 ∈ AS `Action` 枚举 15 值（`action.rs:46-65`）；含 `*`/通配样式/未知值/空串拒绝；类型非字符串数组拒绝 |
@@ -156,6 +196,18 @@ AI-PM 在完成业务意图授权判断后，用**自有的短密钥签名服务
 | V10 | 操作绑定 | §3.1.2：`artifact_id`/`operation_id`/`caller_request_id` 存在时与请求目标一致性校验 |
 | V11 | 撤销（写路径） | §5.3：写动作执行前在线查询 jti 撤销状态；查询不可用 → **fail-closed** |
 | V12 | 审计 | 每次验证结果（含拒绝）入 `audit_event`：`jti/delegation_id/subject/actions/判定原因`（不记 token 本体） |
+
+**读端点动作映射表（v0.3，Q3 补全——WP-03 修复 R2-F-03 后冻结）**：所有受保护 API（含 GET）均要求 delegation；每个读端点映射一个精确动作（无通配）：
+
+| 端点（GET） | 必需动作 | 说明 |
+|---|---|---|
+| `/v1/artifacts`、`/v1/artifacts/{id}` | `artifact:read` | 既有 |
+| `/v1/artifacts/{id}/versions`、`.../versions/{vid}` | `version:read` | WP-03 补（原绕过动作检查） |
+| `/v1/artifacts/{id}/references` | `artifact:read` | WP-03 补；Q4 冻结 15 动作无 `reference:read`，引用属 Artifact 内容元数据，映射 `artifact:read`（精确动作） |
+| `/v1/generation-jobs/{id}`、`/v1/generation-jobs/by-caller-request/{id}` | `generation:read` | 既有 |
+| `/v1/generators` | `generation:read` | WP-03 补（原完全无认证）；注册表全局共享，无需 X-Project-Id |
+
+豁免清单（无需 delegation）：仅 `GET /v1/health`、`GET /v1/ready`（进程存活/就绪探针）。除此之外不存在任何公开业务端点；若未来某端点需公开访问，必须先修订本表并附安全论证。
 
 错误码沿用现有：`UNAUTHENTICATED`(401，`artifact-contract/src/error.rs:43,70`)、`SCOPE_DENIED`(403，:71)、撤销服务不可用新增 `REVOCATION_UNAVAILABLE`(503，fail-closed 语义，见 §5.3)、AS-2 幂等族（409/5xx）。
 
@@ -320,34 +372,39 @@ sequenceDiagram
 | O-2 | 撤销查询端点的认证形态（复用 service-jwt 模式 or 内部 mTLS——LMMS 无 mTLS，V1 用 service-jwt） | 阶段 1 细化 |
 | O-3 | `act` 委托链字段是否 V1 启用 | 建议 V1 恒为服务代理形态，可先固定不签；复审确认 |
 | O-4 | 意图接口的 REST 形态与错误码表 | 阶段 1 设计产出 |
-| O-5 | **AS 侧 jti 消费绑定表（`artifact.delegation_token_use`，本 PR 迁移 0006）**：本实现为"同一 jti 不同请求 → 硬拒 / 并发重放 → DB 原子仲裁"提供了超出 §3.1.2 分层的纵深防御层（含 purge 护栏）。与"AS 不加表"（§5.1）的冻结裁决冲突，**提请第二轮评审裁决**：保留（修订契约，作为声明绑定的服务端兜底 + 复用取证）或移除（AS-4 接线前可无损删除，声明层绑定 + 各端点幂等 + 在线撤销已覆盖同等威胁）。**默认未接线**：无任何路由消费该表 | 本 PR 附带，待裁决 |
-| O-6 | 请求指纹扩展 claim `biz.request_hash`（canonical fingerprint 规范冻结于 `canonical_request_fingerprint`）：为意图接口落地前提供内容级绑定；若采纳需并入 §3.1.1 claims 表并由 AI-PM 签发侧实现 | 本 PR 附带（AS 侧解析 + 校验 + 测试），待裁决 |
+| O-5 | AS 侧 jti 消费绑定表（迁移 0006 + `PgDelegationBindingStore`）。**R2 裁决：B（移除）**——遵守 §5.1"AS 不加表"冻结裁决；实现引用的"契约 §3.4"不存在（R2-F-04），且 AS-1/AS-2 既有幂等机制已具备等价的 DB 唯一约束并发仲裁能力。**WP-03 已执行**：迁移 0006、绑定端口/实现、`DELEGATION_TOKEN_REUSED` 错误码及专属测试全部删除；强制前置条件 PC-O5-1（写路径必带 `caller_request_id` 红线）已落地（§3.1.2 + 验证器强制 + 负面测试）。再评估通道保留：若 AS-4 联调证明仍需 DB 兜底，按契约修订流程重新提案 | **已裁决并执行（WP-03）** |
+| O-6 | 请求指纹扩展 claim `biz.request_hash`（v1 规范见 §3.1.3）。**R2 裁决：修订后保留（CONDITIONAL KEEP）**——修订条件 PC-O6-1（并入 §3.1.1 ✓）/ PC-O6-2（版本化 + 规范冻结 ✓）/ PC-O6-3（AI-PM 侧同算法 + 交叉向量，**待 AI-PM 实现**）/ PC-O6-4（AS-4 接线 `assert_delegation_matches_request` 进入全部写路径，**未接线**）。接线完成前 request_hash 不得作为任何唯一防线（当前 AS 仅做形状/配对/算法校验，状态一致） | **已裁决；PC-O6-1/2 已执行，PC-O6-3/4 未完成（阻断项）** |
 
 ---
 
-## 9. 实现与测试证据映射（本次提交，待独立评审）
+## 9. 实现与测试证据映射（v0.3，WP-03 重建——仅列真实存在、实际运行、覆盖对应断言的测试）
 
-> 本节为**实现附注**（随代码提交）：验证器与 JWKS 缓存已按 §3.1.1/§3.2/§4.2 实现；
-> 全部条目可在 PR diff 与 CI 测试运行中独立复核。**实现 ≠ 已通过安全评审**；
-> AS-4 接线（§5.3 写路径撤销检查、V10 目标一致性、意图接口）仍为后续任务。
+> 本节为**实现附注**（随代码提交）。v0.2 版证据表中 V6/V7/V8 三行声明了
+> 不存在的测试（R2-F-12），以及依赖 O-5 绑定表的场景行——本版全部以实际
+> 测试名重建；未覆盖项显式标记"测试证据缺失"。**实现 ≠ 已通过安全评审**；
+> AS-4 接线（V10 目标一致性、V11 撤销闭环、意图接口）仍为后续任务。
 
-| 契约条目 | 实现 | 测试证据 |
+| 契约条目 | 实现 | 测试证据（测试二进制 :: 测试名） |
 |---|---|---|
-| V1 算法固定 RS256 | `AiPmDelegationVerifier::verify` header.alg 检查 | s02 签名拒绝族；`ai_pm` 单测 |
-| V2 kid 存在/未知 kid 单次限频刷新/缺失 kid 拒绝 | header.kid 必填；`JwksCache::lookup` 60s 限频 | s05（含出站次数断言）、s05b（轮换双活） |
-| V3 issuer 精确匹配（Q6 单 issuer） | 受信清单匹配；配置层强制恰一项 | s03；`config` 单测 `multiple_active_issuers_are_rejected` |
-| V4 audience 精确单值 | `set_audience` + 固定字符串反序列化（数组型即拒） | s04 |
-| V5 时间规则（±60s、TTL≤300、exp>iat、nbf） | `validate_time_claims` + Validation leeway=60 | s07/s08/s09；`ai_pm` 单测（边界 300/301） |
-| V6 jti 必须 UUID | `claims.jti.parse::<Uuid>()` | `ai_pm` 单测 + s 族 |
-| V7 purpose == delegation | 固定值精确比较 | 拒绝矩阵 |
-| V8 actions 非空/无重复/∈15 动作 | 逐项 parse + 重复检测 | s12；`ai_pm` 单测 |
-| V9 scope 装配（P0-01 tenant UUID） | claims→`TenantScope`；header 仅定位 | s10 跨租户 404、s11 claim/头不一致 403、s18 缺头 400 |
-| V10 操作绑定字段携带 | `artifact_id`/`operation_id`/`caller_request_id` 解析（UUID 强校验）；目标一致性属 AS-4 接线 | s16（指纹扩展层）；V10 服务层用例待接线 |
-| V11 写路径在线撤销（Q1） | `DelegationRevocationChecker` 端口 + `FailClosedRevocationChecker`（端点未上线前写路径 fail-closed 503 `REVOCATION_UNAVAILABLE`） | 端口单测；客户端实现属任务 1.7 |
-| V12 审计 | 复用 `audit_and_enrich_layer`（401/403 拒绝入 `audit_event`，无 token 本体） | 错误消息无 token 断言（rejects_with） |
-| §4.2 JWKS 缓存策略（Q5） | 5min 软刷新 / 15min 最大陈旧 / 60s 刷新限频 / 重启空缓存 fail-closed | `jwks` 单测 + 常量契约测试；s06 断供 503 `DELEGATION_VERIFIER_UNAVAILABLE` |
-| §3.1.2 场景①③⑤（合法重试/重复提交/worker 无 token） | 绑定表存储（O-5）+ 既有 AS-1/AS-2 幂等 | s13/s14/s15/s19/s20；AS-2 既有回归 |
-| §3.1.2 场景④（取消后残余） | TTL 收敛 + jti 改绑硬拒 | s17 |
-| 配置缺省全拒 | 空 issuer 清单 → `ClosedDelegationVerifier` | s21；`default_verifier_is_fail_closed` 回归 |
+| V1 算法固定 RS256 | `AiPmDelegationVerifier::verify` header.alg 检查 | delegation_security :: s02；`ai_pm` 单测（库内） |
+| V2 kid 存在/未知 kid 单次限频刷新/缺失 kid 拒绝 | header.kid 必填；`JwksCache::lookup` 60s 限频 | delegation_security :: s05（含出站次数断言）、s05b（轮换双活） |
+| V3 issuer 精确匹配（Q6 单 issuer） | 受信清单匹配；配置层强制恰一项 | delegation_security :: s03；api 库 :: `config::multiple_active_issuers_are_rejected_single_issuer_q6`、`config::duplicate_issuers_are_rejected` |
+| V4 audience 精确单值 + **常量钉死（WP-03）** | `set_audience(&[DELEGATION_AUDIENCE])` 常量 + claims 复核；`TrustedIssuer` 无 audience 字段；配置层恒等校验 | delegation_security :: s04（异值）、`v4_array_audience_even_containing_expected_is_rejected`（数组）；api 库 :: `non_contract_audience_config_fails_startup`、`empty_audience_config_fails_startup`、`audience_cannot_be_bypassed_via_case_or_whitespace`、`explicit_contract_audience_is_accepted` |
+| V5 时间规则（±60s leeway、TTL≤300、exp>iat、nbf） | `validate_time_claims` + Validation leeway=60（leeway 语义见 §3.2 V5） | delegation_security :: s07/s08/s09；`ai_pm` :: `time_rules_reject_bad_windows`（300 过/301 拒边界） |
+| V6 jti 必须 UUID | `claims.jti.parse::<Uuid>()` | delegation_security :: `v6_jti_must_be_uuid`（v0.2 声明的证据不存在，WP-03 补） |
+| V7 purpose == delegation | 固定值精确比较；缺失 = 必填字段反序列化拒绝 | delegation_security :: `v7_purpose_must_be_delegation`（user_login 混淆 + 缺失，WP-03 补） |
+| V8 actions 非空/无重复/∈15 动作 | 逐项 parse + 重复检测 | delegation_security :: `v8_actions_shape_rejections`（通配/未知/重复/空四类，WP-03 补）；**注意 s12 是 V9 层证据，不是 V8** |
+| V9 scope 装配（P0-01 tenant UUID） | claims→`TenantScope`；header 仅定位 | delegation_security :: s10（跨租户 404）、s11（claim/头不一致 403）、s18（缺头 400） |
+| V10 操作绑定字段携带（**未接线**） | `artifact_id`/`operation_id`/`caller_request_id`/`request_hash` 解析与形状校验；`assert_delegation_matches_request` 存在但**零生产调用点**（目标一致性属 AS-4 接线） | delegation_security :: s16（声明层指纹比对）；V10 服务层用例**待接线（阻断项）** |
+| V11 写路径在线撤销（Q1）（**未接线**） | `DelegationRevocationChecker` 端口 + `FailClosedRevocationChecker`；运行路径不存在 | application 库 :: `port::revocation` 端口单测；撤销后写 403 / 四类不可达 503 **测试证据缺失（阻断项）** |
+| V12 审计 | `audit_and_enrich_layer`（401/403 拒绝入 `audit_event`，无 token 本体） | 错误消息无 token 断言（rejects_with 全族）；**审计事件缺 jti/subject/原因——R2-F-09 保持开放，测试证据缺失** |
+| §4.2 JWKS 缓存策略（Q5） | 5min 软刷新 / 15min 最大陈旧 / 60s 刷新限频 / 重启空缓存 fail-closed | `jwks` :: `stale_policy_constants_match_contract`、`redirect_response_is_treated_as_failure`、`unreachable_jwks_is_unavailable`；delegation_security :: s06（断供 503 `DELEGATION_VERIFIER_UNAVAILABLE`）、s06b |
+| §3.1.2 场景①③⑤（合法重试/重复提交/worker 无 token） | O-5 绑定表已移除；并发仲裁由 AS-1（artifact_key/Idempotency 单事务）与 AS-2（caller 三元组部分唯一索引）承接 | as1_creation_identity :: 全族（键控创建幂等/竞态）；as2_caller_identity :: 全族（含 as2_17 并发同 caller 竞态恰一创建、同键异指纹 409）；worker 面无 HTTP（红线 5 由架构保证） |
+| §3.1.2 场景④（取消后残余） | TTL 收敛（Q1 读路径知情接受）+ Job 状态机守卫（取消后无新写入） | worker_coordination :: 取消终态族；**s17 已随绑定表移除**——jti 改绑硬拒由 V10 接线后的撤销闭环承接（阻断项） |
+| §3.1.1 caller_request_id 红线（WP-03 PC-O5-1） | 验证器强制"写动作 token 必带 caller_request_id"；缺失 401 fail-closed | `ai_pm` :: `write_actions_require_caller_request_id`（写/读动作分类矩阵）；delegation_security :: `write_action_token_without_caller_request_id_is_rejected`（纯写+混合写）、`write_without_binding_is_rejected_over_http`（HTTP 层 401） |
+| §3.1.3 request_hash v1（WP-03 PC-O6-2） | `canonical_request_fingerprint`（唯一权威实现）+ `biz.request_hash_alg` 校验（未知算法拒绝） | application 库 :: `v1_frozen_vector_minimal_body`、`v1_key_order_and_method_case_are_canonicalized`、`v1_frozen_vector_null_body_and_missing_caller`、`v1_frozen_vector_unicode_is_byte_exact`、`v1_number_null_and_string_semantics_are_distinct`、`v1_method_and_path_changes_alter_fingerprint`、`fingerprint_is_deterministic_and_field_order_free`、`different_body_or_caller_changes_fingerprint`；`ai_pm` :: `biz_pairing_rules`（配对/alg/格式拒绝矩阵） |
+| 读端点动作授权（Q3，WP-03 R2-F-03 修复） | 三个读 handler 下沉服务层 + `require`；`/v1/generators` 挂 `Authed`+`generation:read`；SDK 同步 | delegation_security :: `version_reads_require_version_read_action`（错误动作 403/合法 200/无 token 401/跨项目 403）、`reference_list_requires_artifact_read_action`（403/200/401）；api_meta :: `generators_require_delegation_and_action`（401/403）+ `generators_report_unavailable_adapters`（200 合法路径）；delegation_security :: s21（closed verifier 下 generators 401） |
+| 配置缺省全拒 | 空 issuer 清单 → `ClosedDelegationVerifier` | delegation_security :: s21；api 库 :: `state::default_verifier_is_fail_closed`、`config::empty_issuer_list_is_accepted_and_means_fail_closed` |
+| 契约引用一致性（WP-03 R2-F-04） | 全仓"§3.4"幻影引用清除（迁移 0006 删除、错误码注释修正、文档修订） | migration_guard :: `released_migrations_are_unchanged`（migrations.sha256 与目录互检）；仓库 grep 无残留 |
 
-测试运行：`cargo test --workspace`（226 通过；本机 Docker PG 高并发下 `sqlx::test` 建库可能 `PoolTimedOut`，属环境饱和——`--test-threads=8` 或 CI Linux 均稳定）。
+测试运行：`cargo test --workspace`（WP-03 分支全量 **241 通过 / 0 失败**，含 59 库单元测试；本机 Docker PG 高并发下 `sqlx::test` 建库可能 `PoolTimedOut`，属环境饱和——`--test-threads=8` 或 CI Linux 均稳定）。**独立 PoC（`docs/security/WP-LMMS-DELEGATION-02/poc/r2-verifier-poc`）是评审验证工具，不是仓库自动化回归测试**——其场景 P1–P7 已按上表移植进 `delegation_security` 套件；PoC 目录独立 workspace，不进主构建。

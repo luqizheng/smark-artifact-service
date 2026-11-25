@@ -11,7 +11,9 @@ pub struct DelegationIssuerConfig {
     /// 固定 JWKS URL。https 强制；仅 127.0.0.1/localhost/[::1] 的 http 回环
     /// 豁免（本机 dev/compose 联调）。不存在任何其他明文传输豁免。
     pub jwks_url: String,
-    /// 期望 `aud`；缺省 = `artifact-service`（契约固定受众）。
+    /// 兼容保留字段：必须**精确等于**契约固定受众 `artifact-service`
+    /// （缺省即该值）。任何其他值（含空白、大小写变体）一律启动失败
+    /// （WP-03 裁决：受众是契约常量，不是可配置信任根——R2-F-06 修复）。
     #[serde(default = "default_delegation_audience")]
     pub audience: String,
 }
@@ -21,10 +23,11 @@ fn default_delegation_audience() -> String {
 }
 
 impl DelegationIssuerConfig {
-    /// 校验信任根配置（P0-03 + Q6 裁决）：清单为空 = 维持全拒（合法姿态）；
-    /// 非空时**恰一项 active issuer**（契约 Q6：V1 单 issuer；LMMS 未来上线
-    /// 候选 A 时按清单机制平滑过渡，届时需复审）；issuer/jwks_url/audience
-    /// 非空、jwks_url 为 https（或本机回环 http）。
+    /// 校验信任根配置（P0-03 + Q6 裁决 + WP-03 audience 固定）：清单为空 =
+    /// 维持全拒（合法姿态）；非空时**恰一项 active issuer**（契约 Q6：V1 单
+    /// issuer；LMMS 未来上线候选 A 时按清单机制平滑过渡，届时需复审）；
+    /// issuer/jwks_url 非空、jwks_url 为 https（或本机回环 http）、audience
+    /// 精确等于契约常量（不做 trim/大小写归一——绕过即失败）。
     pub fn validate_all(list: &[DelegationIssuerConfig]) -> anyhow::Result<()> {
         if !list.is_empty() && list.len() != 1 {
             anyhow::bail!(
@@ -40,10 +43,14 @@ impl DelegationIssuerConfig {
             if !seen.insert(issuer.issuer.clone()) {
                 anyhow::bail!("duplicate delegation issuer '{}'", issuer.issuer);
             }
-            if issuer.audience.trim().is_empty() {
+            if issuer.audience != artifact_infrastructure::delegation::ai_pm::DELEGATION_AUDIENCE {
                 anyhow::bail!(
-                    "delegation issuer '{}' audience must not be empty",
-                    issuer.issuer
+                    "delegation issuer '{}' audience must be exactly '{}' \
+                     (the contract audience is a fixed constant and must not be \
+                     overridden); got {:?}",
+                    issuer.issuer,
+                    artifact_infrastructure::delegation::ai_pm::DELEGATION_AUDIENCE,
+                    issuer.audience
                 );
             }
             validate_jwks_url(&issuer.jwks_url)?;
@@ -184,5 +191,62 @@ mod tests {
         )
         .unwrap();
         assert!(DelegationIssuerConfig::validate_all(&issuers).is_err());
+    }
+
+    // ── WP-03（R2-F-06 修复）：契约受众是常量，配置不可覆盖 ────────────────
+
+    #[test]
+    fn non_contract_audience_config_fails_startup() {
+        // PoC P8（R2-F-06）的配置形态：audience=coder-micro-services 必须启动失败。
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://a/jwks","audience":"coder-micro-services"}]"#,
+        )
+        .unwrap();
+        let err = DelegationIssuerConfig::validate_all(&issuers).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be exactly 'artifact-service'")
+        );
+    }
+
+    #[test]
+    fn empty_audience_config_fails_startup() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://a/jwks","audience":""}]"#,
+        )
+        .unwrap();
+        assert!(DelegationIssuerConfig::validate_all(&issuers).is_err());
+    }
+
+    #[test]
+    fn audience_cannot_be_bypassed_via_case_or_whitespace() {
+        // 大小写 / 空白变体一律拒绝：不做归一化，精确相等是唯一通过路径。
+        for bad in [
+            "Artifact-Service",
+            "artifact-service ",
+            " artifact-service",
+            "ARTIFACT-SERVICE",
+        ] {
+            let raw =
+                format!(r#"[{{"issuer":"ai-pm","jwks_url":"https://a/jwks","audience":"{bad}"}}]"#);
+            let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(&raw).unwrap();
+            assert!(
+                DelegationIssuerConfig::validate_all(&issuers).is_err(),
+                "audience {bad:?} must not pass validation"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_contract_audience_is_accepted() {
+        let issuers: Vec<DelegationIssuerConfig> = serde_json::from_str(
+            r#"[{"issuer":"ai-pm","jwks_url":"https://a/jwks","audience":"artifact-service"}]"#,
+        )
+        .unwrap();
+        DelegationIssuerConfig::validate_all(&issuers).unwrap();
+        assert_eq!(
+            issuers[0].audience,
+            artifact_infrastructure::delegation::ai_pm::DELEGATION_AUDIENCE
+        );
     }
 }

@@ -8,9 +8,6 @@ pub mod service;
 
 pub use port::audit::AuditSink;
 pub use port::auth::{DelegationVerifier, VerificationError};
-pub use port::delegation_binding::{
-    DelegationBindingOutcome, DelegationBindingStore, DelegationTokenUse,
-};
 pub use port::idempotency::{IdempotencyOutcome, IdempotencyStore};
 pub use port::keyed_create::{
     IdempotencyInput, KeyedArtifactCreateError, KeyedArtifactCreateOutcome,
@@ -42,7 +39,7 @@ pub use service::creation_fingerprint::{
     normalize_optional_text, normalize_text,
 };
 pub use service::delegation_request::{
-    assert_delegation_matches_request, canonical_request_fingerprint,
+    REQUEST_HASH_ALGORITHM_V1, assert_delegation_matches_request, canonical_request_fingerprint,
 };
 pub use service::generation_fingerprint::{
     CURRENT_JOB_FINGERPRINT_VERSION, GENERATION_JOB_CREATE_DOMAIN, JobFingerprintError,

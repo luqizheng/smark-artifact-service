@@ -63,6 +63,25 @@ impl Action {
             _ => return None,
         })
     }
+
+    /// 是否写动作（契约 §5.3 Q1 撤销检查清单的 11 个动作；WP-03 PC-O5-1
+    /// 以同一集合强制"写路径 delegation 必带 caller_request_id"红线）。
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            Action::ArtifactCreate
+                | Action::ArtifactUpdateMetadata
+                | Action::ArtifactArchive
+                | Action::ArtifactDelete
+                | Action::VersionCreate
+                | Action::VersionCommit
+                | Action::VersionSetCurrent
+                | Action::ReferenceWrite
+                | Action::ReferenceRemove
+                | Action::GenerationRequest
+                | Action::GenerationCancel
+        )
+    }
 }
 
 impl fmt::Display for Action {
@@ -79,7 +98,8 @@ impl fmt::Display for Action {
 /// `lmms_tid` 仅作来源追溯审计镜像，**不参与任何授权判定**。
 /// 操作绑定字段（§3.1.2/V10）：`artifact_id`/`operation_id`/`caller_request_id`
 /// 存在时，AS-4 接线的服务层必须校验请求目标一致性；`request_hash` 为本实现
-/// 提供的请求指纹扩展（超出契约，见契约遗留开放点 O-5 / PR 说明）。
+/// 提供的请求指纹扩展（WP-03 修订后并入契约 §3.1.1，算法 v1，见
+/// `artifact_application::canonical_request_fingerprint`）。
 /// 签名/JWKS 验证由 `DelegationVerifier`（application ports）实现方负责。
 #[derive(Debug, Clone)]
 pub struct Delegation {

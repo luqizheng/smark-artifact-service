@@ -1,16 +1,24 @@
-//! WP-LMMS-DELEGATION-01 安全测试矩阵（契约 v0.2 §3；SECURITY-REVIEW §12）。
+//! WP-LMMS-DELEGATION-01/03 安全测试矩阵（契约 v0.2 §3 + WP-03 修订）。
 //!
-//! 覆盖任务书 18 场景（以负面为主）+ 绑定存储并发/持久化 + DB 层不变量：
+//! 覆盖任务书 18 场景（以负面为主）+ WP-03 新增负面矩阵：
 //!   1  正常 Token（E2E 创建/读取）
 //!   2  错误签名                10 跨租户访问
 //!   3  错误 issuer             11 跨项目访问（claim vs 头不一致）
 //!   4  错误 audience           12 Action 越权
-//!   5  未知 kid（含限频刷新）  13 同一 jti 不同请求
-//!   6  JWKS 不可用 → 503       14 同一请求并发重放
-//!   7  Token 过期              15 同一请求合法重试
-//!   8  未来 iat                16 请求指纹篡改
-//!   9  超长 TTL                17 撤销语义（TTL 残余窗口）
-//!                              18 缺失 X-Project-Id
+//!   5  未知 kid（含限频刷新）  16 请求指纹篡改
+//!   6  JWKS 不可用 → 503       18 缺失 X-Project-Id
+//!   7  Token 过期
+//!   8  未来 iat                WP-03（R2 评审缺口修复）：
+//!   9  超长 TTL                * V4 数组 aud / V6 jti 非 UUID / V7 purpose /
+//!                                 V8 actions 形状（原 PoC P1–P7 移植，R2-F-12）
+//!                              * PC-O5-1：写动作 token 缺 caller_request_id 拒绝
+//!                              * 三个读 handler 动作授权（version:read /
+//!                                artifact:read，R2-F-03）
+//!                              * /v1/generators 认证（api_meta 套件）
+//!
+//! 注：O-5 绑定表已按 WP-03 裁决移除（迁移 0006 + PgDelegationBindingStore），
+//! 原 s13/s14/s15/s17/s19/s20 绑定存储场景随之删除；同 jti 并发仲裁职责由
+//! 既有业务幂等机制承接（AS-2 caller 唯一索引回归见 as2_caller_identity.rs）。
 //!
 //! 测试密钥在运行期用 `rsa` 生成（无任何真实凭据落盘/入 git）；JWKS 服务器
 //! 为进程内 axum 回环服务。生产配置仍要求 https JWKS（config 单测覆盖）。
@@ -21,12 +29,10 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use artifact_application::{
-    DelegationBindingOutcome, DelegationBindingStore, DelegationTokenUse, DelegationVerifier,
-    assert_delegation_matches_request, canonical_request_fingerprint,
+    DelegationVerifier, assert_delegation_matches_request, canonical_request_fingerprint,
 };
 use artifact_infrastructure::delegation::jwks::{JwksCache, JwksLookup};
 use artifact_infrastructure::delegation::{AiPmDelegationVerifier, TrustedIssuer};
-use artifact_infrastructure::postgres::PgDelegationBindingStore;
 use artifact_infrastructure::test_support::TestDelegationVerifier;
 use axum::routing::get;
 use base64::Engine as _;
@@ -126,7 +132,8 @@ fn mint(key: &RsaPrivateKey, kid: &str, claims: Value) -> String {
     encode(&header, &claims, &encoding_key(key)).expect("token mint")
 }
 
-/// 契约 v0.2 §3.1 的最小合法 claims。
+/// 契约 v0.2 §3.1 的最小合法 claims（WP-03：含写动作 → 必须携带
+/// caller_request_id，PC-O5-1 红线）。
 fn base_claims() -> Value {
     let now = chrono::Utc::now().timestamp();
     json!({
@@ -138,6 +145,7 @@ fn base_claims() -> Value {
         "tenant_id": common::TENANT,
         "project_id": common::PROJECT_1,
         "actions": ["artifact:read", "artifact:create"],
+        "caller_request_id": Uuid::new_v4().to_string(),
         "iat": now,
         "exp": now + 120,
         "jti": Uuid::new_v4().to_string(),
@@ -523,219 +531,341 @@ async fn s18_missing_project_header_is_400(pool: sqlx::PgPool) {
     assert_eq!(envelope["error"]["code"], "INVALID_REQUEST");
 }
 
-// ── 场景 13/14/15/17 + 19：jti 绑定存储（数据库原子性） ─────────────────
+// ── WP-03（R2-F-12）：V4/V6/V7/V8 验证器级负面测试（原 R2 PoC P1–P7 移植） ──
 
-fn binding_use(jti: &str, caller: Option<Uuid>, hash: &str) -> DelegationTokenUse {
-    DelegationTokenUse {
-        issuer: "ai-pm".into(),
-        jti: jti.to_string(),
-        tenant_id: common::TENANT,
-        project_id: common::PROJECT_1,
-        caller_request_id: caller,
-        request_hash: Some(hash.to_string()),
-    }
+#[tokio::test]
+async fn v4_array_audience_even_containing_expected_is_rejected() {
+    // PoC P7：aud 为数组（即使包含 artifact-service）→ 拒绝。claims 层
+    // `aud: String` 反序列化即失败，故拒绝消息是解析类错误（"claims rejected"）；
+    // 断言要点是"包含期望值的数组 aud 也不得通过"。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let token = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        json!({
+            "aud": ["artifact-service", "other"],
+            "iss": "ai-pm",
+            "sub": "user-1",
+            "purpose": "delegation",
+            "tenant_id": common::TENANT,
+            "project_id": common::PROJECT_1,
+            "actions": ["artifact:read"],
+            "iat": chrono::Utc::now().timestamp(),
+            "exp": chrono::Utc::now().timestamp() + 120,
+            "jti": Uuid::new_v4().to_string(),
+            "delegation_id": Uuid::new_v4().to_string(),
+        }),
+    );
+    rejects_with(&jwks, &token, "claims rejected").await;
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn s13_same_jti_different_request_is_rejected(pool: sqlx::PgPool) {
-    let store = PgDelegationBindingStore::new(pool.clone());
-    let jti = Uuid::new_v4().to_string();
-    let caller = Uuid::new_v4();
-    let hash_a = common::sha256_hex("request-a");
-    let hash_b = common::sha256_hex("request-b");
-
-    assert_eq!(
-        store
-            .consume(binding_use(&jti, Some(caller), &hash_a))
-            .await
-            .unwrap(),
-        DelegationBindingOutcome::Fresh
+#[tokio::test]
+async fn v6_jti_must_be_uuid() {
+    // PoC P2：jti 非 UUID → 拒绝（撤销查询主键类型边界）。
+    // 纯读动作，避免写绑定红线先于 V6 判定（保持单项失败语义）。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let token = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:read"], "jti": "not-a-uuid"})),
     );
-    // 同 jti、不同指纹 → 409 族硬拒绝。
-    let err = store
-        .consume(binding_use(&jti, Some(caller), &hash_b))
-        .await
-        .expect_err("different request with same jti must be rejected");
-    assert_eq!(err.code(), "DELEGATION_TOKEN_REUSED");
-    // 同 jti、不同 caller_request_id → 拒绝。
-    let err = store
-        .consume(binding_use(&jti, Some(Uuid::new_v4()), &hash_a))
-        .await
-        .expect_err("different caller_request_id with same jti must be rejected");
-    assert_eq!(err.code(), "DELEGATION_TOKEN_REUSED");
-    // 同 jti、不同 scope（跨项目）→ 拒绝。
-    let mut cross = binding_use(&jti, Some(caller), &hash_a);
-    cross.project_id = common::PROJECT_2;
-    let err = store
-        .consume(cross)
-        .await
-        .expect_err("scope change with same jti must be rejected");
-    assert_eq!(err.code(), "DELEGATION_TOKEN_REUSED");
+    rejects_with(&jwks, &token, "jti").await;
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn s14_concurrent_replay_yields_single_fresh_binding(pool: sqlx::PgPool) {
-    let store = Arc::new(PgDelegationBindingStore::new(pool.clone()));
-    let jti = Uuid::new_v4().to_string();
-    let caller = Uuid::new_v4();
-    let hash = common::sha256_hex("same-request");
-    let use_a = binding_use(&jti, Some(caller), &hash);
-    let use_b = binding_use(&jti, Some(caller), &hash);
+#[tokio::test]
+async fn v7_purpose_must_be_delegation() {
+    // PoC P1 / P1b：LMMS 用户 Token 形态（purpose=user_login）与缺失 purpose
+    // 一律拒绝（类型混淆双闸之二）。缺失 purpose 属必填字段反序列化失败，
+    // 拒绝消息为解析类错误（deny-by-absence）。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let user_login = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"purpose": "user_login"})),
+    );
+    rejects_with(&jwks, &user_login, "purpose").await;
 
-    // 与 as2_17 相同的模式：不假设 tokio::join! 的 poll 顺序。
-    let (a, b) = tokio::join!(store.consume(use_a), store.consume(use_b));
-    let outcomes = [a.unwrap(), b.unwrap()];
-    let fresh = outcomes
-        .iter()
-        .filter(|o| **o == DelegationBindingOutcome::Fresh)
-        .count();
-    let retry = outcomes
-        .iter()
-        .filter(|o| **o == DelegationBindingOutcome::RetryAllowed)
-        .count();
-    assert_eq!(
-        fresh, 1,
-        "exactly one concurrent request wins the jti binding"
-    );
-    assert_eq!(
-        retry, 1,
-        "the loser must be classified as an identical retry, not an error"
-    );
+    let mut missing = base_claims();
+    missing
+        .as_object_mut()
+        .expect("claims object")
+        .remove("purpose")
+        .expect("purpose present in base claims");
+    let missing = mint(&KEY_PRIMARY, KID_PRIMARY, missing);
+    rejects_with(&jwks, &missing, "claims rejected").await;
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn s15_and_s19_retry_is_legal_and_binding_survives_restart(pool: sqlx::PgPool) {
-    let jti = Uuid::new_v4().to_string();
-    let caller = Uuid::new_v4();
-    let hash = common::sha256_hex("retry-me");
-    let use_of = binding_use(&jti, Some(caller), &hash);
+#[tokio::test]
+async fn v8_actions_shape_rejections() {
+    // PoC P3–P6：通配、未知动作、重复条目、空数组 → 全部拒绝。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
 
-    let first = PgDelegationBindingStore::new(pool.clone());
-    assert_eq!(
-        first.consume(use_of.clone()).await.unwrap(),
-        DelegationBindingOutcome::Fresh
+    let wildcard = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["*"]})),
     );
+    rejects_with(&jwks, &wildcard, "unknown action").await;
 
-    // "进程重启"：新的 store 实例（新连接），绑定仍可判定 → 合法重试。
-    let second = PgDelegationBindingStore::new(pool.clone());
-    assert_eq!(
-        second.consume(use_of.clone()).await.unwrap(),
-        DelegationBindingOutcome::RetryAllowed
+    let unknown = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:purge_all"]})),
     );
-    let third = PgDelegationBindingStore::new(pool.clone());
-    assert_eq!(
-        third.consume(use_of).await.unwrap(),
-        DelegationBindingOutcome::RetryAllowed
+    rejects_with(&jwks, &unknown, "unknown action").await;
+
+    let duplicate = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:read", "artifact:read"]})),
     );
+    rejects_with(&jwks, &duplicate, "duplicate action").await;
+
+    let empty = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": []})),
+    );
+    rejects_with(&jwks, &empty, "empty").await;
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn s17_revocation_semantics_ttl_window_and_binding_guard(pool: sqlx::PgPool) {
-    // 契约 §5 撤销模型（Q1 默认裁决）：
-    // (a) 用户被移出项目后，AI-PM 停止签发新 token —— AS 侧无法也无需感知；
-    // (b) 已签发 token 在 TTL ≤ 300s 残余窗口内仍可用于已授权动作（接受的风险，
-    //     审计可按 jti 追溯到签发事件）；这里验证该窗口确实存在且受控；
-    // (c) 残余窗口内同一 jti 仍不能改绑其他请求（绑定守卫不随撤销失效）。
-    let store = PgDelegationBindingStore::new(pool.clone());
-    let jti = Uuid::new_v4().to_string();
-    let caller = Uuid::new_v4();
-    let hash = common::sha256_hex("pre-revocation-request");
-    assert_eq!(
-        store
-            .consume(binding_use(&jti, Some(caller), &hash))
-            .await
-            .unwrap(),
-        DelegationBindingOutcome::Fresh,
-        "token minted before revocation stays usable within its TTL"
+// ── WP-03（PC-O5-1 红线）：写动作 token 必须携带 caller_request_id ────────
+
+#[tokio::test]
+async fn write_action_token_without_caller_request_id_is_rejected() {
+    // O-5 移除的强制前置条件：授予写动作的 delegation 缺顶层 caller_request_id
+    // → 验证器拒绝（缺绑定即拒绝，不依赖签发方自律）。显式置 null 覆盖
+    // base_claims 的合法 caller。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let token = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:create"], "caller_request_id": null})),
     );
-    let mut redirected = binding_use(&jti, Some(caller), &hash);
-    redirected.project_id = common::PROJECT_2;
-    let err = store
-        .consume(redirected)
-        .await
-        .expect_err("post-revocation redirect of the same jti must stay rejected");
-    assert_eq!(err.code(), "DELEGATION_TOKEN_REUSED");
-}
+    rejects_with(&jwks, &token, "caller_request_id").await;
 
-#[sqlx::test(migrations = "../migrations")]
-async fn s20_db_level_binding_invariants(pool: sqlx::PgPool) {
-    // DB 层兜底（不依赖 Rust）：唯一 jti + 配对 CHECK。
-    let jti = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO artifact.delegation_token_use \
-         (issuer, jti, tenant_id, project_id, caller_request_id, request_hash) \
-         VALUES ('ai-pm', $1, $2, $3, $4, $5)",
-    )
-    .bind(&jti)
-    .bind(common::TENANT)
-    .bind(common::PROJECT_1)
-    .bind(Uuid::new_v4())
-    .bind(common::sha256_hex("x"))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // 重复 jti → 23505。
-    let dup = sqlx::query(
-        "INSERT INTO artifact.delegation_token_use \
-         (issuer, jti, tenant_id, project_id, caller_request_id, request_hash) \
-         VALUES ('ai-pm', $1, $2, $3, $4, $5)",
-    )
-    .bind(&jti)
-    .bind(common::TENANT)
-    .bind(common::PROJECT_1)
-    .bind(Uuid::new_v4())
-    .bind(common::sha256_hex("x"))
-    .execute(&pool)
-    .await;
-    assert_eq!(
-        common::pg_error_code(&dup.unwrap_err()).as_deref(),
-        Some("23505")
+    // 混合读+写动作同样受红线约束（写能力存在即要求绑定）。
+    let mixed = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(
+            json!({"actions": ["artifact:read", "artifact:create"], "caller_request_id": null}),
+        ),
     );
+    rejects_with(&jwks, &mixed, "caller_request_id").await;
 
-    // 半配对（caller 非空、hash 为空）→ 23514。
-    let half = sqlx::query(
-        "INSERT INTO artifact.delegation_token_use \
-         (issuer, jti, tenant_id, project_id, caller_request_id, request_hash) \
-         VALUES ('ai-pm', $1, $2, $3, $4, NULL)",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(common::TENANT)
-    .bind(common::PROJECT_1)
-    .bind(Uuid::new_v4())
-    .execute(&pool)
-    .await;
-    assert_eq!(
-        common::pg_error_code(&half.unwrap_err()).as_deref(),
-        Some("23514")
+    // 纯读动作 token 无 caller_request_id 仍然合法（读路径不要求绑定）。
+    let read_only = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:read", "version:read"]})),
     );
-
-    // 大写十六进制 hash → 23514。
-    let upper = sqlx::query(
-        "INSERT INTO artifact.delegation_token_use \
-         (issuer, jti, tenant_id, project_id, caller_request_id, request_hash) \
-         VALUES ('ai-pm', $1, $2, $3, $4, $5)",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(common::TENANT)
-    .bind(common::PROJECT_1)
-    .bind(Uuid::new_v4())
-    .bind("A".repeat(64))
-    .execute(&pool)
-    .await;
-    assert_eq!(
-        common::pg_error_code(&upper.unwrap_err()).as_deref(),
-        Some("23514")
-    );
-
-    // 清理函数窗口护栏：拒绝清理过近的行。
-    let guard = sqlx::query("SELECT artifact.purge_delegation_token_use(now())")
-        .execute(&pool)
-        .await;
+    let verifier = jwks.verifier(Duration::from_secs(600));
     assert!(
-        common::pg_error_message(&guard.unwrap_err()).contains("PURGE_WINDOW_TOO_RECENT"),
-        "purge guard must reject too-recent windows"
+        verifier.verify(&read_only).await.is_ok(),
+        "read-only token without operation binding must verify"
     );
+
+    // 写动作 + caller_request_id → 合法。
+    let bound_write = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({
+            "actions": ["artifact:create"],
+            "caller_request_id": Uuid::new_v4().to_string(),
+        })),
+    );
+    assert!(
+        verifier.verify(&bound_write).await.is_ok(),
+        "write token carrying caller_request_id must verify"
+    );
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn write_without_binding_is_rejected_over_http(pool: sqlx::PgPool) {
+    // HTTP 层证据：写动作但无 caller_request_id 的 token 走真实 verifier
+    // （RS256 + 回环 JWKS）→ 401，任何写路径不可达。
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let base = common::spawn_app(pool, jwks.verifier(Duration::from_secs(600))).await;
+    let http = reqwest::Client::new();
+    let token = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:create"], "caller_request_id": null})),
+    );
+    let res = http
+        .post(format!("{base}/v1/artifacts"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .json(&json!({
+            "project_id": common::PROJECT_1,
+            "name": "UnboundWrite",
+            "artifact_type": "visualization"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "unbound write token must fail closed");
+    let envelope: Value = res.json().await.unwrap();
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("caller_request_id"),
+        "rejection must cite the missing operation binding: {message}"
+    );
+}
+
+// ── WP-03（R2-F-03）：三个读 handler 的动作授权（Q3：GET 也要 delegation） ──
+
+#[sqlx::test(migrations = "../migrations")]
+async fn version_reads_require_version_read_action(pool: sqlx::PgPool) {
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let base = common::spawn_app(pool.clone(), jwks.verifier(Duration::from_secs(600))).await;
+    let http = reqwest::Client::new();
+
+    // 布景：artifact + version 直接落库（独立测试库）。
+    let artifact_id =
+        common::sql_insert_artifact(&pool, common::TENANT, common::PROJECT_1, "R2F03").await;
+    let version_id = common::sql_insert_version(
+        &pool,
+        common::TENANT,
+        common::PROJECT_1,
+        artifact_id,
+        "pending",
+    )
+    .await;
+
+    // ① 无 version:read 动作（artifact:read）→ 两个版本读端点 403，SCOPE_DENIED，
+    //    拒绝发生在任何数据读取之前。
+    let no_version = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:read"]})),
+    );
+    for url in [
+        format!("{base}/v1/artifacts/{artifact_id}/versions/{version_id}"),
+        format!("{base}/v1/artifacts/{artifact_id}/versions"),
+    ] {
+        let res = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {no_version}"))
+            .header("x-project-id", common::PROJECT_1.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403, "GET {url} must require version:read");
+        let envelope: Value = res.json().await.unwrap();
+        assert_eq!(envelope["error"]["code"], "SCOPE_DENIED");
+    }
+
+    // ② 合法 version:read → 200。
+    let with_version = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({
+            "actions": ["version:read"],
+            "caller_request_id": Uuid::new_v4().to_string(),
+        })),
+    );
+    let ok = http
+        .get(format!(
+            "{base}/v1/artifacts/{artifact_id}/versions/{version_id}"
+        ))
+        .header("Authorization", format!("Bearer {with_version}"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "version:read token must read version");
+    let ok_list = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/versions"))
+        .header("Authorization", format!("Bearer {with_version}"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok_list.status(),
+        200,
+        "version:read token must list versions"
+    );
+
+    // ③ 无 delegation → 401（Q3：GET 不豁免）。
+    let anon = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/versions"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 401);
+
+    // ④ 跨项目（header PROJECT_2，token 绑定 PROJECT_1）→ 403，不泄露数据。
+    let cross = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/versions"))
+        .header("Authorization", format!("Bearer {with_version}"))
+        .header("x-project-id", common::PROJECT_2.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross.status(), 403, "cross-project read must be denied");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn reference_list_requires_artifact_read_action(pool: sqlx::PgPool) {
+    let jwks = spawn_jwks(vec![jwk_entry(&KEY_PRIMARY, KID_PRIMARY)]).await;
+    let base = common::spawn_app(pool.clone(), jwks.verifier(Duration::from_secs(600))).await;
+    let http = reqwest::Client::new();
+
+    let artifact_id =
+        common::sql_insert_artifact(&pool, common::TENANT, common::PROJECT_1, "R2F03Ref").await;
+
+    // 无 artifact:read → 403（references 无独立 read 动作，映射 artifact:read）。
+    let no_read = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(
+            json!({"actions": ["version:read"], "caller_request_id": Uuid::new_v4().to_string()}),
+        ),
+    );
+    let res = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/references"))
+        .header("Authorization", format!("Bearer {no_read}"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        403,
+        "list_references must require artifact:read"
+    );
+    let envelope: Value = res.json().await.unwrap();
+    assert_eq!(envelope["error"]["code"], "SCOPE_DENIED");
+
+    // 合法 artifact:read → 200（空列表）。
+    let with_read = mint(
+        &KEY_PRIMARY,
+        KID_PRIMARY,
+        claims_with(json!({"actions": ["artifact:read"]})),
+    );
+    let ok = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/references"))
+        .header("Authorization", format!("Bearer {with_read}"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let body: Value = ok.json().await.unwrap();
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+
+    // 无 delegation → 401。
+    let anon = http
+        .get(format!("{base}/v1/artifacts/{artifact_id}/references"))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 401);
 }
 
 // ── 配置缺省：无受信 issuer = 维持全拒（fail-closed 生产姿态） ───────────
@@ -744,7 +874,7 @@ async fn s20_db_level_binding_invariants(pool: sqlx::PgPool) {
 async fn s21_empty_issuer_config_keeps_default_deny(pool: sqlx::PgPool) {
     let base = common::spawn_app_closed(pool).await;
     let http = reqwest::Client::new();
-    // /v1/generators 是公开注册表端点；用受保护的业务端点验证全拒。
+    // 业务写端点全拒。
     let res = http
         .post(format!("{base}/v1/artifacts"))
         .header("Authorization", format!("Bearer {}", valid_token()))
@@ -754,6 +884,20 @@ async fn s21_empty_issuer_config_keeps_default_deny(pool: sqlx::PgPool) {
         .await
         .unwrap();
     assert_eq!(res.status(), 401, "closed verifier must reject every token");
+    // WP-03：/v1/generators 不再豁免——fail-closed 姿态同样覆盖该端点。
+    let generators = http
+        .get(format!("{base}/v1/generators"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(generators.status(), 401);
+    let anon = http
+        .get(format!("{base}/v1/generators"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 401);
 }
 
 // ── JWKS 缓存不可用单元测试补充（Unavailable 判定与限频不变量） ─────────

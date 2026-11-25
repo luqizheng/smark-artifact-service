@@ -73,8 +73,6 @@ impl ErrorEnvelope {
             "VERSION_CONFLICT"
             | "IDEMPOTENCY_KEY_REUSED"
             | "CALLER_REQUEST_ID_REUSED"
-            // WP 契约 v0.2 §3.4：同一 jti 绑定到不同请求的确定性冲突。
-            | "DELEGATION_TOKEN_REUSED"
             | "ARTIFACT_KEY_CONFLICT"
             | "ARTIFACT_KEY_LEGACY_UNVERIFIABLE" => 409,
             "INVALID_IDEMPOTENCY_KEY" => 400,
