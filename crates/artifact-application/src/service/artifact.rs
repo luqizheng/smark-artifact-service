@@ -6,6 +6,10 @@
 
 use crate::port::audit::AuditSink;
 use crate::port::idempotency::IdempotencyStore;
+use crate::port::keyed_create::{
+    IdempotencyInput, KeyedArtifactCreateOutcome, KeyedArtifactCreationPort,
+    ValidatedCreateArtifactRequest,
+};
 use crate::port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
     JobRepository, NewArtifact, ReferenceRepository, VersionRepository,
@@ -27,10 +31,36 @@ use uuid::Uuid;
 
 pub const ENDPOINT_CREATE_ARTIFACT: &str = "POST /v1/artifacts";
 
+/// 创建结果的稳定解析语义（ART-04E §7）。HTTP 层以 `X-Artifact-Resolution`
+/// 暴露；`replayed` 仅为兼容既有 `x-idempotent-replay` 行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateResolution {
+    Created,
+    ExistingKey,
+    IdempotencyReplay,
+}
+
+impl CreateResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CreateResolution::Created => "created",
+            CreateResolution::ExistingKey => "existing_key",
+            CreateResolution::IdempotencyReplay => "idempotency_replay",
+        }
+    }
+}
+
 /// 创建结果：fresh=首次创建；replayed=同幂等键同请求体的重放。
 pub struct CreateOutcome<T> {
     pub resource: T,
     pub replayed: bool,
+}
+
+/// Artifact 创建结果：在通用创建结果上增加稳定解析语义。
+pub struct ArtifactCreateOutcome {
+    pub resource: ArtifactResponse,
+    pub replayed: bool,
+    pub resolution: CreateResolution,
 }
 
 #[derive(Clone)]
@@ -42,6 +72,7 @@ pub struct ArtifactService {
     pub generators: Arc<dyn GeneratorRepository>,
     pub storage: Arc<dyn StoragePort>,
     pub idempotency: Arc<dyn IdempotencyStore>,
+    pub keyed_create: Arc<dyn KeyedArtifactCreationPort>,
     pub audit: Arc<dyn AuditSink>,
 }
 
@@ -56,7 +87,7 @@ impl ArtifactService {
         req: CreateArtifactRequest,
         idempotency_key: Option<String>,
         request_hash: String,
-    ) -> Result<CreateOutcome<ArtifactResponse>, DomainError> {
+    ) -> Result<ArtifactCreateOutcome, DomainError> {
         ArtifactType::parse(&req.artifact_type).ok_or_else(|| {
             DomainError::InvalidRequest(format!("unknown artifact_type '{}'", req.artifact_type))
         })?;
@@ -64,6 +95,22 @@ impl ArtifactService {
             return Err(DomainError::InvalidRequest("name must not be blank".into()));
         }
         delegation.require(Action::ArtifactCreate, scope)?;
+
+        // AS-1：带 artifact_key 的创建走持久化创建身份 + 单事务端口。
+        // 不得让 unkeyed 旧流程意外进入新路径。
+        if let Some(artifact_key) = req.artifact_key.clone() {
+            return self
+                .create_keyed_artifact(
+                    delegation,
+                    scope,
+                    request_id,
+                    req,
+                    artifact_key,
+                    idempotency_key,
+                    request_hash,
+                )
+                .await;
+        }
 
         let reservation = match &idempotency_key {
             Some(key) => Some(
@@ -90,9 +137,10 @@ impl ArtifactService {
             if let Some(snapshot) = &outcome.replay_response {
                 let dto: ArtifactResponse = serde_json::from_value(snapshot.clone())
                     .map_err(|e| DomainError::Internal(format!("idempotency snapshot: {e}")))?;
-                return Ok(CreateOutcome {
+                return Ok(ArtifactCreateOutcome {
                     resource: dto,
                     replayed: true,
+                    resolution: CreateResolution::IdempotencyReplay,
                 });
             }
             return Err(DomainError::IdempotencyKeyReused(
@@ -148,9 +196,87 @@ impl ArtifactService {
                 )
                 .await?;
         }
-        Ok(CreateOutcome {
+        Ok(ArtifactCreateOutcome {
             resource: dto,
             replayed: false,
+            resolution: CreateResolution::Created,
+        })
+    }
+
+    /// AS-1 keyed create/resolve。授权已在调用方完成且发生在任何重放之前；
+    /// 端口负责单事务内的幂等解析、Artifact 插入与持久化身份写入。
+    #[allow(clippy::too_many_arguments)]
+    async fn create_keyed_artifact(
+        &self,
+        delegation: &Delegation,
+        scope: &TenantScope,
+        request_id: Option<&str>,
+        req: CreateArtifactRequest,
+        artifact_key: String,
+        idempotency_key: Option<String>,
+        request_hash: String,
+    ) -> Result<ArtifactCreateOutcome, DomainError> {
+        let validated = ValidatedCreateArtifactRequest::try_new(
+            scope,
+            artifact_key,
+            req.name,
+            req.description,
+            req.artifact_type,
+            req.category,
+            delegation.actor.subject.clone(),
+        )?;
+        let idempotency = idempotency_key.map(|key| IdempotencyInput {
+            endpoint: ENDPOINT_CREATE_ARTIFACT.to_string(),
+            key,
+            request_hash,
+        });
+
+        let outcome = match self
+            .keyed_create
+            .create_or_resolve_keyed(validated, idempotency)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if matches!(
+                    err,
+                    crate::port::keyed_create::KeyedArtifactCreateError::IntegrityFailure(_)
+                ) {
+                    tracing::error!(
+                        code = "artifact_creation_integrity",
+                        error = %err,
+                        "keyed artifact creation failed closed: durable state is inconsistent"
+                    );
+                }
+                return Err(err.to_domain_error());
+            }
+        };
+
+        let (artifact, resolution) = match outcome {
+            KeyedArtifactCreateOutcome::Created(artifact) => (artifact, CreateResolution::Created),
+            KeyedArtifactCreateOutcome::ResolvedExisting(artifact) => {
+                (artifact, CreateResolution::ExistingKey)
+            }
+            KeyedArtifactCreateOutcome::ReplayedByIdempotency(artifact) => {
+                (artifact, CreateResolution::IdempotencyReplay)
+            }
+        };
+
+        let dto = to_artifact_dto(&artifact);
+        if resolution != CreateResolution::IdempotencyReplay {
+            self.audit_allowed(
+                scope,
+                delegation,
+                "artifact.create",
+                artifact.id,
+                request_id,
+            )
+            .await;
+        }
+        Ok(ArtifactCreateOutcome {
+            resource: dto,
+            replayed: resolution == CreateResolution::IdempotencyReplay,
+            resolution,
         })
     }
 

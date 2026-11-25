@@ -243,17 +243,30 @@ async fn active_reference_unique_and_soft_remove(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 async fn artifact_key_unique_within_project_only(pool: sqlx::PgPool) {
-    async fn insert(
-        pool: &sqlx::PgPool,
-        project: Uuid,
-    ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    // 0004 起 keyed Artifact 必须与创建身份同事务提交，因此 fixture 成对写入。
+    async fn insert(pool: &sqlx::PgPool, project: Uuid) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO artifact.artifact (id, tenant_id, project_id, artifact_key, name, artifact_type, created_by) \
              VALUES ($1, $2, $3, 'stable-key', 'keyed', 'file', 'fixture')",
         )
-        .bind(Uuid::new_v4()).bind(common::TENANT).bind(project)
-        .execute(pool)
-        .await
+        .bind(id)
+        .bind(common::TENANT)
+        .bind(project)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO artifact.artifact_creation_identity \
+             (tenant_id, project_id, artifact_key, artifact_id, fingerprint_version, request_fingerprint, created_by) \
+             VALUES ($1, $2, 'stable-key', $3, 1, repeat('0', 64), 'fixture')",
+        )
+        .bind(common::TENANT)
+        .bind(project)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
     }
     insert(&pool, common::PROJECT_1).await.unwrap();
     let dup = insert(&pool, common::PROJECT_1).await.unwrap_err();

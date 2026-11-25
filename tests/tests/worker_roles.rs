@@ -19,7 +19,8 @@ async fn provision(pool: &PgPool) -> (String, String, String, PgPool, PgPool) {
     let migrator = format!("wmig_{suffix}");
     let app = format!("wapp_{suffix}");
     let worker = format!("wkr_{suffix}");
-    for role in [&migrator, &app, &worker] {
+    let maintenance = format!("wmtn_{suffix}");
+    for role in [&migrator, &app, &worker, &maintenance] {
         sqlx::query(&format!(
             "CREATE ROLE \"{role}\" LOGIN PASSWORD '{PASSWORD}'"
         ))
@@ -31,10 +32,14 @@ async fn provision(pool: &PgPool) -> (String, String, String, PgPool, PgPool) {
     let script = include_str!("../../deploy/db-roles.sql")
         .replace("__MIGRATOR_ROLE__", &migrator)
         .replace("__APP_ROLE__", &app)
-        .replace("__WORKER_ROLE__", &worker);
+        .replace("__WORKER_ROLE__", &worker)
+        .replace("__MAINTENANCE_ROLE__", &maintenance);
     sqlx::raw_sql(&script).execute(pool).await.unwrap();
     // 脚本必须可重复执行：每次迁移之后都要重新跑一遍。
     sqlx::raw_sql(&script).execute(pool).await.unwrap();
+
+    // 本测试不校验清理主体，但角色是集群级对象：就地回收，避免污染集群。
+    common::drop_test_roles(pool, &[&maintenance]).await;
 
     let worker_pool = connect_as(pool, &worker).await;
     let app_pool = connect_as(pool, &app).await;

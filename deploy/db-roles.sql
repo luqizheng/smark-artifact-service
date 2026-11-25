@@ -6,6 +6,9 @@
 -- __WORKER_ROLE__ ：独立 Worker 运行时连接。仅可执行受控协调函数（SECURITY DEFINER），
 --                   对业务表无任何 SELECT/INSERT/UPDATE/DELETE、无 DDL；
 --                   不继承 APP/MIGRATOR，不获得用户 delegation 或对象存储凭据。
+-- __MAINTENANCE_ROLE__：Idempotency-Key 过期清理主体（ART-04E §6.2）。仅有
+--                   清理函数（SECURITY DEFINER）的 EXECUTE 权限，对任何业务表
+--                   都没有 DELETE（也没有 SELECT/INSERT/UPDATE）。
 --
 -- 执行顺序（每次迁移之后都必须重新执行本脚本）：
 --   1. 以 __MIGRATOR_ROLE__ 执行迁移；
@@ -37,6 +40,9 @@ BEGIN
         -- NOINHERIT：即使将来误加成员关系也不会自动继承其他角色的权限。
         CREATE ROLE "__WORKER_ROLE__" LOGIN NOINHERIT;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '__MAINTENANCE_ROLE__') THEN
+        CREATE ROLE "__MAINTENANCE_ROLE__" LOGIN NOINHERIT;
+    END IF;
 END $$;
 
 -- 运行角色：schema usage + DML。
@@ -51,6 +57,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "__MIGRATOR_ROLE__" IN SCHEMA artifact
 REVOKE UPDATE, DELETE ON artifact.audit_event FROM "__APP_ROLE__";
 ALTER DEFAULT PRIVILEGES FOR ROLE "__MIGRATOR_ROLE__" IN SCHEMA artifact
     REVOKE UPDATE, DELETE ON TABLES FROM "__APP_ROLE__";
+
+-- 持久化创建身份只允许追加（ART-04E §4.1 / #4.8）。即使 ON ALL TABLES 的
+-- 历史授权给了 UPDATE，这里也按表显式撤销，身份行在运行期不可改写或删除。
+REVOKE UPDATE, DELETE ON artifact.artifact_creation_identity FROM "__APP_ROLE__";
 
 -- ── Worker role：最小权限边界 ──────────────────────────────────────────
 -- 迁移对所有函数 REVOKE 了 PUBLIC 的 EXECUTE；这里按函数逐个精确授权，
@@ -78,6 +88,16 @@ GRANT EXECUTE ON FUNCTION artifact.request_generation_job_cancel(uuid, uuid, uui
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA artifact FROM "__WORKER_ROLE__";
 ALTER DEFAULT PRIVILEGES FOR ROLE "__MIGRATOR_ROLE__" IN SCHEMA artifact REVOKE ALL ON TABLES FROM "__WORKER_ROLE__";
 REVOKE CREATE ON SCHEMA artifact FROM "__WORKER_ROLE__";
+
+-- ── Maintenance role：只拥有 Idempotency-Key 清理函数的执行权 ───────────
+-- 清理主体不能直接 DELETE 任何表：删除只发生在 SECURITY DEFINER 函数内部，
+-- 且函数固定 search_path、限制批次、只删除「已完成且已过期」的记录。
+GRANT USAGE ON SCHEMA artifact TO "__MAINTENANCE_ROLE__";
+GRANT EXECUTE ON FUNCTION artifact.purge_expired_idempotency_records(integer) TO "__MAINTENANCE_ROLE__";
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA artifact FROM "__MAINTENANCE_ROLE__";
+ALTER DEFAULT PRIVILEGES FOR ROLE "__MIGRATOR_ROLE__" IN SCHEMA artifact
+    REVOKE ALL ON TABLES FROM "__MAINTENANCE_ROLE__";
+REVOKE CREATE ON SCHEMA artifact FROM "__MAINTENANCE_ROLE__";
 
 -- 迁移角色：schema 全权（owner 身份执行迁移）。
 GRANT ALL ON SCHEMA artifact TO "__MIGRATOR_ROLE__";

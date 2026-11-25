@@ -228,12 +228,17 @@ pub async fn create_artifact(
             body.request_hash,
         )
         .await?;
-    let status = if outcome.replayed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
+    // 稳定解析语义（ART-04E §7）：created → 201；existing_key / idempotency_replay → 200。
+    let status = match outcome.resolution {
+        artifact_application::CreateResolution::Created => StatusCode::CREATED,
+        artifact_application::CreateResolution::ExistingKey
+        | artifact_application::CreateResolution::IdempotencyReplay => StatusCode::OK,
     };
     let mut res = etag_response(status, &outcome.resource);
+    res.headers_mut().insert(
+        "x-artifact-resolution",
+        axum::http::HeaderValue::from_static(outcome.resolution.as_str()),
+    );
     if outcome.replayed {
         res.headers_mut().insert(
             "x-idempotent-replay",

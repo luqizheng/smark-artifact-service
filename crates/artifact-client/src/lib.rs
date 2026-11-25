@@ -106,6 +106,40 @@ impl CallContext {
     }
 }
 
+/// Artifact 创建解析语义（ART-04E §7，响应头 `X-Artifact-Resolution`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactResolution {
+    Created,
+    ExistingKey,
+    IdempotencyReplay,
+}
+
+impl ArtifactResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArtifactResolution::Created => "created",
+            ArtifactResolution::ExistingKey => "existing_key",
+            ArtifactResolution::IdempotencyReplay => "idempotency_replay",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(ArtifactResolution::Created),
+            "existing_key" => Some(ArtifactResolution::ExistingKey),
+            "idempotency_replay" => Some(ArtifactResolution::IdempotencyReplay),
+            _ => None,
+        }
+    }
+}
+
+/// 创建结果：Artifact 本体 + 解析语义（旧服务不返回该头时为 `None`）。
+#[derive(Debug, Clone)]
+pub struct CreateArtifactOutcome {
+    pub artifact: ArtifactResponse,
+    pub resolution: Option<ArtifactResolution>,
+}
+
 #[derive(Clone)]
 pub struct ArtifactClient {
     base_url: String,
@@ -150,6 +184,41 @@ impl ArtifactClient {
         ctx: &CallContext,
     ) -> Result<ArtifactResponse, SdkError> {
         self.post_json("/v1/artifacts", &request, ctx).await
+    }
+
+    /// 与 [`Self::create_artifact`] 相同的创建调用，但额外暴露稳定的
+    /// `X-Artifact-Resolution` 语义（created / existing_key / idempotency_replay）。
+    pub async fn create_artifact_with_resolution(
+        &self,
+        request: CreateArtifactRequest,
+        ctx: &CallContext,
+    ) -> Result<CreateArtifactOutcome, SdkError> {
+        let res = self
+            .request(
+                Method::POST,
+                &format!("{}/v1/artifacts", self.base_url),
+                ctx,
+                Some(&request),
+            )
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(self.error_from_response(res).await);
+        }
+        let resolution = res
+            .headers()
+            .get("x-artifact-resolution")
+            .and_then(|value| value.to_str().ok())
+            .and_then(ArtifactResolution::parse);
+        let bytes = res.bytes().await?;
+        let artifact = serde_json::from_slice(&bytes).map_err(|e| SdkError::Unexpected {
+            status: status.as_u16(),
+            body: format!("response deserialization failed: {e}"),
+        })?;
+        Ok(CreateArtifactOutcome {
+            artifact,
+            resolution,
+        })
     }
 
     pub async fn get_artifact(

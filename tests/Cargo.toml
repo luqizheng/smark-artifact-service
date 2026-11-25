@@ -68,3 +68,7 @@ path = "tests/worker_roles.rs"
 [[test]]
 name = "migration_guard"
 path = "tests/migration_guard.rs"
+
+[[test]]
+name = "as1_creation_identity"
+path = "tests/as1_creation_identity.rs"

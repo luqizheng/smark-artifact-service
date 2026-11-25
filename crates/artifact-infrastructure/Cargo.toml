@@ -19,6 +19,7 @@ artifact-application = { workspace = true }
 artifact-contract = { workspace = true }
 sqlx = { workspace = true }
 async-trait = "0.1"
+tokio = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

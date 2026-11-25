@@ -9,6 +9,10 @@ pub mod service;
 pub use port::audit::AuditSink;
 pub use port::auth::{DelegationVerifier, VerificationError};
 pub use port::idempotency::{IdempotencyOutcome, IdempotencyStore};
+pub use port::keyed_create::{
+    IdempotencyInput, KeyedArtifactCreateError, KeyedArtifactCreateOutcome,
+    KeyedArtifactCreationPort, ValidatedCreateArtifactRequest,
+};
 
 pub use port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
@@ -20,8 +24,12 @@ pub use port::worker::{
     WorkerCoordinationPort,
 };
 pub use service::artifact::{
-    ArtifactService, to_artifact_dto, to_generator_dto, to_job_dto, to_reference_dto,
-    to_version_dto,
+    ArtifactCreateOutcome, ArtifactService, CreateResolution, to_artifact_dto, to_generator_dto,
+    to_job_dto, to_reference_dto, to_version_dto,
+};
+pub use service::creation_fingerprint::{
+    CURRENT_FINGERPRINT_VERSION, FingerprintError, canonical_fingerprint, current_fingerprint,
+    normalize_optional_text, normalize_text,
 };
 pub use service::generator::GeneratorService;
 pub use service::job_input::{
