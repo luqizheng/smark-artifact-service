@@ -20,9 +20,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 pub mod keyed_create;
+pub mod keyed_job_create;
 pub mod worker;
 
 pub use keyed_create::PgKeyedArtifactCreator;
+pub use keyed_job_create::PgKeyedGenerationJobCreator;
 pub use worker::PgWorkerCoordination;
 
 // ── 行类型 ──────────────────────────────────────────────────────────────
@@ -174,7 +176,7 @@ impl TryFrom<ReferenceRow> for ArtifactReference {
 const JOB_COLUMNS: &str = "id, tenant_id, project_id, artifact_id, target_version_id, \
      generator_id, generator_version, adapter_version, status, attempt_count, max_attempts, \
      created_at, started_at, heartbeat_at, completed_at, error_code, error_message, trace_id, \
-     cancel_requested_at";
+     cancel_requested_at, caller_request_id";
 
 #[derive(sqlx::FromRow)]
 struct JobRow {
@@ -197,6 +199,7 @@ struct JobRow {
     error_message: Option<String>,
     trace_id: Option<String>,
     cancel_requested_at: Option<DateTime<Utc>>,
+    caller_request_id: Option<Uuid>,
 }
 
 impl TryFrom<JobRow> for GenerationJob {
@@ -215,6 +218,9 @@ impl TryFrom<JobRow> for GenerationJob {
             status: parse_job_state(&row.status)?,
             idempotency_key: None,
             request_hash: None,
+            caller_request_id: row.caller_request_id,
+            request_fingerprint: None,
+            fingerprint_version: None,
             attempt_count: row.attempt_count,
             max_attempts: row.max_attempts,
             created_at: row.created_at,
@@ -655,6 +661,27 @@ impl JobRepository for PgJobRepository {
             .map_err(|e| map_db_error(e, "get job"))?
             .ok_or(DomainError::NotFound)?;
         row.try_into()
+    }
+
+    async fn get_by_caller_request(
+        &self,
+        scope: (Uuid, Uuid),
+        caller_request_id: Uuid,
+    ) -> Result<Option<GenerationJob>, DomainError> {
+        // 谓词强制 tenant + project + caller，走部分唯一索引
+        // uq_generation_job_caller_request；未命中返回 None（与跨 scope 无法区分）。
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM artifact.generation_job \
+             WHERE tenant_id = $1 AND project_id = $2 AND caller_request_id = $3"
+        );
+        let row: Option<JobRow> = sqlx::query_as(&sql)
+            .bind(scope.0)
+            .bind(scope.1)
+            .bind(caller_request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_db_error(e, "get job by caller request"))?;
+        row.map(GenerationJob::try_from).transpose()
     }
 
     async fn cancel(

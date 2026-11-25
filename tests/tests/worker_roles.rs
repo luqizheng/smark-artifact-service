@@ -177,9 +177,9 @@ async fn worker_role_cannot_touch_business_tables(pool: PgPool) {
     );
 
     // 6. 权限矩阵之外，再用真实连接确认两边各自的越权调用都被拒绝。
-    let e = sqlx::query_scalar::<_, Uuid>(
-        "SELECT artifact.create_generation_job_with_input($1,$2,$3,$4,'seecode', \
-         '{}'::jsonb,'{}'::jsonb,'1',$5,NULL,3,300,86400)",
+    let e = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT * FROM artifact.create_generation_job_with_input($1,$2,$3,$4,'seecode', \
+         '{}'::jsonb,'{}'::jsonb,'1',$5,NULL,NULL::uuid,NULL::text,NULL::smallint,3,300,86400)",
     )
     .bind(Uuid::new_v4())
     .bind(common::TENANT)

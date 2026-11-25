@@ -58,6 +58,12 @@ pub fn router(state: AppState) -> Router {
             "/v1/artifacts/{artifact_id}/generation-jobs",
             post(artifacts::request_generation),
         )
+        // AS-2 Caller Request Lookup（ART-04G v3 §5.4）：静态段路由必须位于
+        // `/v1/generation-jobs/{job_id}` 动态路由之前注册，避免被 {job_id} 吞掉。
+        .route(
+            "/v1/generation-jobs/by-caller-request/{caller_request_id}",
+            get(artifacts::get_job_by_caller_request),
+        )
         .route("/v1/generation-jobs/{job_id}", get(artifacts::get_job))
         .route(
             "/v1/generation-jobs/{job_id}/cancel",

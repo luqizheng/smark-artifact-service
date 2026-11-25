@@ -402,8 +402,22 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/CreateGenerationJobRequest" }
       responses:
+        "200":
+          description: |
+            已存在的 Job（重放）。不创建新 Job、不产生新 Job ID。
+            `X-Generation-Job-Resolution` 区分 `caller_request_replay`（caller_request_id
+            与指纹命中）与 `idempotency_replay`（Idempotency-Key 与请求体哈希命中）。
+          headers:
+            X-Generation-Job-Resolution:
+              $ref: "#/components/headers/GenerationJobResolution"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationJob" }
         "202":
-          description: （未实现，Adapter 落地前不可达）
+          description: 新建 Job（Adapter 落地前不可达）
+          headers:
+            X-Generation-Job-Resolution:
+              $ref: "#/components/headers/GenerationJobResolution"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GenerationJob" }
@@ -412,7 +426,9 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409":
-          description: IDEMPOTENCY_KEY_REUSED — 同一 Idempotency-Key 已用于不同的请求体
+          description: |
+            IDEMPOTENCY_KEY_REUSED（同 key 不同请求体）或 CALLER_REQUEST_ID_REUSED
+            （同 caller_request_id 不同创建立指纹）。
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -421,11 +437,47 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: |
+            CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH 或 IDEMPOTENCY_KEY_CROSS_IDENTITY
+            — 持久化完整性冲突，失败关闭，不可重试。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: GENERATOR_UNAVAILABLE（SeeCode Adapter 未实现；Mermaid 不属于本服务）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/generation-jobs/by-caller-request/{caller_request_id}:
+    get:
+      operationId: getGenerationJobByCallerRequest
+      tags: [generation]
+      summary: 按 caller_request_id 解析 Job（Caller Request Lookup）
+      description: |
+        与 `GET /v1/generation-jobs/{job_id}` 完全相同的身份验证与授权模型：
+        delegation token 决定 tenant，`X-Project-Id` 决定 project，
+        需要 `GenerationRead` 授权。查询谓词强制 tenant + project + caller_request_id，
+        跨 scope 与不存在统一返回 404（不泄露其他 tenant/project 是否存在该身份）。
+        本端点只读：不修改状态、不创建记录。response 为现有标准 GenerationJob DTO。
+      parameters:
+        - name: caller_request_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 调用方生成的请求身份。非法 UUID → 400。
+        - { $ref: "#/components/parameters/ProjectIdHeader" }
+      responses:
+        "200":
+          description: 命中的 Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationJob" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
 
   /v1/generation-jobs/{job_id}:
     get:
@@ -493,6 +545,14 @@ components:
       schema:
         type: string
         enum: [created, existing_key, idempotency_replay]
+    GenerationJobResolution:
+      description: |
+        GenerationJob 创建解析语义（ART-04G v3 §5.5）。
+        created=新建；caller_request_replay=caller_request_id 与创建立指纹命中已有 Job；
+        idempotency_replay=Idempotency-Key 与请求体哈希命中已有 Job。
+      schema:
+        type: string
+        enum: [created, caller_request_replay, idempotency_replay]
 
   parameters:
     ArtifactId:
@@ -525,8 +585,12 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: 创建类写请求幂等键；保留 ≥24h；同 key 不同请求体 → 409。
-      schema: { type: string, minLength: 1 }
+      description: |
+        创建类写请求幂等键；保留 ≥24h；同 key 不同请求体 → 409。
+        规范化（ART-04G v3 §10.1）：前后 ASCII 空格（U+0020）被剥离；
+        规范化后为空字符串等价于未提供（不参与幂等）；规范化后长度上限 255，
+        超限 → 400 INVALID_IDEMPOTENCY_KEY。HTAB/CR/LF 不属于空白，不被剥离。
+      schema: { type: string, maxLength: 255 }
     IfMatch:
       name: If-Match
       in: header
@@ -770,9 +834,18 @@ components:
 
     CreateGenerationJobRequest:
       type: object
-      required: [generator_id, input]
+      required: [generator_id, input, caller_request_id]
       properties:
         generator_id: { type: string }
+        caller_request_id:
+          type: string
+          format: uuid
+          description: |
+            调用方生成的请求身份（ART-04G v3 §5.5）。同 tenant/project 内唯一：
+            相同 caller_request_id 与相同创建立指纹的重放解析回同一 Job（不创建新 Job、
+            不产生新 Job ID），指纹不同 → 409 CALLER_REQUEST_ID_REUSED。
+            指纹覆盖服务端解析的 tenant/project、artifact_id、caller_request_id、
+            规范化 generator_id、input 与 options；不包含 Idempotency-Key 与传输层哈希。
         input:
           type: object
           description: |
@@ -794,6 +867,12 @@ components:
         id: { type: string, format: uuid }
         artifact_id: { type: string, format: uuid }
         generator_id: { type: string }
+        caller_request_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Durable caller identity（ART-04G v3 §5.1）。迁移前创建的 legacy Job 为 null；
+            AS-2 之后创建的 Job 必然非空，且写入后永久不可变。
         status:
           type: string
           enum: [queued, running, retry_wait, succeeded, cancelled, timed_out, failed]

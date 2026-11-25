@@ -9,6 +9,7 @@ use artifact_contract::{
     CreateArtifactRequest, CreateGenerationJobRequest, CreateReferenceRequest, ListArtifactsQuery,
     SetCurrentVersionRequest, UpdateArtifactRequest,
 };
+use uuid::Uuid;
 
 fn client(base: &str) -> ArtifactClient {
     ArtifactClient::new(ArtifactClientConfig::new(base)).unwrap()
@@ -117,6 +118,7 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
                 }),
                 options: None,
                 expected_current_version_id: None,
+                caller_request_id: uuid::Uuid::new_v4(),
             },
             &ctx,
         )
@@ -135,6 +137,7 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
                 input: serde_json::json!({"schema": "aipm.vizspec"}),
                 options: None,
                 expected_current_version_id: None,
+                caller_request_id: uuid::Uuid::new_v4(),
             },
             &ctx,
         )
@@ -193,4 +196,147 @@ fn sdk_has_no_internal_aipm_dependencies() {
     assert!(!manifest.contains("pm-infrastructure"));
     assert!(!manifest.contains("artifact-infrastructure"));
     assert!(!manifest.contains("artifact-api"));
+}
+
+// ── AS-2 SDK：AS2-39（lookup 方法）与 AS2-40（请求/响应类型） ─────────────
+
+const SDK_CALLER: Uuid = Uuid::from_u128(0x0e01);
+const SDK_FP: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+fn sdk_ctx() -> CallContext {
+    CallContext::new()
+        .token("sdk-tok")
+        .project(common::PROJECT_1)
+}
+
+/// AS2-39：`get_generation_job_by_caller_request` 的命中 / 404 / 403 / 传输错误分类。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_39_sdk_caller_request_lookup(pool: sqlx::PgPool) {
+    // 布景：一个带 caller identity 的 Job。
+    let artifact =
+        common::sql_insert_artifact(&pool, common::TENANT, common::PROJECT_1, "sdk").await;
+    common::sql_enable_seecode(&pool, "sdk-adapter").await;
+    let (job, _) = common::try_sql_create_job_with_identity(
+        &pool,
+        Uuid::new_v4(),
+        common::TENANT,
+        common::PROJECT_1,
+        artifact,
+        &common::JobOptions::default(),
+        None,
+        &common::sha256_hex("sdk-lookup"),
+        Some((SDK_CALLER, SDK_FP, 1)),
+    )
+    .await
+    .unwrap();
+
+    let verifier = common::verifier_with(&[(
+        "sdk-tok",
+        common::TENANT,
+        common::PROJECT_1,
+        &common::all_actions(),
+    )]);
+    let base = common::spawn_app(pool, verifier).await;
+    let sdk = client(&base);
+    let ctx = sdk_ctx();
+
+    // 命中：200 + caller_request_id。
+    let found = sdk
+        .get_generation_job_by_caller_request(SDK_CALLER, &ctx)
+        .await
+        .unwrap();
+    assert_eq!(found.id, job);
+    assert_eq!(found.caller_request_id, Some(SDK_CALLER));
+
+    // 不存在：404 RESOURCE_NOT_FOUND。
+    let err = sdk
+        .get_generation_job_by_caller_request(Uuid::new_v4(), &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "RESOURCE_NOT_FOUND");
+
+    // 项目不匹配：403 SCOPE_DENIED。
+    let err = sdk
+        .get_generation_job_by_caller_request(SDK_CALLER, &ctx.clone().project(common::PROJECT_2))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "SCOPE_DENIED");
+
+    // 无凭证：401。
+    let err = sdk
+        .get_generation_job_by_caller_request(
+            SDK_CALLER,
+            &CallContext::new().project(common::PROJECT_1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "UNAUTHENTICATED");
+
+    // 传输错误（不可达地址）必须与 HTTP 错误区分。
+    let dead = client("http://127.0.0.1:1");
+    let err = dead
+        .get_generation_job_by_caller_request(SDK_CALLER, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "TRANSPORT_ERROR");
+}
+
+/// AS2-40：请求体必含 caller_request_id；响应可反序列化可空 caller_request_id。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_40_sdk_types_require_caller_identity(pool: sqlx::PgPool) {
+    // 序列化：caller_request_id 必然出现在 JSON 中（类型层必填）。
+    let request = CreateGenerationJobRequest {
+        generator_id: "seecode".into(),
+        input: common::minimal_input(),
+        options: None,
+        expected_current_version_id: None,
+        caller_request_id: SDK_CALLER,
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["caller_request_id"], SDK_CALLER.to_string());
+
+    // 反序列化：legacy Job 的 caller_request_id 为 null 时仍可解析。
+    let legacy = serde_json::json!({
+        "id": Uuid::new_v4().to_string(),
+        "artifact_id": Uuid::new_v4().to_string(),
+        "generator_id": "seecode",
+        "status": "queued",
+        "error_code": null,
+        "attempt_count": 0,
+        "max_attempts": 3,
+        "caller_request_id": null,
+        "cancel_requested": false,
+        "created_at": "2026-01-01T00:00:00Z",
+        "poll_url": "/v1/generation-jobs/x"
+    });
+    let parsed: artifact_contract::GenerationJobResponse = serde_json::from_value(legacy).unwrap();
+    assert_eq!(parsed.caller_request_id, None);
+
+    // 布景无关：确认 SDK 在缺少 caller_request_id 的请求上行为一致（400）。
+    let verifier = common::verifier_with(&[(
+        "sdk-tok",
+        common::TENANT,
+        common::PROJECT_1,
+        &common::all_actions(),
+    )]);
+    let base = common::spawn_app(pool, verifier).await;
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{base}/v1/artifacts/{}/generation-jobs",
+            Uuid::new_v4()
+        ))
+        .header("x-project-id", common::PROJECT_1.to_string())
+        .header("authorization", "Bearer sdk-tok")
+        .json(&serde_json::json!({
+            "generator_id": "seecode",
+            "input": common::minimal_input()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status() == 400 || res.status() == 422,
+        "a request without caller_request_id must be rejected, got {}",
+        res.status()
+    );
 }

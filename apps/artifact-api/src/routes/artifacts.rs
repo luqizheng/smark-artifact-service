@@ -541,6 +541,21 @@ pub async fn get_job(
     Ok(json_response(StatusCode::OK, dto))
 }
 
+/// AS-2 Caller Request Lookup（ART-04G v3 §5.4）：与 get_job 相同链路的只读查询。
+/// 非法 UUID → 400 稳定原因码；跨 scope 与不存在统一 404（不泄露存在性）。
+pub async fn get_job_by_caller_request(
+    State(state): State<AppState>,
+    req: Scoped,
+    Path(caller_request_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let caller_request_id = parse_path_uuid(&caller_request_id, "caller_request_id")?;
+    let dto = state
+        .artifacts
+        .get_job_by_caller_request(&req.delegation, &req.scope, caller_request_id)
+        .await?;
+    Ok(json_response(StatusCode::OK, dto))
+}
+
 pub async fn cancel_job(
     State(state): State<AppState>,
     req: Scoped,

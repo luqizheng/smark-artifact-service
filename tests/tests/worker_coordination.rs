@@ -1286,9 +1286,10 @@ async fn job_creation_pins_versions_and_is_idempotent(pool: PgPool) {
     assert_eq!(jobs, 1);
 
     // 空输入被拒绝，不会留下永远排不上队的 Job。
-    let err = sqlx::query_as::<_, (Uuid, bool)>(
+    let err = sqlx::query_as::<_, (Uuid, String)>(
         "SELECT * FROM artifact.create_generation_job_with_input \
-         ($1, $2, $3, $4, 'seecode', NULL, NULL, NULL, $5, NULL, 3, 300, 86400)",
+         ($1, $2, $3, $4, 'seecode', NULL, NULL, NULL, $5, NULL, \
+          NULL::uuid, NULL::text, NULL::smallint, 3, 300, 86400)",
     )
     .bind(Uuid::new_v4())
     .bind(TENANT)

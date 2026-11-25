@@ -269,6 +269,7 @@ pub async fn sql_create_job_with(
 }
 
 /// [`sql_create_job_with`] 的可失败版本：供断言数据库拒绝路径的测试使用。
+/// 返回 (job_id, replayed)；replayed 为 caller_request_replay 或 idempotency_replay。
 #[allow(clippy::too_many_arguments)]
 pub async fn try_sql_create_job_with(
     pool: &sqlx::PgPool,
@@ -280,9 +281,42 @@ pub async fn try_sql_create_job_with(
     idempotency_key: Option<&str>,
     request_hash: &str,
 ) -> Result<(Uuid, bool), sqlx::Error> {
-    sqlx::query_as(
+    try_sql_create_job_with_identity(
+        pool,
+        job_id,
+        tenant,
+        project,
+        artifact_id,
+        options,
+        idempotency_key,
+        request_hash,
+        None,
+    )
+    .await
+}
+
+/// AS-2：可指定 caller identity 三元组的创建调用（直接走受控函数 v2）。
+/// `identity = None` 即 legacy 未键控语义。
+#[allow(clippy::too_many_arguments)]
+pub async fn try_sql_create_job_with_identity(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    tenant: Uuid,
+    project: Uuid,
+    artifact_id: Uuid,
+    options: &JobOptions,
+    idempotency_key: Option<&str>,
+    request_hash: &str,
+    identity: Option<(Uuid, &str, i16)>,
+) -> Result<(Uuid, bool), sqlx::Error> {
+    let (caller_request_id, fingerprint, version) = match identity {
+        Some((caller, fingerprint, version)) => (Some(caller), Some(fingerprint), Some(version)),
+        None => (None, None, None),
+    };
+    let (resolved_id, resolution): (Uuid, String) = sqlx::query_as(
         "SELECT * FROM artifact.create_generation_job_with_input \
-         ($1, $2, $3, $4, 'seecode', $5, '{}'::jsonb, '1', $6, $7, $8, $9, $10)",
+         ($1, $2, $3, $4, 'seecode', $5, '{}'::jsonb, '1', $6, $7, \
+          $8, $9, $10, $11, $12, $13)",
     )
     .bind(job_id)
     .bind(tenant)
@@ -291,11 +325,15 @@ pub async fn try_sql_create_job_with(
     .bind(minimal_input())
     .bind(request_hash)
     .bind(idempotency_key)
+    .bind(caller_request_id)
+    .bind(fingerprint)
+    .bind(version)
     .bind(options.max_attempts)
     .bind(options.max_execution_seconds)
     .bind(options.queue_ttl_seconds)
     .fetch_one(pool)
-    .await
+    .await?;
+    Ok((resolved_id, resolution != "created"))
 }
 
 /// 模拟 ART-03D 的输出登记：建一个 READY Version 和一个已通过安全检查的主 Output，

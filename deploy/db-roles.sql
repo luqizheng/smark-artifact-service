@@ -62,6 +62,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "__MIGRATOR_ROLE__" IN SCHEMA artifact
 -- 历史授权给了 UPDATE，这里也按表显式撤销，身份行在运行期不可改写或删除。
 REVOKE UPDATE, DELETE ON artifact.artifact_creation_identity FROM "__APP_ROLE__";
 
+-- AS-2（ART-04G v3 §10.5 / §9.4）：GenerationJob 的写入只允许经受控
+-- SECURITY DEFINER 创建函数。APP 不得直接 INSERT Job 行（否则可绕过受控路径
+-- 伪造 caller identity），也不得直接 UPDATE（caller identity 三列由触发器
+-- 永久不可变，表级 UPDATE 一并撤销）。SELECT 保留：查询/取消协调需要读。
+REVOKE INSERT, UPDATE ON artifact.generation_job FROM "__APP_ROLE__";
+
 -- ── Worker role：最小权限边界 ──────────────────────────────────────────
 -- 迁移对所有函数 REVOKE 了 PUBLIC 的 EXECUTE；这里按函数逐个精确授权，
 -- 不授予任何表 DML、不授予 DDL、不授予 CREATE EXTENSION。
@@ -77,10 +83,12 @@ GRANT EXECUTE ON FUNCTION artifact.confirm_generation_job_cancelled(uuid, uuid, 
 GRANT EXECUTE ON FUNCTION artifact.recover_expired_generation_jobs() TO "__WORKER_ROLE__";
 GRANT EXECUTE ON FUNCTION artifact.purge_expired_generation_job_input() TO "__WORKER_ROLE__";
 
--- API role 需要调用「创建（同事务输入快照）」与「取消协调」两个受控函数；
--- 其余 Worker 专用函数与内部辅助函数不授予 API role。
+-- API role 需要调用「创建（同事务输入快照 + durable caller identity）」与
+-- 「取消协调」两个受控函数；其余 Worker 专用函数、key holder 门禁 helper 与
+-- 内部辅助函数不授予 API role。
 GRANT EXECUTE ON FUNCTION artifact.create_generation_job_with_input(
-    uuid, uuid, uuid, uuid, text, jsonb, jsonb, text, text, text, integer, integer, integer) TO "__APP_ROLE__";
+    uuid, uuid, uuid, uuid, text, jsonb, jsonb, text, text, text,
+    uuid, text, smallint, integer, integer, integer) TO "__APP_ROLE__";
 GRANT EXECUTE ON FUNCTION artifact.request_generation_job_cancel(uuid, uuid, uuid) TO "__APP_ROLE__";
 
 -- 显式兜底：Worker role 不拥有任何业务表的 DML/DDL（即便将来 ALTER DEFAULT PRIVILEGES

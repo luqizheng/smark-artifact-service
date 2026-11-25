@@ -681,3 +681,138 @@ async fn migration_0003_heartbeat_respects_backfilled_deadline(pool: PgPool) {
     assert_eq!(job_status, "retry_wait");
     assert_eq!(code.as_deref(), Some("GENERATION_TIMEOUT"));
 }
+
+// ── AS2-44 / AS2-29：0005 的结构不变量，且不触碰 0003 语义 ─────────────────
+
+/// 0005 只做加法：三列、配对/格式 CHECK、部分唯一索引、身份不可变触发器，
+/// 并把创建函数升级为 16 参 + (job_id, resolution) 返回；0003 的
+/// Idempotency-Key 唯一索引与清洗语义原样保留。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_44_migration_0005_structural_invariants(pool: PgPool) {
+    // 1. 三列存在且类型正确。
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_schema='artifact' AND table_name='generation_job' \
+           AND column_name IN ('caller_request_id','request_fingerprint','fingerprint_version') \
+         ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("caller_request_id".to_string(), "uuid".to_string()),
+            ("fingerprint_version".to_string(), "smallint".to_string()),
+            ("request_fingerprint".to_string(), "character".to_string()),
+        ]
+    );
+
+    // 2. 配对/格式 CHECK 存在并覆盖 version>0 与 64 位小写十六进制。
+    let check_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid='artifact.generation_job'::regclass \
+           AND conname='generation_job_caller_identity_pairing_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(check_def.contains("fingerprint_version > 0"), "{check_def}");
+    assert!(check_def.contains("[0-9a-f]{64}"), "{check_def}");
+
+    // 3. 部分唯一索引：唯一 + 谓词仅限非 NULL。
+    let (indexdef, is_unique): (String, bool) = sqlx::query_as(
+        "SELECT indexdef, indisunique FROM pg_indexes i \
+         JOIN pg_class c ON c.relname = i.indexname \
+         JOIN pg_index x ON x.indexrelid = c.oid \
+         WHERE i.schemaname='artifact' AND i.tablename='generation_job' \
+           AND i.indexname='uq_generation_job_caller_request'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(is_unique);
+    assert!(indexdef.contains("UNIQUE"), "{indexdef}");
+    assert!(
+        indexdef.contains("caller_request_id IS NOT NULL"),
+        "{indexdef}"
+    );
+
+    // 4. 身份不可变由既有触发器函数承担（函数体包含三列不可变判定）。
+    let guard_src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc WHERE oid = 'artifact.guard_job_transition()'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for column in [
+        "caller_request_id",
+        "request_fingerprint",
+        "fingerprint_version",
+    ] {
+        assert!(
+            guard_src.contains(column),
+            "guard_job_transition must enforce immutability of {column}"
+        );
+    }
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger WHERE tgrelid='artifact.generation_job'::regclass \
+           AND NOT tgisinternal",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        trigger_count >= 1,
+        "the transition guard trigger must exist"
+    );
+
+    // 5. 创建函数 v2：16 参、(job_id uuid, resolution text)。
+    let signature: String = sqlx::query_scalar(
+        "SELECT pg_get_function_identity_arguments(oid) \
+         FROM pg_proc WHERE oid = 'artifact.create_generation_job_with_input(\
+         uuid,uuid,uuid,uuid,text,jsonb,jsonb,text,text,text,uuid,text,smallint,integer,integer,integer)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(signature.split(',').count(), 16, "{signature}");
+
+    // 6. 旧 13 参签名必须不存在（避免两条并存路径）。
+    let old_signature_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='artifact' AND p.proname='create_generation_job_with_input' \
+           AND pg_get_function_identity_arguments(p.oid) = \
+               'uuid, uuid, uuid, uuid, text, jsonb, jsonb, text, text, text, integer, integer, integer')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !old_signature_exists,
+        "the 0003-era 13-arg function must be dropped"
+    );
+
+    // 7. AS2-29：0003 的 Idempotency-Key 唯一索引原样保留（0005 未触碰）。
+    let key_index: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname='artifact' \
+           AND tablename='generation_job' AND indexname='uq_generation_job_idempotency_key'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let key_index = key_index.expect("0003 idempotency-key unique index must survive 0005");
+    assert!(
+        key_index.contains("idempotency_key IS NOT NULL"),
+        "{key_index}"
+    );
+
+    // 8. 历史 Job 不回填：迁移前后 legacy 身份保持 NULL（新库无行，同样成立）。
+    let backfilled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfilled, 0);
+}

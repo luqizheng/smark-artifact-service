@@ -331,8 +331,22 @@ impl ArtifactClient {
         .await
     }
 
-    // ── HTTP 基元 ──────────────────────────────────────────────────────
+    /// AS-2 Caller Request Lookup（ART-04G v3 §5.4/§5.6）：按 caller_request_id
+    /// 解析回已存在的 Job。与 GET Job 同链路（delegation + X-Project-Id）；
+    /// 跨 scope 与不存在统一 404（`RESOURCE_NOT_FOUND`）。
+    pub async fn get_generation_job_by_caller_request(
+        &self,
+        caller_request_id: Uuid,
+        ctx: &CallContext,
+    ) -> Result<GenerationJobResponse, SdkError> {
+        self.get(
+            &format!("/v1/generation-jobs/by-caller-request/{caller_request_id}"),
+            ctx,
+        )
+        .await
+    }
 
+    // ── HTTP 基元 ──────────────────────────────────────────────────────
     async fn get<T: DeserializeOwned>(&self, path: &str, ctx: &CallContext) -> Result<T, SdkError> {
         let res = self
             .request(

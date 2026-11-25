@@ -72,8 +72,15 @@ impl ErrorEnvelope {
             "RESOURCE_NOT_FOUND" => 404,
             "VERSION_CONFLICT"
             | "IDEMPOTENCY_KEY_REUSED"
+            | "CALLER_REQUEST_ID_REUSED"
             | "ARTIFACT_KEY_CONFLICT"
             | "ARTIFACT_KEY_LEGACY_UNVERIFIABLE" => 409,
+            "INVALID_IDEMPOTENCY_KEY" => 400,
+            // ART-04G v3 §9.2.2：指纹版本不匹配与 key 交叉身份是 5xx 完整性错误，
+            // 失败关闭，不可重试（retryable() 已排除）；显式映射为 500。
+            "CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH" | "IDEMPOTENCY_KEY_CROSS_IDENTITY" => {
+                500
+            }
             "PAYLOAD_TOO_LARGE" => 413,
             "UNSUPPORTED_MEDIA_TYPE" => 415,
             "GENERATOR_VALIDATION_FAILED" => 422,
