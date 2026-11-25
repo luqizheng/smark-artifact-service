@@ -1,6 +1,15 @@
 # ART-03B-02 — Worker 执行进程生命周期设计（草稿，待评审）
 
-> 状态：**草稿（draft）**，供设计评审；评审通过前不实施任何代码改动。
+> 状态：**SUPERSEDED / 已被 v2 取代（2026-11-25）**。
+> 本稿经架构评审结论为 **Changes Required / 打回重设计**（状态机不闭合、数据库终态语义理解错误、进程树回收保障不足、终态提交不确定性未处理、重复执行副作用边界不清晰）。
+> **v2 为新的设计基线**，见：
+> - `ART-03B-02-worker-process-lifecycle-design-v2.md`（主设计）
+> - `ART-03B-02-state-transition-matrix-v2.md`（状态转换矩阵）
+> - `ART-03B-02-failure-scenarios-v2.md`（故障场景分析）
+> - `ART-03B-02-test-strategy-v2.md`（测试策略）
+> - `ART-03B-02-decision-record-v2.md`（决策记录与反向审查）
+>
+> 本文件仅保留历史记录，其内容**不再具有设计效力**；其中与 v2 冲突之处（如 §4 D3 "deadline_exceeded → fail(GENERATION_TIMEOUT)" 的二次提交缺陷、§7 待裁 5）一律以 v2 为准。
 > 关联：`ART-03A-job-worker-svg-decisions-v1.md`（尤其 §11 A3A-09~22）、`ART-03B-01-IMPLEMENTATION-REPORT.md`、迁移 `0002/0003`、`deploy/db-roles.sql`。
 > 基线：main `c11e79a51a145ded026632630bb0b52aa44dc311`（PR #3 已合并，CI success，迁移校验一致）。
 
