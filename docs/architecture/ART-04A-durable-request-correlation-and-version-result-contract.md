@@ -191,3 +191,17 @@ ART-04A does not:
 - close LMMS delegation, File Service upload/finalize, or ART-03B-02/03 runtime lifecycle blockers.
 
 **Approval status remains Draft / Changes Required / Not approved for implementation until this contract is reviewed and the API/data-model feasibility is verified.**
+
+
+## 7. Repository fit check (static inspection, 2026-11-25)
+
+The proposal is grounded in the current `main` schema/model, but the required behavior is not implemented:
+
+- `artifact.generation_job.target_version_id` already exists and is nullable; its composite foreign key constrains any non-null target to the same Artifact/tenant/project.
+- `GenerationJob.target_version_id` already exists in the Rust domain model as `Option<Uuid>`.
+- The public `GenerationJobResponse` DTO and OpenAPI schema omit this field.
+- `artifact.idempotency_record` is a separate table whose `expires_at` defaults to 24 hours; it is not a durable caller-operation ledger.
+- The current `create_generation_job_with_input` DB function accepts request_hash and idempotency_key but does not accept caller_request_id or target_version_id.
+- The current SeeCode generation path remains unavailable/fail-closed, so the actual point at which a target Version is allocated cannot yet be verified against a working end-to-end generator.
+
+Consequently, ART-04A is an additive contract proposal, not evidence of a working recovery path. During implementation, the team must inspect the complete create/commit transaction and prove that the caller_request_id uniqueness record and Job row commit atomically, and that the target Version is allocated exactly once and remains stable through retries, cancellation, and completion.
