@@ -225,7 +225,8 @@ async fn as2_09_replay_after_commit_returns_same_job(pool: PgPool) {
 //      pg_terminate_backend 终止并等待 backend 真正退出。
 //   B. INSERT 已执行、COMMIT 前终止：显式 BEGIN + 函数返回 'created' 证明
 //      INSERT 已执行，不提交，由独立管理连接终止 backend。
-//   C. COMMIT 成功后终止（响应丢失）：已提交数据必须完整持久化且可重放。
+//   C. COMMIT 成功且客户端已收到确认后终止连接：验证已提交数据完整持久化且可重放；
+//      这不是 COMMIT 响应丢失/结果未知的网络故障注入。
 //
 // 共同纪律：pg_terminate_backend() 返回 true 不等于事务已经结束——必须轮询
 // pg_stat_activity 确认目标 backend 进程真正退出后，才以独立连接检查数据库
@@ -359,7 +360,7 @@ async fn as2_10b_termination_before_commit_rolls_back(pool: PgPool) {
     assert_eq!(job_count(&pool).await, 1);
 }
 
-// ── 阶段 C：COMMIT 后终止（响应丢失） ───────────────────────────────────
+// ── 阶段 C：COMMIT 已确认后终止连接（持久化与重放验证） ─────────────────
 
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_10c_termination_after_commit_is_durable_and_replayable(pool: PgPool) {
@@ -367,7 +368,8 @@ async fn as2_10c_termination_after_commit_is_durable_and_replayable(pool: PgPool
     let spec = Spec::caller(artifact, CALLER_A, &fp_a()).with_key("K12");
     let job_id = Uuid::new_v4();
 
-    // 创建 Job 并成功 COMMIT；随后终止客户端连接（模拟响应丢失）。
+    // 创建 Job 并收到成功 COMMIT 确认；随后终止连接。此测试验证提交后的持久化与重放，
+    // 不模拟 COMMIT 响应在网络中丢失或客户端结果未知。
     let mut victim = pool.acquire().await.unwrap();
     let (victim_pid, victim_started) = backend_identity(&mut victim).await;
     sqlx::query("BEGIN").execute(&mut *victim).await.unwrap();
