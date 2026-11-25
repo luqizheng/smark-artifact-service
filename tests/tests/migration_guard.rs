@@ -3,11 +3,16 @@
 //!   * 每个迁移文件都必须在清单里（新增迁移在同一个 PR 里加一行）；
 //!   * Mermaid seed 删除幂等，SeeCode 保留且 unavailable；
 //!   * 0002 / 0003 的结构与约束存在；
-//!   * 0003 能在 0002 已造成损坏数据的库上升级并自动修复。
+//!   * 0003 能在 0002 已造成损坏数据的库上升级并自动修复；
+//!   * 0002 → 0003 的 deadline 回填：历史活跃 Attempt 获得 deadline、租约被夹紧，
+//!     已过期的 deadline 由 recovery 立即按 GENERATION_TIMEOUT 收尾（场景 A/B/C）。
 
 mod common;
 
-use artifact_application::WorkerCoordinationPort;
+use artifact_application::{HeartbeatOutcome, WorkerCoordinationPort};
+use artifact_domain::AttemptState;
+use artifact_infrastructure::postgres::PgWorkerCoordination;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPool;
@@ -365,4 +370,314 @@ async fn migration_0003_repairs_damage_left_by_0002(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(remaining, 0);
+}
+
+// ── 0002 → 0003 的 deadline 回填回归（场景 A/B/C） ──────────────────────
+//
+// 三个场景都真实经过迁移路径：先只应用 0001+0002 并用 0002 的受控函数构造数据，
+// 再应用 0003 后断言——而不是在最终形态的库上手工设置 deadline。
+
+/// 布景：只应用 0001+0002（不含 0003），建 artifact 并把 seecode 临时置为 available
+/// （0002 时代的注册表没有 adapter_version）。返回 artifact id。
+async fn apply_0001_and_0002(pool: &PgPool) -> Uuid {
+    sqlx::raw_sql(include_str!("../../migrations/0001_init.sql"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../../migrations/0002_job_coordination.sql"))
+        .execute(pool)
+        .await
+        .unwrap();
+    let artifact =
+        common::sql_insert_artifact(pool, common::TENANT, common::PROJECT_1, "deadline").await;
+    sqlx::query(
+        "UPDATE artifact.generator_registry SET status = 'available' \
+         WHERE generator_id = 'seecode'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    artifact
+}
+
+/// 按 0002 的受控函数签名创建 queued Job（input_sha256 由调用方自报）。
+async fn create_job_under_0002(pool: &PgPool, artifact: Uuid, max_attempts: i32) -> Uuid {
+    let requested = Uuid::new_v4();
+    let created: Uuid = sqlx::query_scalar(
+        "SELECT artifact.create_generation_job_with_input \
+         ($1, $2, $3, $4, 'seecode', '{}'::jsonb, '{}'::jsonb, '1', \
+         $5, $5, NULL, $6)",
+    )
+    .bind(requested)
+    .bind(common::TENANT)
+    .bind(common::PROJECT_1)
+    .bind(artifact)
+    .bind("a".repeat(64))
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(created, requested);
+    created
+}
+
+/// 0002 的 claim：返回 (job_id, attempt_id, lease_token 明文)。
+async fn claim_under_0002(pool: &PgPool, worker: &str, lease_seconds: i32) -> (Uuid, Uuid, String) {
+    sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        "SELECT job_id, attempt_id, lease_token FROM artifact.claim_generation_job($1, $2)",
+    )
+    .bind(worker)
+    .bind(lease_seconds)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn apply_0003(pool: &PgPool) {
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0003_job_coordination_fixes.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn coordination(pool: &PgPool) -> PgWorkerCoordination {
+    PgWorkerCoordination { pool: pool.clone() }
+}
+
+/// 场景 A：迁移时仍 running 的历史 Attempt 获得 deadline，租约被限制在 deadline 以内。
+#[sqlx::test]
+async fn migration_0003_backfills_deadline_for_active_attempts(pool: PgPool) {
+    let artifact = apply_0001_and_0002(&pool).await;
+
+    // 长租约（0002 允许 1..=3600 秒）：远超 deadline，迁移后必须被夹紧。
+    let long_job = create_job_under_0002(&pool, artifact, 3).await;
+    let (claimed, long_attempt, _) = claim_under_0002(&pool, "long-lease", 3600).await;
+    assert_eq!(claimed, long_job);
+    // 短租约：本来就在 deadline 之内，必须保持原值。
+    let short_job = create_job_under_0002(&pool, artifact, 3).await;
+    let (_, short_attempt, _) = claim_under_0002(&pool, "short-lease", 30).await;
+    let _ = short_job;
+
+    let short_lease_before: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT lease_expires_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(short_attempt)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // 迁移前没有 deadline 列（0002 无该列），活跃 Attempt 自然也没有 deadline。
+    let deadline_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'artifact' \
+           AND table_name = 'generation_job_attempt' AND column_name = 'deadline_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deadline_columns, 0, "fixture: 0002 has no deadline column");
+
+    apply_0003(&pool).await;
+
+    for attempt_id in [long_attempt, short_attempt] {
+        let (deadline, lease, started): (Option<DateTime<Utc>>, DateTime<Utc>, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT deadline_at, lease_expires_at, started_at \
+                 FROM artifact.generation_job_attempt WHERE id = $1",
+            )
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let deadline = deadline.expect("deadline must be backfilled for an active attempt");
+        // deadline = started_at + max_execution_seconds（0002 时代的 Job 迁移后默认 300 秒）。
+        assert_eq!(deadline - started, chrono::Duration::seconds(300));
+        assert!(lease <= deadline, "the lease must not exceed the deadline");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM artifact.generation_job_attempt WHERE id = $1")
+                .bind(attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running", "a valid attempt survives the migration");
+        let job_status: String = sqlx::query_scalar(
+            "SELECT j.status FROM artifact.generation_job j \
+             JOIN artifact.generation_job_attempt a ON a.job_id = j.id WHERE a.id = $1",
+        )
+        .bind(attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(job_status, "running");
+    }
+
+    // 长租约被夹到 deadline（LEAST 生效）；短租约保持不变。
+    let (long_lease, long_deadline): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_expires_at, deadline_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(long_attempt)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        long_lease, long_deadline,
+        "the 3600s lease must be clamped to the deadline"
+    );
+    let short_lease_after: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT lease_expires_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(short_attempt)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        short_lease_after, short_lease_before,
+        "a lease already within the deadline must be untouched"
+    );
+}
+
+/// 场景 B：迁移前已超过最大执行时长的活跃 Attempt（0002 语义下 Worker 一直 heartbeat，
+/// 租约仍有效），迁移后由 recovery 立即按 GENERATION_TIMEOUT 收尾。
+#[sqlx::test]
+async fn migration_0003_expired_deadline_attempts_time_out_via_recovery(pool: PgPool) {
+    let artifact = apply_0001_and_0002(&pool).await;
+    let job = create_job_under_0002(&pool, artifact, 1).await;
+    let (_, attempt_id, _) = claim_under_0002(&pool, "worker-a", 30).await;
+
+    // started_at 在 10 分钟前、租约仍有效：deadline（默认 300 秒）已在过去。
+    sqlx::query(
+        "UPDATE artifact.generation_job_attempt \
+         SET started_at = now() - interval '10 minutes', \
+             lease_expires_at = now() + interval '30 minutes' \
+         WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_0003(&pool).await;
+
+    // 迁移把租约夹到已过期的 deadline：recovery 必须能立即处理。
+    let (deadline, lease): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT deadline_at, lease_expires_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        deadline < Utc::now(),
+        "fixture: the deadline must already be past"
+    );
+    assert_eq!(
+        lease, deadline,
+        "the lease must be clamped to the past deadline"
+    );
+
+    assert_eq!(coordination(&pool).recover_expired().await.unwrap(), 1);
+
+    let (status, code): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_code FROM artifact.generation_job WHERE id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "timed_out");
+    assert_eq!(code.as_deref(), Some("GENERATION_TIMEOUT"));
+    let attempt_status: String =
+        sqlx::query_scalar("SELECT status FROM artifact.generation_job_attempt WHERE id = $1")
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let state = AttemptState::parse(&attempt_status).expect("valid attempt status");
+    assert_eq!(state, AttemptState::TimedOut);
+    assert!(!state.is_active(), "the attempt must no longer be active");
+}
+
+/// 场景 C：deadline 未到的历史 Attempt 可以正常续租但不越过 deadline；
+/// deadline 过后不能再续租（heartbeat 返回 deadline_exceeded 并原地收尾为超时）。
+#[sqlx::test]
+async fn migration_0003_heartbeat_respects_backfilled_deadline(pool: PgPool) {
+    let artifact = apply_0001_and_0002(&pool).await;
+    let job = create_job_under_0002(&pool, artifact, 3).await;
+    let (_, attempt_id, token) = claim_under_0002(&pool, "worker-a", 30).await;
+
+    // 租约与 deadline 都在未来。
+    sqlx::query(
+        "UPDATE artifact.generation_job_attempt \
+         SET started_at = now(), lease_expires_at = now() + interval '10 seconds' \
+         WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_0003(&pool).await;
+    let c = coordination(&pool);
+
+    // deadline 之内正常续租。
+    assert_eq!(
+        c.heartbeat(job, attempt_id, &token, 30).await.unwrap(),
+        HeartbeatOutcome::Renewed
+    );
+    let (lease, deadline): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_expires_at, deadline_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(lease <= deadline);
+
+    // 申请远超 deadline 的续租：被夹到 deadline，而不是无限延长。
+    assert_eq!(
+        c.heartbeat(job, attempt_id, &token, 3600).await.unwrap(),
+        HeartbeatOutcome::Renewed
+    );
+    let (lease, deadline): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_expires_at, deadline_at FROM artifact.generation_job_attempt WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lease, deadline, "renewal must be capped at the deadline");
+
+    // deadline 过后不能再续租：heartbeat 不续租并原地收尾为超时。
+    sqlx::query(
+        "UPDATE artifact.generation_job_attempt \
+         SET started_at = now() - interval '6 minutes', \
+             deadline_at = now() - interval '1 second', \
+             lease_expires_at = now() - interval '1 second' \
+         WHERE id = $1",
+    )
+    .bind(attempt_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        c.heartbeat(job, attempt_id, &token, 30).await.unwrap(),
+        HeartbeatOutcome::DeadlineExceeded
+    );
+    let attempt_status: String =
+        sqlx::query_scalar("SELECT status FROM artifact.generation_job_attempt WHERE id = $1")
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempt_status, "timed_out");
+    // Job 进入退避等待重试（max_attempts = 3）。
+    let (job_status, code): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_code FROM artifact.generation_job WHERE id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(job_status, "retry_wait");
+    assert_eq!(code.as_deref(), Some("GENERATION_TIMEOUT"));
 }

@@ -13,7 +13,8 @@
 --   4. 运行中的 Worker 无法感知取消请求；
 --   5. complete 可以在没有任何 READY Version / Output 的情况下把 Job 置为 succeeded；
 --   6. Job 创建不固定 generator / adapter 版本、没有幂等约束、接受空输入、排队无时限；
---   7. Worker 侧的状态演进不写审计；claim 排序没有索引支撑；错误码没有约束。
+--   7. Worker 侧的状态演进不写审计；claim 排序没有索引支撑；错误码没有约束；
+--   8. 0002 遗留的活跃 Attempt 没有 deadline，可以无限续租绕过执行上限。
 
 -- ── ① 结构：新增列 ─────────────────────────────────────────────────────
 
@@ -34,6 +35,23 @@ UPDATE artifact.generation_job_attempt
        error_code = coalesce(error_code, 'LEASE_EXPIRED')
  WHERE status IN ('claimed', 'running')
    AND lease_expires_at IS NULL;
+
+-- 0002 遗留的活跃 Attempt 没有 deadline（0002 无该列），而 heartbeat 只在 deadline 非 NULL
+-- 时检查执行时限：旧 Attempt 可以无限续租。为迁移时仍活跃（claimed/running）的 Attempt
+-- 按 Job 的 max_execution_seconds 回填 deadline，并把租约限制在 deadline 以内。
+-- 必须在 NULL 租约修复之后执行：那批 Attempt 已被置为 lease_expired，不会被这里触碰。
+-- 回填后 deadline 已过去的 Attempt，租约同样被夹到过去，恢复扫描会立即处理：
+-- 租约与 deadline 重合（Worker 存活到时限）按 GENERATION_TIMEOUT 收尾；
+-- 租约先于 deadline 失效的按 LEASE_EXPIRED（Worker 失联）归类，与 A3A-12 一致。
+UPDATE artifact.generation_job_attempt AS a
+   SET deadline_at = a.started_at + make_interval(secs => j.max_execution_seconds::double precision),
+       lease_expires_at = LEAST(
+           a.lease_expires_at,
+           a.started_at + make_interval(secs => j.max_execution_seconds::double precision))
+  FROM artifact.generation_job AS j
+ WHERE j.id = a.job_id
+   AND a.status IN ('claimed', 'running')
+   AND a.deadline_at IS NULL;
 
 -- 没有任何活跃 Attempt 却仍是 running 的 Job：还能重试的回到队列，其余收尾。
 UPDATE artifact.generation_job
@@ -160,7 +178,8 @@ $$;
 
 -- Attempt 失败后的统一收尾：更新 Attempt，按重试策略推进 Job，并写审计。
 -- 调用方必须已经锁定 Attempt 与 Job 行。返回 Job 的下一个状态。
--- 退避：第 n 次失败后等待 min(5s × 2^(n-1), 300s) × [0.8, 1.2)；等不到的下一次重试直接终结。
+-- 退避：第 n 次失败后等待 min(5s × 2^(n-1), 300s)，无 jitter（A3A-10 的确认公式）；
+-- 等不到的下一次重试直接终结。
 CREATE FUNCTION artifact.settle_failed_attempt(
     p_job            artifact.generation_job,
     p_attempt_id     uuid,
@@ -192,8 +211,7 @@ BEGIN
      WHERE id = p_attempt_id;
 
     IF coalesce(p_retryable, false) AND p_job.attempt_count < p_job.max_attempts THEN
-        v_delay := LEAST(5.0 * power(2, greatest(p_job.attempt_count - 1, 0)), 300.0)
-                   * (0.8 + random() * 0.4);
+        v_delay := LEAST(5.0 * power(2, greatest(p_job.attempt_count - 1, 0)), 300.0);
         v_next_at := v_now + make_interval(secs => v_delay);
         IF p_job.expires_at IS NULL OR v_next_at < p_job.expires_at THEN
             UPDATE artifact.generation_job

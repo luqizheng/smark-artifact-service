@@ -7,8 +7,9 @@
 > 范围声明：本切片只做 Migration、Attempt/Lease、受控函数、Worker 骨架、权限与部署基础；
 > **不实现** SeeCode / Mermaid / Node / File Service / SVG Sanitizer，不开放生产生成路径。
 >
-> **阅读提示**：§1 至 §11 记录迁移 0002 切片的原始实现。合并后的评审发现其中若干缺陷，
-> 由迁移 0003 修复，见 §12；两者不一致时以 §12 为准。
+> **阅读提示**：§1 至 §11 记录迁移 0002 切片的原始实现（历史状态，非当前事实）。合并后的
+> 评审发现其中若干缺陷，由迁移 0003 修复——第一轮见 §12.1，第二轮（PR #3 review）见 §12.2；
+> 与历史描述不一致时以 §12 为准。
 
 ## 0. 实施前检查结论
 
@@ -168,18 +169,20 @@
   5. SVG 安全签收未实现。
 - 本切片**不引入** Redis 或第二套 Job 权威状态源；**不增加**任何生产绕过开关；**未解除**任何 P0 门禁。
 
-## 11. 已知问题与未关闭风险（0002 切片当时的状态）
+## 11. 已知问题与未关闭风险（0002 切片当时的状态；历史记录，非当前事实）
 
-- （已由 §12 取代）`deploy/docker-compose.yml` 基础文件在本次会话中读取被审批拦截，未修改；Worker 以 `docker-compose.worker.yml` override 形式提供独立服务，使用时需 `-f` 同时指定两份文件。**未验证基础 compose 中 postgres 服务名/网络是否与 override 完全一致**（本地 dev PG 为独立容器，非 compose 启动）。CI 未跑 docker compose 集成。
+- **历史状态，已解决**：0002 切片当时 compose 未做任何验证（基础文件在当时的会话中读取被审批拦截）。0003 轮已在全新卷上完成 compose 全栈启动验证（postgres → migrate → db-grants → api / worker，角色授权、Worker 维护循环与 SIGTERM 退出均核对，见 §12）；CI 现在校验 compose 配置并构建/冒烟 Worker 镜像。
 - （部分解决，见 §12）输入校验为"通用结构上限 + 禁字段"规则集；SeeCode 专用 JSON Schema（字段/枚举/必填）冻结属 ART-03A 验收项，本切片以结构规则近似，未做 schema golden tests。
 - `VALID_JSON` 通用提取器仍允许 8 MiB，只有生成端点走 256 KiB 专用提取器；符合"生成 envelope 256 KiB"要求，其他端点不受影响。
-- （已由 §12 取代）Worker 领取后因无 Adapter 立即以 `GENERATOR_ADAPTER_NOT_IMPLEMENTED`（不可重试）fail；这是诚实的骨架行为，避免伪造成功，但也意味着生产一旦放开 generator=available 会快速耗尽 attempt——**必须在 Adapter 就绪后再放开 generator 状态**。
+- **历史状态，风险已消除**：0002 切片的 Worker 领取 Job 后因无 Adapter 立即以 `GENERATOR_ADAPTER_NOT_IMPLEMENTED`（不可重试）fail——当时若放开 generator=available 会快速耗尽 attempt。0003 之后数据库按 adapter 版本匹配领取，本切片的 Worker 不申报任何能力，领不到任何 Job，该风险不再存在；**仍须在 Adapter 就绪后再放开 generator 状态**（当前生产 seed 保持 unavailable）。
 
-## 12. 评审修复（迁移 0003）
+## 12. 评审修复（迁移 0003，两轮）
 
-> 状态：**已实现 + 已本地测试**。CI 结果以对应 PR 的检查为准。
+> 状态：**已实现 + 已本地测试**。CI 结果以 PR #3 的检查为准。
 > 裁决依据：`ART-03A-job-worker-svg-decisions-v1.md` §11。
-> 0001、0002 未改写，内容哈希由 `migrations.sha256` 锁定。
+> 0001、0002 未改写，内容哈希由 `migrations.sha256` 锁定；0003 在合并前（PR #3）按评审意见就地修订，清单在同一次提交中更新。
+
+### 12.1 第一轮修复
 
 评审指出的问题逐项处置如下。验证一列是覆盖它的自动化测试；标为"实测"的项另在一次性 PostgreSQL 16 容器或 compose 栈上验证过。
 
@@ -216,7 +219,7 @@
 - 环境变量 `ARTIFACT_WORKER_LEASE_SECONDS` 与 `ARTIFACT_WORKER_POLL_INTERVAL_MS` 已移除，新增 `ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS`。租约秒数由执行循环（ART-03B-02）作为 claim 参数传入。
 - `deploy/initdb/01-roles.sh` 已删除。部署顺序固定为迁移、执行 `deploy/db-roles.sql`、启动服务；compose 环境由 `db-grants` 服务完成第二步。
 
-本地验证：
+第一轮验证（0003 初版）：
 
 | 检查 | 结果 |
 |---|---|
@@ -225,10 +228,54 @@
 | `cargo test --workspace`（并行，PG 16 容器 `artifact-dev-pg`） | 83 通过，0 失败 |
 | compose 栈（postgres、migrate、db-grants、api、worker） | 全新卷一次启动成功；角色权限矩阵与预期一致；可领取的 Job 未被 Worker 领走；排队超时的 Job 被维护循环收尾；`docker stop` 以 0 退出 |
 
+### 12.2 第二轮评审修复（PR #3 review）
+
+> 0003 尚未合并，本轮按评审意见就地修订 0003 并补充迁移回归测试；0001、0002 未改写。
+
+**P1 — 历史活跃 Attempt 的 deadline 回填。** 0002 的活跃 Attempt 没有 deadline（0002 无该列），而 heartbeat 只在 deadline 非 NULL 时检查执行时限：旧 Attempt 可以无限续租，绕过执行上限。0003 现在为迁移时仍处于 `claimed`/`running` 的 Attempt 回填：
+
+- `deadline_at = started_at + max_execution_seconds`（经 Job 关联取得；0002 时代的 Job 迁移后默认 300 秒）；
+- `lease_expires_at = LEAST(lease_expires_at, deadline_at)`；
+- 回填在 NULL 租约修复之后执行：那批 Attempt 已被置为 `lease_expired`，不会被回填触碰，0002 数据修复逻辑不受影响；
+- 回填后 deadline 已过去的 Attempt，租约同被夹到过去，recovery 立即处理——Worker 存活到时限的按 `GENERATION_TIMEOUT` 收尾（Job 为 `timed_out`），租约先于 deadline 失效的按 `LEASE_EXPIRED`（Worker 失联）归类，与 A3A-12 的分类规则一致。
+
+回归测试（真实 0002 → 0003 迁移路径：先只应用 0001+0002 并用 0002 的受控函数构造数据，再应用 0003 后断言；见 `tests/tests/migration_guard.rs`）：
+
+| 场景 | 断言 |
+|---|---|
+| A `migration_0003_backfills_deadline_for_active_attempts` | 迁移前无 deadline 列；迁移后活跃 Attempt 的 deadline 非 NULL 且等于 started_at + 300s；3600 秒的长租约被夹到 deadline，30 秒的短租约不变；Job/Attempt 仍 running |
+| B `migration_0003_expired_deadline_attempts_time_out_via_recovery` | 迁移前 started_at 已超过 300 秒而租约仍有效；迁移把租约夹到已过期的 deadline；recovery 立即收尾：Job `timed_out` / `GENERATION_TIMEOUT`，Attempt 变为 `timed_out`（不再 active） |
+| C `migration_0003_heartbeat_respects_backfilled_deadline` | 迁移后 heartbeat 正常续租且不超过 deadline；申请 3600 秒续租被夹到 deadline；deadline 过后 heartbeat 返回 `deadline_exceeded`，Attempt `timed_out`，Job 进入退避（`GENERATION_TIMEOUT`） |
+
+**退避策略对齐。** 移除实现中未经确认的 ±20% jitter，按已确认公式执行：第 n 次失败后等待 `min(5s × 2^(n−1), 300s)`。`ART-03A` A3A-10 已同步修订。确认的默认值：
+
+- Queue TTL：24 小时；
+- 单次执行时限：300 秒；
+- Retry backoff：5 秒指数增长，上限 300 秒，无 jitter；
+- Retryable errors：仅 `GENERATION_TIMEOUT`、`STORAGE_UNAVAILABLE`。
+
+**当前事实与历史状态的区分。** 为避免把实施过程误读为当前能力：
+
+- 当前 Worker 不领取任何 Job（不申报 adapter 能力）；0002 切片"领取后立即失败"是历史行为（见 §11）。
+- API 层仍未接通实际 Job 创建流程：生成请求在输入校验后仍 fail-closed（503 `GENERATOR_UNAVAILABLE`），不产生 Job。数据库受控创建函数 `create_generation_job_with_input` 已实现并有测试，**不代表 API 创建路径已启用**。
+- `GenerationJob` 响应新增字段与 409 / 413 需要 ART-01 errata 正式确认，**尚未确认**。
+- compose 全栈已在全新卷上验证（见 12.1 的验证表）；CI 校验 compose 配置、构建并冒烟 Worker 镜像，发布流程推送 Worker 镜像。
+
+**Migration 清单与 CI。** `migrations.sha256` 锁定 0001/0002/0003；CI 以 `sha256sum -c` 校验，测试 `released_migrations_are_unchanged` 用同一份清单再校验一次，并拒绝未列入清单的迁移。本轮修订后三个哈希均与清单一致，0001、0002 相对已推送基线无改动。
+
+第二轮验证：
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过，0 告警 |
+| `cargo test --workspace`（并行，PG 16 容器 `artifact-dev-pg`） | 86 通过，0 失败（含场景 A/B/C 迁移回归） |
+| `sha256sum -c migrations.sha256` | 0001/0002/0003 全部一致；0001、0002 与已合并基线相同 |
+| compose `config` 与全新卷启动 | 通过：基础与 override 组合的 config 校验通过；全新卷栈 postgres → migrate（0001–0003 全部成功，含本轮修订后的 0003）→ db-grants（exit 0）→ api（约 2 秒就绪）→ worker（coordination-only）；函数授权矩阵 worker 7 / app 2 / public 0；`docker stop` 以 0 退出 |
+
 仍未解决（不在本次修复范围）：
 
 - SeeCode 输入 schema 冻结之前，`diagram` 内部没有逐字段的 allowlist（A3A-22）。在那之前 Adapter 不得把原始 JSON 直接交给 CLI。
-- `GenerationJob` 的新增字段与 409、413 需要 ART-01 errata 确认。
 - 注册表里 seecode 的 `supported_input_formats` 仍是 `vizspec`，版本仍是 `0.0.0`，等输入 schema 冻结与 vendor 引入时一并更新。
-- 排队时限、退避参数与最大执行时长的默认值是否需要按生成器配置，尚未裁决。
+- 排队时限、退避参数与最大执行时长的默认值已确认（见上），是否需要按生成器配置尚未裁决。
 - Worker 的执行循环、强杀与容器隔离（ART-03B-02、ART-03B-03）。

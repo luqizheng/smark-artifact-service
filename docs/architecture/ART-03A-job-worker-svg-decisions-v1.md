@@ -248,7 +248,7 @@ ART-03B-01（迁移 0002）评审发现 §3 至 §5 的部分裁决没有落到�
 | ID | 主题 | 裁决 |
 |---|---|---|
 | A3A-09 | 租约参数 | `lease_seconds` 必填且在 1..3600；活跃 Attempt 的 `lease_expires_at` 必须非空（数据库 CHECK）。0002 对 NULL 的放行会产生永久 running、既不能恢复也不能取消的 Job |
-| A3A-10 | 重试退避 | `retry_wait` 的 Job 在 `next_attempt_at` 之前不会被领取。第 n 次失败后的等待为 min(5s × 2^(n−1), 300s) × [0.8, 1.2)；等不到的下一次重试直接终结 |
+| A3A-10 | 重试退避 | `retry_wait` 的 Job 在 `next_attempt_at` 之前不会被领取。第 n 次失败后的等待为 min(5s × 2^(n−1), 300s)，无 jitter；等不到的下一次重试直接终结 |
 | A3A-11 | 重试白名单 | 只有 `GENERATION_TIMEOUT` 与 `STORAGE_UNAVAILABLE` 可重试；Worker 自报的 `retryable` 不能扩大范围。租约过期（Worker 失联）按 attempt 上限重试 |
 | A3A-12 | 最大执行时长 | 每个 Attempt 的 `deadline_at = started_at + max_execution_seconds`（Job 创建时固定，1..3600 秒，默认 300）。租约不会超过 deadline；超过后 heartbeat 不再续租，Attempt 按 `timed_out` 收尾 |
 | A3A-13 | 取消可见性 | heartbeat 返回 `renewed / cancel_requested / deadline_exceeded / stale`；fail 与 complete 返回 `cancel_requested`。取消属于控制流，用返回值表达，不用异常；取消检查在租约校验之后，错误 token 一律 `stale` |
