@@ -47,8 +47,8 @@
 3. 锁定 Job 行；
 4. 验证 Job 仍为 running；
 5. 若 cancel_requested_at IS NOT NULL，返回 cancel_requested，不检查/延长 Lease、不更新 heartbeat、不调用 settlement；
-6. 否则才检查 Lease 是否过期；过期返回 stale；
-7. 其后再执行 deadline settlement / 正常续租的最终顺序，必须由 DB-BLOCKER-02 时间契约复核。
+6. 否则先按既有语义检查 deadline；已到 deadline 则执行 timeout settlement 并返回 deadline_exceeded；
+7. deadline 未到时再检查 Lease；Lease 已过期返回 stale，否则按 DB-BLOCKER-02 时间契约执行正常续租。
 
 第 5 步意味着：即使 lease_expires_at <= database_now，只要 recovery 尚未取得 Attempt 锁并改变 Attempt 状态，持有正确 token 的旧 Worker 仍可能收到 cancel_requested。这**不是租约续期，也不是重新获得执行权**，只授予一个狭窄的、单向的 KillOnly/confirm 收敛机会：
 - 不得 spawn、resume、继续驱动 Executor；
