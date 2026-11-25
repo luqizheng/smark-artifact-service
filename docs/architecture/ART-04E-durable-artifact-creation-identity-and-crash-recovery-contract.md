@@ -300,7 +300,7 @@ V1 policy:
    - Artifact exists without identity, or evidence is inconsistent: keep the row blocked and require operator investigation; do not infer a fingerprint.
 5. Once a completed row is physically deleted, that Idempotency-Key may be used again under the existing retention contract. The durable `artifact_key` still prevents a duplicate logical Artifact and checks the semantic fingerprint.
 6. The cleanup job must not delete or mutate `artifact_creation_identity` rows. Durable identity retention is independent of Idempotency-Key retention.
-7. The cleanup worker must not receive broad table DELETE privileges. Expose a narrowly scoped maintenance function (or equivalent privileged maintenance path) that deletes only completed, expired Idempotency-Key rows in bounded batches under the required row-lock semantics. Revoke PUBLIC execution and grant only the designated maintenance principal. Incomplete-row reconciliation is a separate operator-controlled operation and must not be callable as routine TTL cleanup.
+7. The cleanup worker must not receive broad table DELETE privileges. Expose a narrowly scoped `SECURITY DEFINER` maintenance function (or equivalent privileged maintenance path) that deletes only completed, expired Idempotency-Key rows in bounded batches under the required row-lock semantics. Pin its `search_path`, validate and cap the batch-size argument, revoke PUBLIC execution, and grant only the exact function signature to the designated maintenance principal. Incomplete-row reconciliation is a separate operator-controlled operation and must not be callable as routine TTL cleanup.
 
 The cleanup/reconciliation mechanism, metrics, and operator runbook are required implementation artifacts. The exact cleanup batch size is operational configuration, not an API contract.
 
@@ -432,7 +432,8 @@ All tests below are required before AS-1 can be marked implementation-complete.
 53. The drain procedure records zero in-flight create requests and verifies no old application instance remains before migration.
 54. The database deferred invariant rejects a residual old binary's keyed Artifact insert without a matching identity row.
 55. The new application build remains gated until schema compatibility and atomic keyed-create smoke checks pass.
-56. New and existing-key responses use the frozen 201/200 semantics and a stable resolution indicator/header.
+56. New and existing-key responses use the frozen 201/200 semantics and the `resolution` field or `X-Artifact-Resolution` header.
+57. The idempotency cleanup function is SECURITY DEFINER with pinned search_path, bounded batch size, revoked PUBLIC execution, and exact maintenance-principal EXECUTE grant; the cleanup principal has no broad table DELETE privilege.
 
 
 ## 10. Failure-injection evidence
@@ -459,14 +460,14 @@ Tests must assert database row counts and returned Artifact IDs, not only HTTP s
 4. Implement a single transactional create-or-resolve database/application path.
 5. Change handler ordering so durable key resolution is not blocked by stale Idempotency-Key reservations.
 6. Add conflict recovery using a fresh transaction.
-7. Add API/OpenAPI contract tests and the full 56-case concurrency/crash-injection/retention/cutover suite.
+7. Add API/OpenAPI contract tests and the full 57-case concurrency/crash-injection/retention/cutover suite.
 8. Run an independent review focused on transaction atomicity, legacy behavior, RLS, and failure recovery.
 
 **AS-1 remains not implemented until all acceptance evidence exists.** Completing this document does not approve production code, SeeCode, Worker rollout, or the wider ART-04 implementation. AS-2, AS-3, AS-4, and AI-PM PM-1..PM-3 remain separate gates.
 
 ## 12. Decisions frozen for the next review
 
-1. **HTTP replay semantics:** new Artifact is 201; durable key resolution or completed idempotency replay is 200. Both return the same Artifact representation and an explicit `resolution` field (`created`, `existing_key`, or `idempotency_replay`) if consistent with the API response conventions. If the current response envelope cannot add this field compatibly, use a response header rather than changing existing required fields.
+1. **HTTP replay semantics:** new Artifact is 201; durable key resolution or completed idempotency replay is 200. Both return the same Artifact representation and an explicit `resolution` field (`created`, `existing_key`, or `idempotency_replay`) if consistent with the API response conventions. If the current response envelope cannot add this field compatibly, use the stable `X-Artifact-Resolution` response header rather than changing existing required fields.
 2. **Fingerprint defaults:** canonicalization is computed from the validated DTO after applying deterministic server defaults. Before implementation, record the actual defaults in golden test vectors from `CreateArtifactRequest`; no default may depend on wall-clock time, random values, or request order.
 3. **Old-writer drain:** use the ingress-level POST route pause (or first deploy a gate-capable compatibility release), drain in-flight create requests, remove old instances, apply the migration invariant backstop, verify the new build, and run gated smoke tests as defined in §6.1. If the deployment platform cannot prove these steps, rollout is blocked.
 4. **Idempotency expiry:** `expires_at` is retention eligibility only. Completed rows are replayable until physically deleted by the locked cleanup process; incomplete rows are never TTL-deleted and require explicit post-drain reconciliation under §6.2.
