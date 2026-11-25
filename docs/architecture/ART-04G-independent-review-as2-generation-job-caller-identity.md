@@ -583,7 +583,7 @@ ART-04H 的 C-1 P1 已在文档层给出明确修订方案；C-2..C-5 P2 已纳�
 1. 创建函数必须在任何 caller identity lookup、Idempotency-Key lookup、replay return 或异常块 replay 处理之前，完成当前请求 key 的规范化与长度校验。
 2. 规范化规则与现有 0003 保持一致：`v_key := nullif(btrim(p_idempotency_key), '')`。当 `v_key IS NOT NULL` 时，先校验 `length(v_key) <= 255`；超限使用稳定 token `INVALID_IDEMPOTENCY_KEY` 与 SQLSTATE `22023`。
 3. §9.1 的普通读前查门禁和 unique_violation 异常块门禁，必须统一使用已规范化的 `v_key`，禁止直接使用原始参数 `p_idempotency_key`。建议通过同一 SQL helper 实现；不得出现两处语义漂移。
-4. `v_key IS NULL`（包括 NULL、空字符串或全空白字符串）等价于未提供 Idempotency-Key，跳过 key holder 门禁；caller identity replay 仍可继续。
+4. `v_key IS NULL`（包括 NULL、空字符串或仅由 ASCII 空格 U+0020 组成的字符串）等价于未提供 Idempotency-Key，跳过 key holder 门禁；caller identity replay 仍可继续。必须保持 PostgreSQL `btrim(text)` 的既有精确语义：默认只剥离 U+0020，不得擅自扩展为剥离 HTAB、CR、LF 或全部 Unicode whitespace。HTTP adapter 对字段值的解析/OWS 处理沿用既有 HTTP 层契约，不得与数据库函数的 `btrim` 语义混为一谈。
 5. 该前移不得改变 caller 冲突优先级、key holder 冲突优先级、既有 raw `request_hash` 语义或 generator availability 检查顺序。输入校验先于身份查找，但 generator availability 仍在所有可判定 replay 之后。
 6. 长度校验必须在 replay 与 create 两条路径一致执行，避免已存在 caller identity 的请求通过 replay 分支绕过格式校验。
 
@@ -617,7 +617,7 @@ v1 canonicalizer 应显式递归地按 object key 的 Unicode code point 顺序�
 | ID | 场景 | 预期 |
 |---|---|---|
 | AS2-52 | C-6 key 规范化回归：Job B 已绑定 K2；caller A 的匹配 fingerprint 请求携带 `' K2 '` | 409 IDEMPOTENCY_KEY_REUSED；门禁必须按规范化 `v_key` 命中 Job B |
-| AS2-52a | 空字符串/全空白 key | 等价无 key；匹配 caller identity 时允许 replay |
+| AS2-52a | 空字符串/仅含 ASCII 空格 U+0020 的 key | 等价无 key；匹配 caller identity 时允许 replay；HTAB/CR/LF 不得被数据库函数的 `btrim` 擅自折叠为空 key |
 | AS2-52b | 长度超过 255 的 key | replay 与 create 路径均返回 400 INVALID_IDEMPOTENCY_KEY |
 | AS2-53 | benign interleaving：预置 Job A(caller A, K1)；并发 R1={caller A, F_A, K2} replay 与 R2={caller B, F_B, K2} create；用屏障保证 R1 gate 先于 R2 commit | R1=200 caller replay A；R2=202 created B；K2 最终只绑定 B；无身份/key/hash 改写 |
 
