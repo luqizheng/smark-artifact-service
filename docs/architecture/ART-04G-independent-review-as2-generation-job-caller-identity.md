@@ -225,19 +225,17 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, artifact AS $$
 $$;
 ```
 
-**函数内执行顺序（冻结，P1-3）**：
-1. 输入校验（现函数全量保留：payload 类型/大小、schema 版本、request hash 格式、attempts/执行时长/TTL 上限）；新增：`p_caller_request_id IS NOT NULL` ⇒ `(p_request_fingerprint, p_fingerprint_version)` 必须非空且格式合法；三者必须同空或同非空（DB CHECK 双保险）。
-2. **caller 身份解析**（`p_caller_request_id IS NOT NULL` 时）：按 `(tenant_id, project_id, caller_request_id)` 读前查 → 命中：存储 `fingerprint_version` 与传入版本相等且 hash 相等 ⇒ `RETURN (id, 'caller_request_replay')`；hash 不等 ⇒ `RAISE 'CALLER_REQUEST_ID_REUSED'`；版本不等 ⇒ `RAISE 'CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH'`（失败关闭）。**重放分支不重评 generator 可用性与乐观前置条件**。
-3. **Idempotency-Key 解析**（原逻辑逐字保留）：同 key 同 request_hash ⇒ `RETURN (id, 'idempotency_replay')`；同 key 不同 hash ⇒ `RAISE 'IDEMPOTENCY_KEY_REUSED'`。
-4. **generator registry 检查**（原逻辑保留）：未知 → `UNKNOWN_GENERATOR`；非 available → `GENERATOR_UNAVAILABLE`（生产 fail-closed 门禁不松动）。
+**函数内执行顺序（冻结；本段已按 ART-04H/04I 修订，优先于旧版执行顺序描述）**：
+
+1. **Idempotency-Key 规范化与输入校验（必须最先执行）**：先执行 `v_key := nullif(btrim(p_idempotency_key), '')`；`v_key IS NOT NULL` 时校验 `length(v_key) <= 255`，超限以 SQLSTATE `22023`、稳定消息 `INVALID_IDEMPOTENCY_KEY` 拒绝。该 `btrim` 仅剥离 ASCII SP U+0020，保持 0003 原语义。随后执行现有全量输入校验（payload 类型/大小、schema 版本、request hash 格式、attempts/执行时长/TTL 上限）；新增：`p_caller_request_id IS NOT NULL` ⇒ (`p_request_fingerprint`, `p_fingerprint_version`) 必须非空且格式合法；三者必须同空或同非空（DB CHECK 双保险）。
+2. **caller 身份解析 + Idempotency-Key 冲突硬门禁**（`p_caller_request_id IS NOT NULL` 时）：按 (tenant_id, project_id, caller_request_id) 读前查。命中后先比较 fingerprint version 与 fingerprint；任一冲突立即失败关闭。两者一致时，若 `v_key IS NOT NULL`，必须按 `v_key` 查询 key holder：holder 是其他 Job 且 raw `request_hash` 不同 ⇒ `IDEMPOTENCY_KEY_REUSED`；holder 是其他 Job 但 raw hash 相同 ⇒ `IDEMPOTENCY_KEY_CROSS_IDENTITY`（完整性冲突）；holder 未命中或绑定自身 ⇒ `RETURN (id, 'caller_request_replay')`。不得在此成功 replay 前跳过 key gate。**重放分支不重评 generator 可用性与乐观前置条件**。
+3. **Idempotency-Key 解析**（仅 caller 未命中时）：仅当 `v_key IS NOT NULL` 时按 `v_key` 执行既有逻辑；同 key 同 raw `request_hash` ⇒ `RETURN (id, 'idempotency_replay')`；同 key 不同 hash ⇒ `IDEMPOTENCY_KEY_REUSED`。不得再读取原始 `p_idempotency_key` 作为查询值。
+4. **generator registry 检查**：未知 ⇒ `UNKNOWN_GENERATOR`；非 available ⇒ `GENERATOR_UNAVAILABLE`（生产 fail-closed 门禁不松动）。此步骤必须位于所有可判定 replay 之后。
 5. `input_sha256` 计算（原逻辑不变）。
 6. 单条 INSERT 写入 Job 行（含 caller 三列，caller 为空时三列为 NULL）。
-7. `EXCEPTION WHEN unique_violation`（子事务自动回滚）：
-   - 先按 caller_request_id 重读胜者：命中 ⇒ 指纹一致 → `RETURN (winner.id, 'caller_request_replay')`；不一致 → `RAISE 'CALLER_REQUEST_ID_REUSED'`；
-   - 未命中 → 按 idempotency_key 重读（原异常块逻辑保留）⇒ 同 hash 重放 / 不同 hash `RAISE 'IDEMPOTENCY_KEY_REUSED'`；
-   - 均未命中 ⇒ 原样 RAISE（视为完整性异常）；
-   - 防御条款（结构上不可达，注释声明）：按 key 命中且 hash 相等但胜者 caller_request_id 与传入不同 ⇒ fail-closed RAISE，绝不返回跨身份重放。
+7. **`EXCEPTION WHEN unique_violation`**（子事务自动回滚）：先以新语句快照按 caller_request_id 重读胜者；命中后按顺序比较 fingerprint version、fingerprint，再对当前请求执行与 step 2 完全相同的 `v_key` holder gate；不得因异常块而绕过 key gate。caller 未命中时，按 `v_key` 重读 Idempotency-Key（原异常块语义保留），同 hash 重放 / 不同 hash 返回 `IDEMPOTENCY_KEY_REUSED`；均未命中则原样 RAISE（完整性异常）。step 2 与 step 7 必须复用同一 SQL helper 或等价实现。
 8. 正常路径 `RETURN (p_job_id, 'created')`。
+
 
 #### 5.3.2 隔离与重试（沿 ART-04E §5.3 / Lessons Learned）
 READ COMMITTED 足够：唯一性竞争全部经"子事务回滚 + 新语句快照重读"解决；单行单 INSERT 结构上消除 AS-1 的双快照误判面。`40001`/`40P01` 由 Rust 端口做有界重试（≤3 次 + 退避）；不把任意 DB 错误归入"已存在"。
