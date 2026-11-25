@@ -324,6 +324,12 @@ All tests below are required before AS-1 can be marked implementation-complete.
 28. Existing Idempotency-Key behavior for unkeyed requests remains unchanged.
 29. Existing artifact_key unique index and its scope semantics remain unchanged.
 30. Existing Artifact metadata update, archive, version, and output workflows are not weakened.
+31. Concurrent requests reusing one Idempotency-Key for different artifact_key values produce one idempotency winner and a deterministic request-hash conflict; they must not create two Artifacts.
+32. For a keyed request, a failure before transaction commit leaves no newly committed Idempotency-Key reservation, Artifact, or creation identity.
+33. A deferred trigger rejects commit of a new keyed Artifact without a matching identity row.
+34. A deferred trigger rejects commit of an identity row whose artifact_key differs from the referenced Artifact.
+35. An old reservation-first writer cannot overlap the new handler during cutover; deployment evidence demonstrates the old writer drain gate.
+
 
 ## 10. Failure-injection evidence
 
@@ -334,6 +340,8 @@ The implementation PR must attach reproducible test evidence for at least:
 - stale Idempotency-Key reservation;
 - Idempotency-Key cache expiry;
 - same-key concurrent requests with identical and conflicting payloads;
+- same Idempotency-Key concurrently reused across different artifact_key values;
+- deferred identity-pair constraints and old-writer drain/cutover behavior;
 - scope-isolation attempts;
 - legacy-key collision.
 
