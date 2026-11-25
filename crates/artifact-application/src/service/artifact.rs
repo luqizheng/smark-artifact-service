@@ -7,8 +7,8 @@
 use crate::port::audit::AuditSink;
 use crate::port::idempotency::IdempotencyStore;
 use crate::port::repo::{
-    ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobRepository,
-    NewArtifact, ReferenceRepository, VersionRepository,
+    ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
+    JobRepository, NewArtifact, ReferenceRepository, VersionRepository,
 };
 use crate::port::storage::{StorageError, StoragePort};
 use artifact_contract::{
@@ -518,12 +518,15 @@ impl ArtifactService {
         request_id: Option<&str>,
     ) -> Result<GenerationJobResponse, DomainError> {
         delegation.require(Action::GenerationCancel, scope)?;
-        let job = self
+        let (job, outcome) = self
             .jobs
             .cancel((scope.tenant_id, scope.project_id), job_id)
             .await?;
-        self.audit_allowed(scope, delegation, "generation.cancel", job_id, request_id)
-            .await;
+        // 终态 Job 上的取消是空操作，不记审计；其余两种结果都改变了 Job 的状态。
+        if outcome != JobCancelOutcome::Terminal {
+            self.audit_allowed(scope, delegation, "generation.cancel", job_id, request_id)
+                .await;
+        }
         Ok(to_job_dto(&job))
     }
 
@@ -666,6 +669,10 @@ pub fn to_job_dto(j: &GenerationJob) -> GenerationJobResponse {
         artifact_id: j.artifact_id,
         generator_id: j.generator_id.clone(),
         status: j.status.as_str().to_string(),
+        error_code: j.error_code.clone(),
+        attempt_count: j.attempt_count,
+        max_attempts: j.max_attempts,
+        cancel_requested: j.cancel_requested(),
         created_at: j.created_at,
         poll_url: format!("/v1/generation-jobs/{}", j.id),
     }

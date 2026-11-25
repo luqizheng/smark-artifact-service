@@ -75,4 +75,13 @@ pub struct GenerationJob {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub trace_id: Option<String>,
+    /// running 期间收到取消请求的时间；Job 此时仍是 running，等待 Worker 确认。
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+}
+
+impl GenerationJob {
+    /// 调用方是否已经请求取消（尚未成为终态）。
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested_at.is_some()
+    }
 }

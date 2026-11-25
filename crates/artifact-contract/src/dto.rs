@@ -203,12 +203,19 @@ pub struct CreateGenerationJobRequest {
     pub expected_current_version_id: Option<Uuid>,
 }
 
+/// GenerationJob 的调用方视图。输入正文永不出现在响应中。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationJobResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
     pub generator_id: String,
     pub status: String,
+    /// 终态或最近一次失败原因的稳定机器码（例如 `GENERATION_TIMEOUT`）；成功时为空。
+    pub error_code: Option<String>,
+    pub attempt_count: i32,
+    pub max_attempts: i32,
+    /// running 期间已收到取消请求、尚未由 Worker 确认时为 true。
+    pub cancel_requested: bool,
     pub created_at: DateTime<Utc>,
     pub poll_url: String,
 }

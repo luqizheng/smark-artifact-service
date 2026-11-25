@@ -9,11 +9,13 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use uuid::Uuid;
 
-/// API 层错误类型：认证失败（无有效委托）或领域错误。
+/// API 层错误类型：认证失败（无有效委托）、领域错误，或已组装好的错误信封。
 #[derive(Debug, Clone)]
 pub enum ApiError {
     Unauthenticated(String),
     Domain(DomainError),
+    /// 需要携带结构化 `details` 的拒绝（例如输入校验失败的原因码与位置）。
+    Envelope(ErrorEnvelope),
 }
 
 impl ApiError {
@@ -21,6 +23,13 @@ impl ApiError {
         match self {
             ApiError::Unauthenticated(msg) => ErrorEnvelope::unauthenticated(msg, request_id),
             ApiError::Domain(err) => ErrorEnvelope::from_domain(err, request_id),
+            ApiError::Envelope(envelope) => {
+                let mut envelope = envelope.clone();
+                if envelope.error.request_id.is_none() {
+                    envelope.error.request_id = request_id;
+                }
+                envelope
+            }
         }
     }
 }

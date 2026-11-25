@@ -32,7 +32,7 @@
 | 4 不读 AI-PM 业务库 / 不依赖 pm-* crate | workspace 依赖图 + sdk_contract::sdk_has_no_internal_aipm_dependencies 静态守卫 |
 | 5 请求体 tenant/project 不是授权证明 | `TenantScope` tenant 恒取自凭证；body project ≠ 凭证 project → SCOPE_DENIED |
 | 6 文件正文不进 PG / 不建 S3 控制面 | 表结构无正文列（仅 object_id/hash/size/mime）；无对象存储 SDK 依赖 |
-| 7 Worker 零凭据 | Worker 未实现；契约预留（ART-01 §5.4），实现时按此约束 |
+| 7 Worker 零凭据 | 独立 `artifact-worker` 二进制只读取自身的 Worker DSN（独立 DB 角色，仅有受控函数的 EXECUTE）；不读取用户 delegation，不持有对象存储凭据 | tests/worker_roles.rs；`apps/artifact-worker/src/config.rs` 单元测试 |
 | 8 不双写 viz.* | 本仓库无 viz.* 引用 |
 | 9 业务变更不触发全量 CI | 独立仓库 |
 | 10 兼容性由契约测试证明 | contract_openapi.rs + sdk_contract.rs |
@@ -45,8 +45,9 @@
 | ArtifactVersion | `artifact.artifact_version` | UNIQUE(artifact_id,version_number)；UNIQUE(id,artifact_id,tenant,project)；复合 FK→artifact；version_number 触发器按父行锁分配；READY 不可变 |
 | ArtifactOutput | `artifact.artifact_output` | UNIQUE(version_id,output_role,format)；复合 FK→version |
 | ArtifactReference | `artifact.artifact_reference` | 6 元组部分唯一（removed_at IS NULL）；复合 FK→artifact；owner/relation 受控枚举 |
-| GenerationJob | `artifact.generation_job` | 状态机白名单触发器；复合 FK→artifact 与 target version；`(status,heartbeat_at)` 调度索引 |
-| Generator | `artifact.generator_registry` | PK generator_id；status CHECK；历史 0001 migration 含 Mermaid seed；后续 migration 应删除该 seed，仅保留 SeeCode |
+| GenerationJob | `artifact.generation_job` | 状态机白名单触发器；复合 FK→artifact 与 target version。0002 / 0003 增加：输入快照与清理期限、`next_attempt_at` / `expires_at` / `max_execution_seconds`、Idempotency-Key 部分唯一索引、claim 部分索引、错误码形式 CHECK |
+| GenerationJobAttempt（ART-03A） | `artifact.generation_job_attempt` | UNIQUE(job_id, attempt_number)；同一 Job 至多一个活跃 Attempt（部分唯一）；活跃 Attempt 的租约必须非空；状态机触发器 |
+| Generator | `artifact.generator_registry` | PK generator_id；status CHECK；0001 中的 Mermaid seed 已由 0002 删除，仅保留 SeeCode |
 | AuditEvent | `artifact.audit_event` | append-only 触发器 + 运行角色 REVOKE UPDATE/DELETE；scope+created 索引 |
 | （幂等） | `artifact.idempotency_record` | UNIQUE(tenant,project,endpoint,key)；request_hash 64 位；24h 过期 |
 | outbox_event | 未建 | ART-01"若启用事件通知"，V1 轮询必选，事件通知属后续（OPEN-ISSUES #5） |

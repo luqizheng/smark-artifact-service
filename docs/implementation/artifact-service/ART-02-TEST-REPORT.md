@@ -1,5 +1,8 @@
 # ART-02 测试报告
 
+> 本文记录 ART-02 基线（30 用例）。ART-03B-01 之后的测试增量见
+> [ART-03B-01 实施报告 §12](ART-03B-01-IMPLEMENTATION-REPORT.md)；当前全量套件为 83 用例。
+
 ## 1. 门禁结果（本地 + CI）
 
 | 门禁 | 本地（Windows，PG16 容器 artifact-dev-pg@16500） | CI（ubuntu-latest + postgres:16 service） |
@@ -27,7 +30,7 @@ CI 在全新环境可重复：postgres:16 service 容器 + DATABASE_URL 注入�
 |---|---|
 | health_reports_build_info | health 200 + version/git_sha |
 | ready_reports_database_and_blocked_storage | DB=ok；file_storage=protocol_blocked_p0（诚实上报） |
-| generators_report_unavailable_adapters | mermaid/seecode 均 unavailable（无伪 available） |
+| generators_report_unavailable_adapters | 仅保留 seecode 且 unavailable（无伪 available）；mermaid seed 已由迁移 0002 删除 |
 
 ### default_deny（默认拒绝，2）
 | 用例 | 覆盖 |

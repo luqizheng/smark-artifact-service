@@ -1,0 +1,17 @@
+[package]
+name = "artifact-worker"
+description = "Independent Artifact Service worker: job coordination maintenance only (no generator adapter, no SeeCode, no Node)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+artifact-application = { workspace = true }
+artifact-infrastructure = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

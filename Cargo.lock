@@ -134,9 +134,23 @@ dependencies = [
  "reqwest",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "artifact-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "artifact-application",
+ "artifact-infrastructure",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

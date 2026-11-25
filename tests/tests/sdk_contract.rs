@@ -104,14 +104,18 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
         .unwrap_err();
     assert_eq!(err.code(), "RESOURCE_NOT_FOUND");
 
-    // 生成请求：Adapter 未实现 → GENERATOR_UNAVAILABLE，且不可重试。
+    // 生成请求：输入信封合法，但 Adapter 未实现 → GENERATOR_UNAVAILABLE，且不可重试。
     let generation = client
         .request_generation(
             created.id,
             CreateGenerationJobRequest {
-                generator_id: "mermaid".into(),
-                input: serde_json::json!({"source_version_id": uuid::Uuid::new_v4()}),
-                options: Some(serde_json::json!({"formats": ["svg"]})),
+                generator_id: "seecode".into(),
+                input: serde_json::json!({
+                    "schema": "smark.seecode.input",
+                    "schema_version": "1",
+                    "diagram": {"type": "architecture", "title": "SDK", "nodes": [], "edges": []}
+                }),
+                options: None,
                 expected_current_version_id: None,
             },
             &ctx,
@@ -121,6 +125,23 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
     assert_eq!(generation.code(), "GENERATOR_UNAVAILABLE");
     // 503 类错误按契约 retryable=true（Worker/Generator 未来部署后可用）。
     assert!(generation.retryable());
+
+    // 不符合输入信封的请求在校验阶段被拒绝：稳定错误码 + 结构化的原因与位置。
+    let rejected = client
+        .request_generation(
+            created.id,
+            CreateGenerationJobRequest {
+                generator_id: "seecode".into(),
+                input: serde_json::json!({"schema": "aipm.vizspec"}),
+                options: None,
+                expected_current_version_id: None,
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), "INVALID_REQUEST");
+    assert!(!rejected.retryable());
 }
 
 #[sqlx::test(migrations = "../migrations")]

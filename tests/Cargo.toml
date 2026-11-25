@@ -23,6 +23,7 @@ serde_yaml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+sha2 = { workspace = true }
 
 [[test]]
 name = "api_meta"
@@ -51,3 +52,19 @@ path = "tests/contract_openapi.rs"
 [[test]]
 name = "sdk_contract"
 path = "tests/sdk_contract.rs"
+
+[[test]]
+name = "worker_coordination"
+path = "tests/worker_coordination.rs"
+
+[[test]]
+name = "generation_api"
+path = "tests/generation_api.rs"
+
+[[test]]
+name = "worker_roles"
+path = "tests/worker_roles.rs"
+
+[[test]]
+name = "migration_guard"
+path = "tests/migration_guard.rs"

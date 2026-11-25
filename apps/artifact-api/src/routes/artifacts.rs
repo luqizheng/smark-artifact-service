@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::{Authed, Scoped};
-use crate::error::{ApiError, RequestId, error_response};
+use crate::error::{ApiError, RequestId, api_error, error_response};
 use crate::state::AppState;
 
 // ── 通用提取器 ─────────────────────────────────────────────────────────
@@ -51,6 +51,67 @@ where
             request_hash,
         })
     }
+}
+
+/// 生成请求专用提取器：body 上限 256 KiB（ART-03A A3A-02），超限返回 413。
+/// 只保留原始字节数与解析后的 JSON；输入正文不进入日志/trace。
+pub struct ValidGenerationJson<T> {
+    pub value: T,
+    pub envelope_bytes: usize,
+}
+
+impl<S, T> FromRequest<S> for ValidGenerationJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = req.extensions().get::<RequestId>().copied();
+        let bytes = axum::body::to_bytes(req.into_body(), artifact_application::MAX_ENVELOPE_BYTES)
+            .await
+            .map_err(|_| {
+                api_error(
+                    request_id,
+                    &generation_input_rejected(
+                        request_id,
+                        "INPUT_TOO_LARGE",
+                        "request body",
+                        "generation input envelope exceeds 256 KiB",
+                    ),
+                )
+            })?;
+        let envelope_bytes = bytes.len();
+        let value: T = serde_json::from_slice(&bytes)
+            .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
+        Ok(Self {
+            value,
+            envelope_bytes,
+        })
+    }
+}
+
+/// 生成请求被拒绝的错误：稳定原因码与结构位置放在 `details` 里，
+/// 消息是固定文本，不回显任何输入内容。
+fn generation_input_rejected(
+    request_id: Option<RequestId>,
+    code: &'static str,
+    field: &str,
+    message: &str,
+) -> ApiError {
+    let error_code = if code == "INPUT_TOO_LARGE" {
+        "PAYLOAD_TOO_LARGE"
+    } else {
+        "INVALID_REQUEST"
+    };
+    ApiError::Envelope(ErrorEnvelope::new(
+        error_code,
+        message,
+        request_id.map(|id| id.0.to_string()),
+        false,
+        serde_json::json!({ "reason": code, "field": field }),
+    ))
 }
 
 /// 查询参数（解析失败 → 400 INVALID_REQUEST 信封）。
@@ -422,9 +483,25 @@ pub async fn request_generation(
     req: Scoped,
     Path(artifact_id): Path<String>,
     _headers: HeaderMap,
-    body: ValidJson<CreateGenerationJobRequest>,
+    body: ValidGenerationJson<CreateGenerationJobRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
+
+    // 服务端输入校验（A3A-02）：大小、结构上限、信封 allowlist、危险字段与 URL 形态的值。
+    // 拒绝只返回稳定原因码与结构位置，绝不回显输入正文。
+    if let Err(e) = artifact_application::validate_job_input_envelope(
+        body.envelope_bytes,
+        &body.value.input,
+        body.value.options.as_ref(),
+    ) {
+        return Err(generation_input_rejected(
+            req.request_id,
+            e.code,
+            &e.field,
+            "generation input envelope was rejected",
+        ));
+    }
+
     match state
         .artifacts
         .request_generation(

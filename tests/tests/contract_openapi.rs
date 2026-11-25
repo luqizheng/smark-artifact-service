@@ -128,6 +128,59 @@ fn error_envelope_schema_matches_contract() {
     }
 }
 
+/// GenerationJob 的响应必须让调用方拿到结果（原因码、重试进度、取消状态），
+/// 且永远不暴露输入正文或租约。
+#[test]
+fn generation_job_documents_outcome_fields() {
+    let spec = load_spec();
+    let job = &spec["components"]["schemas"]["GenerationJob"];
+    let required: Vec<String> = job["required"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for field in [
+        "id",
+        "artifact_id",
+        "generator_id",
+        "status",
+        "error_code",
+        "attempt_count",
+        "max_attempts",
+        "cancel_requested",
+        "created_at",
+        "poll_url",
+    ] {
+        assert!(
+            required.contains(&field.to_string()),
+            "GenerationJob.{field} must be documented as required"
+        );
+    }
+    let properties = job["properties"].as_mapping().unwrap();
+    for forbidden in [
+        "input",
+        "input_payload",
+        "options",
+        "options_payload",
+        "lease_token",
+    ] {
+        assert!(
+            !properties.contains_key(forbidden),
+            "GenerationJob must never expose {forbidden}"
+        );
+    }
+
+    let responses =
+        &spec["paths"]["/v1/artifacts/{artifact_id}/generation-jobs"]["post"]["responses"];
+    for status in ["202", "400", "409", "413", "503"] {
+        assert!(
+            responses.get(status).is_some(),
+            "requestGeneration must document {status}"
+        );
+    }
+}
+
 #[test]
 fn every_business_path_documents_401() {
     // 无 DB 依赖的静态部分：规范中每个业务路径都声明了 401。

@@ -1,13 +1,13 @@
 //! PostgreSQL 仓储实现（schema `artifact`）。
 //!
-//! 不变量由 migration 0001 的约束与触发器强制；本层负责范围限定查询、
+//! 不变量由 migration 0001/0002 的约束与触发器强制；本层负责范围限定查询、
 //! 乐观并发（row_revision / ETag）与错误码映射。所有查询显式携带
 //! tenant_id/project_id，杜绝跨租户读取。
 
 use artifact_application::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, AuditSink, GeneratorRepository,
-    IdempotencyOutcome, IdempotencyStore, JobRepository, NewArtifact, ReferenceRepository,
-    VersionRepository,
+    IdempotencyOutcome, IdempotencyStore, JobCancelOutcome, JobRepository, NewArtifact,
+    ReferenceRepository, VersionRepository,
 };
 use artifact_domain::{
     Artifact, ArtifactReference, ArtifactType, ArtifactVersion, DomainError, GenerationJob,
@@ -18,6 +18,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+pub mod worker;
+
+pub use worker::PgWorkerCoordination;
 
 // ── 行类型 ──────────────────────────────────────────────────────────────
 
@@ -164,18 +168,33 @@ impl TryFrom<ReferenceRow> for ArtifactReference {
     }
 }
 
+/// Job 查询列。不含输入正文：输入永不出现在普通 Job 查询里。
+const JOB_COLUMNS: &str = "id, tenant_id, project_id, artifact_id, target_version_id, \
+     generator_id, generator_version, adapter_version, status, attempt_count, max_attempts, \
+     created_at, started_at, heartbeat_at, completed_at, error_code, error_message, trace_id, \
+     cancel_requested_at";
+
 #[derive(sqlx::FromRow)]
 struct JobRow {
     id: Uuid,
     tenant_id: Uuid,
     project_id: Uuid,
     artifact_id: Uuid,
+    target_version_id: Option<Uuid>,
     generator_id: String,
     generator_version: Option<String>,
     adapter_version: Option<String>,
     status: String,
     attempt_count: i32,
+    max_attempts: i32,
     created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    heartbeat_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    trace_id: Option<String>,
+    cancel_requested_at: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<JobRow> for GenerationJob {
@@ -187,7 +206,7 @@ impl TryFrom<JobRow> for GenerationJob {
             tenant_id: row.tenant_id,
             project_id: row.project_id,
             artifact_id: row.artifact_id,
-            target_version_id: None,
+            target_version_id: row.target_version_id,
             generator_id: row.generator_id,
             generator_version: row.generator_version,
             adapter_version: row.adapter_version,
@@ -195,14 +214,15 @@ impl TryFrom<JobRow> for GenerationJob {
             idempotency_key: None,
             request_hash: None,
             attempt_count: row.attempt_count,
-            max_attempts: 0,
+            max_attempts: row.max_attempts,
             created_at: row.created_at,
-            started_at: None,
-            heartbeat_at: None,
-            completed_at: None,
-            error_code: None,
-            error_message: None,
-            trace_id: None,
+            started_at: row.started_at,
+            heartbeat_at: row.heartbeat_at,
+            completed_at: row.completed_at,
+            error_code: row.error_code,
+            error_message: row.error_message,
+            trace_id: row.trace_id,
+            cancel_requested_at: row.cancel_requested_at,
         })
     }
 }
@@ -621,11 +641,10 @@ pub struct PgJobRepository {
 #[async_trait]
 impl JobRepository for PgJobRepository {
     async fn get(&self, scope: (Uuid, Uuid), job_id: Uuid) -> Result<GenerationJob, DomainError> {
-        let sql = "SELECT id, tenant_id, project_id, artifact_id, generator_id, generator_version, \
-               adapter_version, status, attempt_count, created_at \
-             FROM artifact.generation_job \
-             WHERE id = $1 AND tenant_id = $2 AND project_id = $3";
-        let row: JobRow = sqlx::query_as(sql)
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM artifact.generation_job WHERE id = $1 AND tenant_id = $2 AND project_id = $3"
+        );
+        let row: JobRow = sqlx::query_as(&sql)
             .bind(job_id)
             .bind(scope.0)
             .bind(scope.1)
@@ -640,29 +659,32 @@ impl JobRepository for PgJobRepository {
         &self,
         scope: (Uuid, Uuid),
         job_id: Uuid,
-    ) -> Result<GenerationJob, DomainError> {
-        // 尽力而为取消：终态 Job 原样返回（ART-01 §8.2）。
-        let sql = "UPDATE artifact.generation_job \
-             SET status = 'cancelled', completed_at = now(), \
-                 error_code = COALESCE(error_code, 'cancelled_by_request') \
-             WHERE id = $1 AND tenant_id = $2 AND project_id = $3 \
-               AND status IN ('queued', 'running', 'retry_wait') \
-             RETURNING id, tenant_id, project_id, artifact_id, generator_id, generator_version, \
-               adapter_version, status, attempt_count, created_at";
-        let updated: Option<JobRow> = sqlx::query_as(sql)
-            .bind(job_id)
-            .bind(scope.0)
-            .bind(scope.1)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| match trigger_message(&e) {
-                Some(msg) => DomainError::VersionConflict(msg),
-                None => map_db_error(e, "cancel job"),
-            })?;
-        match updated {
-            Some(row) => row.try_into(),
-            None => self.get(scope, job_id).await,
-        }
+    ) -> Result<(GenerationJob, JobCancelOutcome), DomainError> {
+        // 取消只走受控函数，避免"直接 UPDATE"与函数两个权威来源。
+        // 租户/项目在函数内校验：scope 不匹配返回 not_found，与 Job 不存在无法区分。
+        let outcome = sqlx::query_scalar::<_, String>(
+            "SELECT artifact.request_generation_job_cancel($1, $2, $3)",
+        )
+        .bind(scope.0)
+        .bind(scope.1)
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_db_error(e, "request generation job cancel"))?;
+        let outcome = match outcome.as_str() {
+            "cancelled" => JobCancelOutcome::Cancelled,
+            "cancel_requested" => JobCancelOutcome::CancelRequested,
+            "terminal" => JobCancelOutcome::Terminal,
+            "not_found" => return Err(DomainError::NotFound),
+            other => {
+                tracing::error!(outcome = other, "unexpected job cancel outcome");
+                return Err(DomainError::Internal(format!(
+                    "request generation job cancel: unexpected outcome '{other}'"
+                )));
+            }
+        };
+        let job = self.get(scope, job_id).await?;
+        Ok((job, outcome))
     }
 }
 

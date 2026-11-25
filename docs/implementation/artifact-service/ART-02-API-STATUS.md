@@ -19,9 +19,9 @@
 | 12 | POST /v1/artifacts/{id}/current-version | 切换当前版本 | ✅ 已实现+已测试 | 只接受 READY；expected_current_version_id 乐观并发（不匹配→409）；DB 触发器兜底 | artifact_flow::current_version_pointer_invariant_via_api |
 | 13 | POST /v1/artifacts/{id}/references | 建立引用 | ✅ 已实现+已测试 | owner_type/relation_type 受控枚举；重复活跃引用返回既有记录（幂等语义） | artifact_flow::reference_create_remove |
 | 14 | DELETE /v1/artifacts/{id}/references/{rid} | 解除引用 | ✅ 已实现+已测试 | 软删除（removed_at）；重复解除 → 404 | 同上 |
-| 15 | POST /v1/artifacts/{id}/generation-jobs | 请求生成 | 🚧 尚未实现（Adapter 层） | 鉴权+校验后 → 503 GENERATOR_UNAVAILABLE（adapter not implemented）；已知 generator → 400；未注册 → 400 | sdk_contract::sdk_full_flow_matches_contract |
-| 16 | GET /v1/generation-jobs/{job_id} | Job 状态 | ✅ 已实现+已测试（读取路径） | 200 / 404；创建路径落地后即为完整读面 | sdk_contract（404 分支） |
-| 17 | POST /v1/generation-jobs/{job_id}/cancel | 取消 Job | ✅ 已实现+已测试（终态语义） | 终态 Job 原样返回（ART-01 §8.2 尽力而为取消） | 同上（状态机 DB 触发器已测） |
+| 15 | POST /v1/artifacts/{id}/generation-jobs | 请求生成 | 🚧 尚未实现（Adapter 层） | 输入信封先校验：超过 256 KiB → 413 PAYLOAD_TOO_LARGE；不符合信封 → 400 INVALID_REQUEST，原因与位置在 `error.details.reason` / `field`，不回显输入。校验通过后 → 503 GENERATOR_UNAVAILABLE（adapter not implemented）；未注册 generator → 400 | sdk_contract::sdk_full_flow_matches_contract；generation_api::generation_request_enforces_the_input_envelope |
+| 16 | GET /v1/generation-jobs/{job_id} | Job 状态 | ✅ 已实现+已测试 | 200 / 404。响应字段与 OpenAPI 一致：`status`、`error_code`、`attempt_count`、`max_attempts`、`cancel_requested` 等；不含输入正文 | generation_api::get_job_serves_the_documented_shape；job_endpoints_enforce_scope_and_action |
+| 17 | POST /v1/generation-jobs/{job_id}/cancel | 取消 Job | ✅ 已实现+已测试 | queued / retry_wait → 200 `cancelled`；running → 200 `running` 且 `cancel_requested=true`（等待 Worker 确认）；终态原样返回且不记审计。scope 在数据库函数内校验，不匹配 → 404 | generation_api::cancel_queued_job_and_terminal_noop / cancel_running_job_reports_cancel_requested |
 | — | GET /metrics | 内部监控 | 🚧 尚未实现 | ART-01 要求网络受限暴露；属可观测性后续批次 | — |
 
 ## 认证语义（对全部业务端点）
@@ -42,6 +42,6 @@
 |---|---|---|
 | 统一错误信封 | `{error:{code,message,request_id,retryable,details}}`，ART-01 §8.1 全部 13 码 + INTERNAL_ERROR | contract_openapi::error_envelope_schema_matches_contract；default_deny |
 | request_id | X-Request-Id 透传/生成，注入信封与响应头 | default_deny（request_id 断言）；sdk_contract（request_id 透出） |
-| Idempotency-Key | idempotency_record 原子预留 + 响应快照重放，保留 ≥24h | artifact_flow::idempotency_replay_and_reuse_conflict；migration_invariants::idempotency_record_unique_per_scope |
+| Idempotency-Key | idempotency_record 原子预留 + 响应快照重放，保留 ≥24h。GenerationJob 的创建幂等另由 `(tenant, project, idempotency_key)` 部分唯一索引保证（API 创建路径尚未开放） | artifact_flow::idempotency_replay_and_reuse_conflict；migration_invariants::idempotency_record_unique_per_scope；worker_coordination::job_creation_pins_versions_and_is_idempotent |
 | ETag / If-Match | ETag=`"r<row_revision>"`；更新类操作强制乐观并发 | artifact_flow（400/409/200 三分支） |
 | 审计 | 成功动作 allowed 事件 + 全部 401/403 拒绝事件（不含任何凭证原文） | default_deny（审计断言） |
