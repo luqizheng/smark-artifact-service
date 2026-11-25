@@ -314,6 +314,25 @@ NRG 是宿主机 fail-safe kill-only 组件，不是第二个 ARC，不成为 Jo
 
 新增验收：ARC 在 Create/Start/Running/Kill 任意阶段被 SIGKILL 或永久挂起，NRG 必须在冻结的上界内阻止新 Start 并终止全部受管 Attempt；同时注入 NRG 进程崩溃、watchdog 超时、权限丢失、cgroupfs 异常，验证节点 fail closed。该测试必须覆盖 ARC 与 Worker 同时故障。
 
+
+### 7.6 Durable journal 的崩溃一致性协议（新增强制门禁）
+
+“durable journal”必须落实为可验证的 write-ahead 协议，而不能只表示 ARC 将状态写入某个本地文件/数据库。
+
+每个操作必须遵循以下顺序：
+
+1. 分配全局唯一 operation_id，并在 Attempt 锁/CAS 下校验当前 lifecycle generation。
+2. 将操作意图、Attempt/runtime identity、operation generation、session binding、期望前态/后态写入 journal；执行 fsync（必要时同步父目录），成功前不得调用 runtime。
+3. 调用 containerd/cgroup 操作时，将 service identity、job_id、attempt_id、attempt_number、operation_id、generation 写入不可由 Executor 修改的 runtime labels/metadata。
+4. 收到 runtime 结果后，先 Inspect 并核验 runtime identity，再写入 observed resource ID/结果并 fsync；只有持久化完成后才向 Worker 返回成功。
+5. 响应丢失或 ARC 崩溃时，以 operation_id + runtime labels + journal 进行 reconciliation；不能唯一确定资源归属时，所有候选资源均 KillOnly，不允许任选一个继续。
+6. KillRequested 必须先写入并 fsync，再执行 kill；若 fsync 失败，不得返回“已 fencing”，必须通过 NRG 触发 fail-safe kill，并将节点标记为 Quarantined。
+7. Start 同样必须有持久化 intent 和 generation fencing；任何迟到的 runtime success response 都必须重新检查 KillRequested/generation，不能覆盖较新的 Kill 状态。
+8. journal 损坏、磁盘满、I/O error、文件系统只读、fsync 失败、label 缺失/重复或版本不兼容时：禁止 Create/Start/Read/Cleanup；已存在 sandbox 由 NRG KillOnly，保留证据，节点不得 Ready。
+9. tombstone/operation 去重记录的保留期必须覆盖最长 RPC 重试、ARC/NRG 重启与 reconciliation 窗口；不得因过早压缩而允许旧 request_id 复活资源。
+
+该协议仍不能使 PostgreSQL 与 containerd 原子化；它只解决 ARC 自身操作日志与 runtime 副作用之间的崩溃一致性。必须通过 ARC-T43/T44 故障注入验证。
+
 ## 8. 输出冻结、目录保留与清理
 
 ARC 不把宿主 scratch path 暴露给 Worker。所有输出通过 ReadFrozenOutput RPC 读取。
