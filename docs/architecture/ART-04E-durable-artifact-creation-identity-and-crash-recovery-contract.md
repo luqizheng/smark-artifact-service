@@ -168,28 +168,31 @@ For a new keyed Artifact, one database transaction MUST:
 
 The Artifact and identity row either both exist or neither exists. No externally visible intermediate state is permitted.
 
-Do not call the current short-lived Idempotency-Key reservation and leave it as the first durable step before this transaction. That ordering is the known stale-reservation crash window.
+For keyed requests that carry an `Idempotency-Key`, the idempotency reservation, Artifact, creation identity, and completed response snapshot/resource_id MUST also be committed in this same transaction. This prevents a second race in which two different artifact keys reuse the same Idempotency-Key concurrently. A keyed create must not use the current two-transaction "reserve first, create later, complete last" flow.
+
+The old reservation-first flow is the known stale-reservation crash window. The new keyed path must replace it with one transaction, not merely reorder two separate transactions.
 
 ### 5.2 Request algorithm
 
 For a keyed create request:
 
-1. Authenticate and authorize the tenant/project. Validate and canonicalize the request; compute its versioned fingerprint.
-2. In a short database transaction, attempt to resolve `(tenant_id, project_id, artifact_key)` in `artifact_creation_identity`.
-3. If an identity exists:
-   - same fingerprint version and same fingerprint: return the existing Artifact representation (or the documented canonical create response);
-   - different fingerprint: return HTTP 409 `ARTIFACT_KEY_CONFLICT`;
-   - do not create a new Artifact and do not modify the existing Artifact.
-4. If no identity exists, attempt the atomic Artifact + identity insert transaction.
-5. If the insert succeeds, return the newly created Artifact.
-6. If a uniqueness conflict occurs on either the existing Artifact key index or the creation-identity primary key, roll back the losing transaction, start a fresh transaction, and resolve the durable identity again:
-   - identity exists and fingerprint matches: return the winner;
-   - identity exists and fingerprint differs: return 409;
+1. Authenticate and authorize the tenant/project. Validate and canonicalize the request; compute the versioned Artifact creation fingerprint and, when supplied, the existing endpoint-specific Idempotency-Key request hash.
+2. Start one transaction. For a supplied Idempotency-Key, atomically insert its reservation row (using the existing unique scope `tenant_id/project_id/endpoint/idempotency_key`) or lock/read the existing row:
+   - a different request hash returns the existing idempotency conflict;
+   - a completed matching row replays its response;
+   - an incomplete legacy row may proceed only under the cutover/drain rule in §6.1.
+3. Resolve `(tenant_id, project_id, artifact_key)` in `artifact_creation_identity` inside the same transaction:
+   - if an identity exists, canonicalize the incoming semantic DTO using that stored identity's fingerprint version; a matching hash resolves the existing Artifact, while a mismatch returns HTTP 409 `ARTIFACT_KEY_CONFLICT`;
+   - if no identity exists, insert the Artifact and its identity row in this transaction.
+4. If a key collision occurs, roll back the entire transaction (including any newly inserted idempotency reservation), start a fresh transaction, and resolve both the Idempotency-Key record and durable Artifact identity again. Never continue in an aborted PostgreSQL transaction:
+   - identity exists and the incoming request matches its stored-version fingerprint: resolve the winner;
+   - identity exists and does not match: return 409;
    - Artifact with that key exists but no identity row exists: return 409 `ARTIFACT_KEY_LEGACY_UNVERIFIABLE`; never infer equivalence from mutable metadata;
-   - neither exists: treat as a retryable transaction/race failure and retry with bounded backoff, then return a retryable server error.
-7. Only after durable identity resolution/commit may the handler complete or update the transport Idempotency-Key record. Failure to update that cache must not invalidate the committed Artifact identity.
+   - neither exists: bounded retry, then a retryable server error.
+5. Before commit, write the completed idempotency `response_snapshot` and `resource_id` (when an Idempotency-Key was supplied). Commit the idempotency record, Artifact, and identity together.
+6. Return the committed response. A response lost after commit is recovered from the completed Idempotency-Key row or, after its expiry, from `artifact_key` + creation fingerprint.
 
-The read-before-insert is an optimization, not the concurrency guarantee. Unique constraints plus post-conflict re-read are the guarantee.
+The read-before-insert is an optimization, not the concurrency guarantee. Unique constraints plus transaction rollback and fresh-transaction re-read are the guarantee.
 
 ### 5.3 Isolation and retry
 
@@ -199,12 +202,23 @@ A serialization failure/deadlock may be retried with a strict bounded retry poli
 
 ### 5.4 Idempotency-Key interaction
 
-- For requests carrying both `artifact_key` and `Idempotency-Key`, durable key resolution MUST occur before an old in-progress idempotency reservation can block recovery.
+- For keyed creates, the Idempotency-Key row and durable Artifact identity are coordinated in one transaction. Do not leave a newly reserved Idempotency-Key committed without the Artifact/identity operation also committing or rolling back.
 - Same `artifact_key` + same fingerprint returns the same Artifact even if the Idempotency-Key differs or its cache entry expired.
 - Same `artifact_key` + different fingerprint returns 409 even if a new Idempotency-Key is supplied.
-- The Idempotency-Key record may cache the response for transport replay, but it is not the authority for whether the Artifact exists.
+- The Idempotency-Key remains a transport replay optimization; it is not the durable authority for whether the Artifact exists.
 - Requests without `artifact_key` retain the existing Idempotency-Key behavior in AS-1; they are outside this durable-key recovery contract.
-- Do not silently repurpose an existing Idempotency-Key with a different request fingerprint. Preserve the existing idempotency conflict semantics.
+- Do not silently repurpose an existing Idempotency-Key with a different request hash. Preserve the existing idempotency conflict semantics, including concurrent reuse of one Idempotency-Key for two different artifact keys.
+
+## 5.5 Deferred database invariants
+
+The migration must enforce both directions of the identity relationship:
+
+- A deferred constraint trigger on newly inserted/key-mutated Artifact rows verifies at commit that a non-null `artifact_key` has a matching identity row for the same tenant/project/Artifact.
+- A deferred constraint trigger on identity-row insertion verifies at commit that the referenced Artifact has exactly the same `artifact_key` and scope.
+- Runtime permissions and append-only triggers prevent identity update/delete/rebinding.
+- A BEFORE UPDATE guard rejects any change to an existing Artifact's `artifact_key`.
+
+This allows the Artifact and identity inserts to occur in either order within one transaction while preventing either side from committing alone or being paired with a mismatched key. Existing legacy rows are not retroactively rejected merely because they predate the identity table.
 
 ## 6. Legacy rows and migration safety
 
@@ -219,6 +233,20 @@ Required migration behavior:
 5. No cross-tenant existence information may be exposed by inventory or API responses.
 
 The repository's current product context says there are no real customers or historical business data, but that is not a substitute for checking the actual target database at rollout. If unexpected non-test data is found, stop rollout and obtain an explicit product decision; do not run a guessed backfill.
+
+### 6.1 Cutover gate for old reservation-first writers
+
+The current implementation reserves Idempotency-Key in a separate operation before inserting the Artifact. An old handler may therefore still be in flight while a new handler tries to recover its stale reservation.
+
+Before enabling the new keyed-create transaction path:
+
+1. deploy/operate a write-quiescence gate for keyed Artifact creation;
+2. stop admitting new keyed creates through the old handler and drain all in-flight old create handlers;
+3. confirm no old handler can subsequently insert an Artifact without a creation-identity row;
+4. reconcile pre-existing incomplete Idempotency-Key records under the explicit policy below;
+5. only then enable the new handler/database invariant.
+
+An incomplete legacy idempotency row with no matching Artifact identity is not automatically proof that no old request is still executing. It may be reused only after the old writer drain is proven. If that cannot be proven, keep the key blocked and require operator reconciliation; do not race old and new writers.
 
 ## 7. API contract
 
