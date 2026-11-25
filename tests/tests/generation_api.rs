@@ -295,7 +295,7 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     let res = auth(
         client
             .post(&url)
-            .json(&json!({"generator_id": "seecode", "input": common::minimal_input()})),
+            .json(&json!({"generator_id": "seecode", "caller_request_id": Uuid::new_v4(), "input": common::minimal_input()})),
         PROJECT_1,
     )
     .send()
@@ -310,6 +310,7 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     // 超过 256 KiB：413，带 request_id。
     let oversized = json!({
         "generator_id": "seecode",
+        "caller_request_id": Uuid::new_v4(),
         "input": {"schema": "smark.seecode.input", "padding": "x".repeat(300_000)}
     });
     let res = auth(client.post(&url).json(&oversized), PROJECT_1)
@@ -329,7 +330,7 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     let res = auth(
         client
             .post(&url)
-            .json(&json!({"generator_id": "seecode", "input": unknown})),
+            .json(&json!({"generator_id": "seecode", "caller_request_id": Uuid::new_v4(), "input": unknown})),
         PROJECT_1,
     )
     .send()
@@ -359,7 +360,7 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     let res = auth(
         client
             .post(&url)
-            .json(&json!({"generator_id": "seecode", "input": url_shaped})),
+            .json(&json!({"generator_id": "seecode", "caller_request_id": Uuid::new_v4(), "input": url_shaped})),
         PROJECT_1,
     )
     .send()
@@ -380,7 +381,7 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     let res = auth(
         client
             .post(&url)
-            .json(&json!({"generator_id": "seecode", "input": wrong_version})),
+            .json(&json!({"generator_id": "seecode", "caller_request_id": Uuid::new_v4(), "input": wrong_version})),
         PROJECT_1,
     )
     .send()
@@ -399,4 +400,220 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
         jobs_after, jobs_before,
         "no request in this test may create a job"
     );
+}
+
+// ── AS-2 Caller Request Lookup（HTTP 层）：AS2-21/22/23/24/36/41 ────────────
+
+const LOOKUP_CALLER: Uuid = Uuid::from_u128(0x0d01);
+const LOOKUP_FP: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+/// 经受控函数建一个带 caller identity 的 Job。
+async fn seed_identified(pool: &PgPool, tenant: Uuid, project: Uuid, caller: Uuid) -> (Uuid, Uuid) {
+    let artifact = common::sql_insert_artifact(pool, tenant, project, "api-identified").await;
+    common::sql_enable_seecode(pool, ADAPTER).await;
+    let (job, replayed) = common::try_sql_create_job_with_identity(
+        pool,
+        Uuid::new_v4(),
+        tenant,
+        project,
+        artifact,
+        &common::JobOptions::default(),
+        None,
+        &common::sha256_hex("lookup-request"),
+        Some((caller, LOOKUP_FP, 1)),
+    )
+    .await
+    .unwrap();
+    assert!(!replayed);
+    (job, artifact)
+}
+
+async fn lookup(base: &str, caller: Uuid, project: Uuid) -> reqwest::Response {
+    auth(
+        reqwest::Client::new().get(format!(
+            "{base}/v1/generation-jobs/by-caller-request/{caller}"
+        )),
+        project,
+    )
+    .send()
+    .await
+    .unwrap()
+}
+
+/// AS2-36：命中返回 200 + 标准 GenerationJob（含 caller_request_id）+ 可用 poll_url。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_36_lookup_serves_the_job_with_caller_identity(pool: PgPool) {
+    let (job, _) = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
+    let base = spawn(&pool).await;
+
+    let res = lookup(&base, LOOKUP_CALLER, PROJECT_1).await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], job.to_string());
+    assert_eq!(body["caller_request_id"], LOOKUP_CALLER.to_string());
+    assert_eq!(body["poll_url"], format!("/v1/generation-jobs/{job}"));
+    // 与按 job_id 查询完全一致（同 DTO）。
+    let by_id = get_job(&base, job).await;
+    assert_eq!(body, by_id);
+}
+
+/// AS2-22：跨 scope 与不存在统一 404，不泄露存在性。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_22_lookup_does_not_leak_across_scopes(pool: PgPool) {
+    let (job, _) = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
+    let base = spawn(&pool).await;
+
+    // 另一个租户查询同一个 caller_request_id：404（存在但不可见）。
+    let res = reqwest::Client::new()
+        .get(format!(
+            "{base}/v1/generation-jobs/by-caller-request/{LOOKUP_CALLER}"
+        ))
+        .header("x-project-id", PROJECT_1.to_string())
+        .header("authorization", format!("Bearer {OTHER_TENANT_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "RESOURCE_NOT_FOUND");
+
+    // 完全不存在的 caller 在同一 scope：同样 404（响应形态一致）。
+    let res = lookup(&base, Uuid::new_v4(), PROJECT_1).await;
+    assert_eq!(res.status(), 404);
+    let missing: Value = res.json().await.unwrap();
+    assert_eq!(missing["error"]["code"], "RESOURCE_NOT_FOUND");
+
+    // 只读：命中后 Job 状态未改变。
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM artifact.generation_job WHERE id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "queued");
+}
+
+/// AS2-21：无项目授权 → 403（授权在查询之前，且不泄露存在性）。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_21_lookup_requires_project_authorization(pool: PgPool) {
+    let _ = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
+    let base = spawn(&pool).await;
+    let res = lookup(&base, LOOKUP_CALLER, PROJECT_2).await;
+    assert_eq!(res.status(), 403);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "SCOPE_DENIED");
+}
+
+/// AS2-23：非法路径参数 → 400 稳定原因码。
+/// P2-01（独立审查修复）：错误响应不得回显用户提交的原始路径参数。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_23_lookup_rejects_invalid_uuid(pool: PgPool) {
+    let _ = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
+    let base = spawn(&pool).await;
+    // 哨兵值带有唯一标记，确保任何回显都能被检出。
+    let malicious = "not-a-uuid-MARKER-9f3a";
+    let res = auth(
+        reqwest::Client::new().get(format!(
+            "{base}/v1/generation-jobs/by-caller-request/{malicious}"
+        )),
+        PROJECT_1,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+    let reason = body["error"]["details"]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("invalid caller_request_id"),
+        "stable reason for a malformed path uuid, got {reason}"
+    );
+    let raw = serde_json::to_string(&body).unwrap_or_default();
+    assert!(
+        !raw.contains(malicious),
+        "the error response must not echo the raw path parameter, got {raw}"
+    );
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(malicious),
+        "the error message must not echo the raw path parameter"
+    );
+}
+
+/// AS2-24：lookup 与创建互斥于提交时点——提交前 404，提交后必达（N-6）。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_24_lookup_sees_only_committed_jobs(pool: PgPool) {
+    let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "api-commit").await;
+    common::sql_enable_seecode(&pool, ADAPTER).await;
+    let base = spawn(&pool).await;
+    let caller = Uuid::from_u128(0x0d02);
+
+    // 未提交的创建事务。
+    let mut tx = pool.begin().await.unwrap();
+    let (job, resolution): (Uuid, String) = sqlx::query_as(
+        "SELECT * FROM artifact.create_generation_job_with_input(\
+         $1, $2, $3, $4, 'seecode', $5, '{}'::jsonb, '1', $6, NULL, \
+         $7, $8, 1::smallint, 3, 300, 86400)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(TENANT)
+    .bind(PROJECT_1)
+    .bind(artifact)
+    .bind(common::minimal_input())
+    .bind(common::sha256_hex("commit-visibility"))
+    .bind(caller)
+    .bind(LOOKUP_FP)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(resolution, "created");
+
+    // 提交前：lookup 必须 404（READ COMMITTED 语句快照语义，不泄露未提交数据）。
+    let res = lookup(&base, caller, PROJECT_1).await;
+    assert_eq!(res.status(), 404);
+
+    tx.commit().await.unwrap();
+
+    // 提交后：lookup 必达同一 Job。
+    let res = lookup(&base, caller, PROJECT_1).await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], job.to_string());
+}
+
+/// AS2-41：HTTP create 继续 fail-closed 503，不因 AS-2 放开生成入口。
+#[sqlx::test(migrations = "../migrations")]
+async fn as2_41_http_create_stays_fail_closed(pool: PgPool) {
+    let (_, artifact) = seed(&pool).await;
+    let base = spawn(&pool).await;
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let res = auth(
+        reqwest::Client::new()
+            .post(format!("{base}/v1/artifacts/{artifact}/generation-jobs"))
+            .json(&json!({
+                "generator_id": "seecode",
+                "caller_request_id": Uuid::new_v4(),
+                "input": common::minimal_input()
+            })),
+        PROJECT_1,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 503);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "GENERATOR_UNAVAILABLE");
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs_before, jobs_after, "no job may be created over HTTP");
 }

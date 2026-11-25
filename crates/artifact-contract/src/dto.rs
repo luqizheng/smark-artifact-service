@@ -201,6 +201,9 @@ pub struct CreateGenerationJobRequest {
     pub options: Option<Value>,
     #[serde(default)]
     pub expected_current_version_id: Option<Uuid>,
+    /// Durable caller identity（ART-04G v3 §5.5）：调用方生成的请求身份，
+    /// 同 scope 内唯一；重放时解析回同一 Job，不创建新 Job。
+    pub caller_request_id: Uuid,
 }
 
 /// GenerationJob 的调用方视图。输入正文永不出现在响应中。
@@ -214,6 +217,8 @@ pub struct GenerationJobResponse {
     pub error_code: Option<String>,
     pub attempt_count: i32,
     pub max_attempts: i32,
+    /// Durable caller identity（ART-04G v3 §5.1）；legacy Job（迁移前创建）为 null。
+    pub caller_request_id: Option<Uuid>,
     /// running 期间已收到取消请求、尚未由 Worker 确认时为 true。
     pub cancel_requested: bool,
     pub created_at: DateTime<Utc>,

@@ -121,6 +121,14 @@ pub enum JobCancelOutcome {
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     async fn get(&self, scope: (Uuid, Uuid), job_id: Uuid) -> Result<GenerationJob, DomainError>;
+    /// Caller Request Lookup（ART-04G v3 §5.4）：按 (tenant, project, caller_request_id)
+    /// 查询 Job。谓词走部分唯一索引 `uq_generation_job_caller_request`；
+    /// 未命中与跨 scope 统一返回 `Ok(None)`（HTTP 层转 404，不泄露存在性）。
+    async fn get_by_caller_request(
+        &self,
+        scope: (Uuid, Uuid),
+        caller_request_id: Uuid,
+    ) -> Result<Option<GenerationJob>, DomainError>;
     /// 取消必须经数据库受控函数完成；租户/项目校验在函数内进行，
     /// scope 不匹配一律按 NotFound 处理，不泄露 Job 是否存在。
     async fn cancel(

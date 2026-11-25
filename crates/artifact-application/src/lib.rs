@@ -13,6 +13,10 @@ pub use port::keyed_create::{
     IdempotencyInput, KeyedArtifactCreateError, KeyedArtifactCreateOutcome,
     KeyedArtifactCreationPort, ValidatedCreateArtifactRequest,
 };
+pub use port::keyed_job_create::{
+    KeyedGenerationJobCreatePort, KeyedJobCreateError, KeyedJobCreateOutcome,
+    ValidatedCreateGenerationJobRequest,
+};
 
 pub use port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
@@ -30,6 +34,10 @@ pub use service::artifact::{
 pub use service::creation_fingerprint::{
     CURRENT_FINGERPRINT_VERSION, FingerprintError, canonical_fingerprint, current_fingerprint,
     normalize_optional_text, normalize_text,
+};
+pub use service::generation_fingerprint::{
+    CURRENT_JOB_FINGERPRINT_VERSION, GENERATION_JOB_CREATE_DOMAIN, JobFingerprintError,
+    canonical_job_document, canonical_job_fingerprint,
 };
 pub use service::generator::GeneratorService;
 pub use service::job_input::{

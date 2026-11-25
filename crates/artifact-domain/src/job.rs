@@ -66,6 +66,12 @@ pub struct GenerationJob {
     pub status: JobState,
     pub idempotency_key: Option<String>,
     pub request_hash: Option<String>,
+    /// Durable caller identity（ART-04G v3 §5.1）：三者同空（legacy Job）或同非空。
+    /// 一旦写入永久不可变（数据库触发器保证）；`request_fingerprint` 为小写
+    /// 64 位十六进制 SHA-256，`fingerprint_version` > 0。
+    pub caller_request_id: Option<Uuid>,
+    pub request_fingerprint: Option<String>,
+    pub fingerprint_version: Option<i16>,
     pub attempt_count: i32,
     pub max_attempts: i32,
     pub created_at: DateTime<Utc>,

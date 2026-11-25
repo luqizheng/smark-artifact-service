@@ -365,6 +365,143 @@ async fn runtime_role_is_dml_only(pool: sqlx::PgPool) {
     assert_eq!(pg_error_code(&direct_delete).as_deref(), Some("42501"));
     maintenance_pool.close().await;
 
+    // ── AS-2：GenerationJob caller identity 的真实权限边界（ART-04G v3 §10.5）──
+    // 目标不是「Rust API 不提供写入口」，而是 APP 角色在数据库层被实际拒绝。
+    assert!(
+        table_privilege(&pool, &app, "artifact.generation_job", "SELECT").await,
+        "the app role must still read generation jobs"
+    );
+    for privilege in ["INSERT", "UPDATE"] {
+        assert!(
+            !table_privilege(&pool, &app, "artifact.generation_job", privilege).await,
+            "generation_job writes must go through the controlled create function only \
+             (app role must not hold {privilege})"
+        );
+    }
+    assert!(
+        function_executable(
+            &pool,
+            &app,
+            "artifact.create_generation_job_with_input(\
+             uuid,uuid,uuid,uuid,text,jsonb,jsonb,text,text,text,uuid,text,smallint,integer,integer,integer)"
+        )
+        .await,
+        "the app role must be able to call the controlled create function"
+    );
+    // 内部 key 门禁 helper 不授予任何运行角色。
+    for role in [&app, &worker, &maintenance] {
+        assert!(
+            !function_executable(
+                &pool,
+                role,
+                "artifact.assert_generation_job_key_gate(uuid,uuid,text,text,uuid)"
+            )
+            .await,
+            "the internal key gate helper must never be executable by a runtime role ({role})"
+        );
+    }
+    let public_gate: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_proc p, aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) a \
+           WHERE p.oid = 'artifact.assert_generation_job_key_gate(uuid,uuid,text,text,uuid)'::regprocedure \
+             AND a.grantee = 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !public_gate,
+        "PUBLIC must not execute the internal key gate helper"
+    );
+
+    // 创建函数必须是 SECURITY DEFINER 并固定 search_path。
+    // 内部 key 门禁 helper 采用 invoker 权限（只允许被 SECURITY DEFINER 函数内部调用），
+    // 但同样固定 search_path、且不授权任何运行角色。
+    let create_signature = "artifact.create_generation_job_with_input(\
+         uuid,uuid,uuid,uuid,text,jsonb,jsonb,text,text,text,uuid,text,smallint,integer,integer,integer)";
+    let gate_signature = "artifact.assert_generation_job_key_gate(uuid,uuid,text,text,uuid)";
+    let (secdef, config): (bool, Option<Vec<String>>) =
+        sqlx::query_as("SELECT prosecdef, proconfig FROM pg_proc WHERE oid = $1::regprocedure")
+            .bind(create_signature)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(secdef, "the create function must be SECURITY DEFINER");
+    let config = config.unwrap_or_default();
+    assert!(
+        config.iter().any(|c| c.starts_with("search_path=")),
+        "the create function must pin search_path, got {config:?}"
+    );
+    let (_gate_secdef, gate_config): (bool, Option<Vec<String>>) =
+        sqlx::query_as("SELECT prosecdef, proconfig FROM pg_proc WHERE oid = $1::regprocedure")
+            .bind(gate_signature)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let gate_config = gate_config.unwrap_or_default();
+    assert!(
+        gate_config.iter().any(|c| c.starts_with("search_path=")),
+        "the key gate helper must pin search_path, got {gate_config:?}"
+    );
+
+    // 正向：APP 经受控函数创建合法 Job。
+    let owned_artifact =
+        common::sql_insert_artifact(&pool, common::TENANT, common::PROJECT_1, "as2-role").await;
+    sqlx::query(
+        "UPDATE artifact.generator_registry SET status='available' WHERE generator_id='seecode'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let created: (Uuid, String) = sqlx::query_as(
+        "SELECT * FROM artifact.create_generation_job_with_input(\
+         $1, $2, $3, $4, 'seecode', $5, '{}'::jsonb, '1', repeat('a', 64), NULL, \
+         NULL::uuid, NULL::text, NULL::smallint, 3, 300, 86400)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::TENANT)
+    .bind(common::PROJECT_1)
+    .bind(owned_artifact)
+    .bind(common::minimal_input())
+    .fetch_one(&app_pool)
+    .await
+    .unwrap();
+    assert_eq!(created.1, "created");
+
+    // 反向：APP 直接被拒绝写 generation_job。
+    let direct_insert = sqlx::query(
+        "INSERT INTO artifact.generation_job \
+         (id, tenant_id, project_id, artifact_id, generator_id, generator_version, \
+          adapter_version, input_payload, input_schema_version, input_sha256, request_hash, status) \
+         VALUES ($1, $2, $3, $4, 'seecode', 'v0', 'a', '{}'::jsonb, '1', repeat('0',64), \
+                 repeat('a',64), 'queued')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::TENANT)
+    .bind(common::PROJECT_1)
+    .bind(owned_artifact)
+    .execute(&app_pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pg_error_code(&direct_insert).as_deref(),
+        Some("42501"),
+        "the app role must not INSERT generation_job rows directly"
+    );
+
+    let direct_update =
+        sqlx::query("UPDATE artifact.generation_job SET caller_request_id = $2 WHERE id = $1")
+            .bind(created.0)
+            .bind(Uuid::new_v4())
+            .execute(&app_pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        pg_error_code(&direct_update).as_deref(),
+        Some("42501"),
+        "the app role must not UPDATE generation_job identity columns directly"
+    );
+
     common::drop_test_roles(&pool, &[&migrator, &app, &worker, &maintenance]).await;
     app_pool.close().await;
     pool.close().await;

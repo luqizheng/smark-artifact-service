@@ -636,6 +636,25 @@ impl ArtifactService {
         Ok(to_job_dto(&job))
     }
 
+    /// Caller Request Lookup（ART-04G v3 §5.4）：与 get_job 相同的身份验证与授权
+    /// 模型（delegation tenant scope + X-Project-Id project scope +
+    /// `Action::GenerationRead`）。查询谓词强制 tenant + project + caller；
+    /// 跨 scope 与不存在统一返回 NotFound（不泄露存在性），且绝不修改状态。
+    pub async fn get_job_by_caller_request(
+        &self,
+        delegation: &Delegation,
+        scope: &TenantScope,
+        caller_request_id: Uuid,
+    ) -> Result<GenerationJobResponse, DomainError> {
+        delegation.require(Action::GenerationRead, scope)?;
+        let job = self
+            .jobs
+            .get_by_caller_request((scope.tenant_id, scope.project_id), caller_request_id)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+        Ok(to_job_dto(&job))
+    }
+
     pub async fn cancel_job(
         &self,
         delegation: &Delegation,
@@ -798,6 +817,7 @@ pub fn to_job_dto(j: &GenerationJob) -> GenerationJobResponse {
         error_code: j.error_code.clone(),
         attempt_count: j.attempt_count,
         max_attempts: j.max_attempts,
+        caller_request_id: j.caller_request_id,
         cancel_requested: j.cancel_requested(),
         created_at: j.created_at,
         poll_url: format!("/v1/generation-jobs/{}", j.id),

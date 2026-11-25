@@ -72,6 +72,10 @@ fn server_routes() -> Vec<(String, Vec<String>)> {
         ),
         ("/v1/generation-jobs/{job_id}".into(), vec!["get".into()]),
         (
+            "/v1/generation-jobs/by-caller-request/{caller_request_id}".into(),
+            vec!["get".into()],
+        ),
+        (
             "/v1/generation-jobs/{job_id}/cancel".into(),
             vec!["post".into()],
         ),
@@ -173,10 +177,194 @@ fn generation_job_documents_outcome_fields() {
 
     let responses =
         &spec["paths"]["/v1/artifacts/{artifact_id}/generation-jobs"]["post"]["responses"];
-    for status in ["202", "400", "409", "413", "503"] {
+    for status in ["200", "202", "400", "409", "413", "500", "503"] {
         assert!(
             responses.get(status).is_some(),
             "requestGeneration must document {status}"
+        );
+    }
+}
+
+/// AS2-37：AS-2 的 OpenAPI parity —— DTO ↔ schema 双向、必填 caller_request_id、
+/// 可空响应字段、resolution 头、新路由与 409/500 错误码。
+#[test]
+fn as2_37_openapi_mirrors_caller_identity_contract() {
+    let spec = load_spec();
+
+    // 请求：caller_request_id 必填且为 uuid。
+    let create = &spec["components"]["schemas"]["CreateGenerationJobRequest"];
+    let required: Vec<String> = create["required"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        required.contains(&"caller_request_id".to_string()),
+        "caller_request_id must be required in the create request"
+    );
+    let caller = &create["properties"]["caller_request_id"];
+    assert_eq!(caller["format"].as_str(), Some("uuid"));
+
+    // 响应：caller_request_id 可空。
+    let job_caller =
+        &spec["components"]["schemas"]["GenerationJob"]["properties"]["caller_request_id"];
+    let types: Vec<String> = job_caller["type"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(types.contains(&"string".to_string()) && types.contains(&"null".to_string()));
+
+    // resolution 头三值。
+    let enum_values: Vec<String> =
+        spec["components"]["headers"]["GenerationJobResolution"]["schema"]["enum"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+    assert_eq!(
+        enum_values,
+        vec!["created", "caller_request_replay", "idempotency_replay"]
+    );
+
+    // POST 200/202 都必须声明 resolution 头。
+    let responses =
+        &spec["paths"]["/v1/artifacts/{artifact_id}/generation-jobs"]["post"]["responses"];
+    for status in ["200", "202"] {
+        assert!(
+            responses[status]["headers"]
+                .get("X-Generation-Job-Resolution")
+                .is_some(),
+            "the {status} response must document the resolution header"
+        );
+    }
+    // 409 说明并入 CALLER_REQUEST_ID_REUSED；500 说明两个完整性错误码。
+    let conflict = responses["409"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(conflict.contains("CALLER_REQUEST_ID_REUSED"), "{conflict}");
+    let integrity = responses["500"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        integrity.contains("CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH")
+            && integrity.contains("IDEMPOTENCY_KEY_CROSS_IDENTITY"),
+        "{integrity}"
+    );
+
+    // lookup 路由：路径参数 + 404 语义。
+    let lookup = &spec["paths"]["/v1/generation-jobs/by-caller-request/{caller_request_id}"]["get"];
+    let params = lookup["parameters"].as_sequence().unwrap();
+    let has_path_param = params.iter().any(|p| {
+        p["name"].as_str() == Some("caller_request_id") && p["in"].as_str() == Some("path")
+    });
+    assert!(
+        has_path_param,
+        "caller_request_id path parameter must be documented"
+    );
+    assert!(lookup["responses"].get("404").is_some());
+}
+
+/// AS2-38：新增稳定错误码进入 contract 映射（HTTP status + 不可重试）。
+#[test]
+fn as2_38_new_error_codes_are_mapped() {
+    use artifact_contract::ErrorEnvelope;
+    use artifact_domain::DomainError;
+
+    let cases = [
+        (
+            DomainError::CallerRequestIdReused("x".into()),
+            "CALLER_REQUEST_ID_REUSED",
+            409,
+        ),
+        (
+            DomainError::InvalidIdempotencyKey("x".into()),
+            "INVALID_IDEMPOTENCY_KEY",
+            400,
+        ),
+        (
+            DomainError::FingerprintVersionMismatch("x".into()),
+            "CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH",
+            500,
+        ),
+        (
+            DomainError::IdempotencyKeyCrossIdentity("x".into()),
+            "IDEMPOTENCY_KEY_CROSS_IDENTITY",
+            500,
+        ),
+    ];
+    for (err, code, status) in cases {
+        let envelope = ErrorEnvelope::from_domain(&err, None);
+        assert_eq!(envelope.error.code, code);
+        assert_eq!(envelope.http_status(), status, "{code} status");
+        assert!(!envelope.error.retryable, "{code} must be non-retryable");
+    }
+}
+
+/// P1-03（独立审查修复）：Error.code 枚举必须覆盖服务端实际会产生的全部
+/// 稳定错误码。每个 DomainError::code() 都必须出现在 OpenAPI 枚举中，
+/// 防止新增错误变体时契约静默漂移；HTTP status 语义由 as2_38 与
+/// ErrorEnvelope::http_status 映射负责，数据库内部 token 不直接越过该映射。
+/// 注意：新增 DomainError 变体时必须同步扩展下方的显式清单。
+#[test]
+fn error_code_enum_covers_every_domain_error() {
+    use artifact_domain::DomainError;
+
+    let spec = load_spec();
+    let enum_values: Vec<String> =
+        spec["components"]["schemas"]["Error"]["properties"]["error"]["properties"]["code"]["enum"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+    let produced = [
+        DomainError::InvalidRequest(String::new()),
+        DomainError::ScopeDenied(String::new()),
+        DomainError::NotFound,
+        DomainError::VersionConflict(String::new()),
+        DomainError::IdempotencyKeyReused(String::new()),
+        DomainError::CallerRequestIdReused(String::new()),
+        DomainError::FingerprintVersionMismatch(String::new()),
+        DomainError::IdempotencyKeyCrossIdentity(String::new()),
+        DomainError::InvalidIdempotencyKey(String::new()),
+        DomainError::ArtifactKeyConflict(String::new()),
+        DomainError::ArtifactKeyLegacyUnverifiable(String::new()),
+        DomainError::UnsupportedMediaType(String::new()),
+        DomainError::PayloadTooLarge(String::new()),
+        DomainError::StorageUnavailable(String::new()),
+        DomainError::GeneratorUnavailable(String::new()),
+        DomainError::GeneratorValidationFailed(String::new()),
+        DomainError::PersistenceUnavailable(String::new()),
+        DomainError::Internal(String::new()),
+    ];
+    for code in produced.iter().map(|err| err.code()) {
+        assert!(
+            enum_values.iter().any(|v| v == code),
+            "the OpenAPI error code enum must document {code}"
+        );
+    }
+    // 认证失败信封由 ApiError::Unauthenticated 产生，同样必须入库。
+    assert!(
+        enum_values.iter().any(|v| v == "UNAUTHENTICATED"),
+        "UNAUTHENTICATED must stay documented"
+    );
+    // 独立审查 P1-03 点名的四个 AS-2 新增码，显式固化。
+    for code in [
+        "CALLER_REQUEST_ID_REUSED",
+        "CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH",
+        "IDEMPOTENCY_KEY_CROSS_IDENTITY",
+        "INVALID_IDEMPOTENCY_KEY",
+    ] {
+        assert!(
+            enum_values.iter().any(|v| v == code),
+            "the AS-2 error code {code} must stay in the enum"
         );
     }
 }
