@@ -332,6 +332,27 @@ ARC 不直接 SELECT/UPDATE 业务表。它使用专属只读 DB role，仅执�
 
 ARC 不改变 DB Job 状态。Worker 仍调用 DB 受控函数完成 heartbeat/complete/fail/confirm；ARC 只根据验证结果控制隔离单元。DB cancelled 与 ARC DeathUnconfirmed 可同时成立，且 API/运维必须分别展示“DB 执行资格已撤销”和“进程回收尚未确认”。
 
+### 9.1 PostgreSQL 与 Runtime 的跨系统竞态
+
+PostgreSQL 事务与 containerd/cgroup 操作之间没有分布式原子提交。本设计不声称 cancel commit 与 OS kill 能形成同一瞬时线性化点。
+
+因此必须区分：
+- **DB authority fencing**：cancel/stale/deadline 在数据库提交后，complete/fail/confirm 等 DB 受控函数立即拒绝旧 Attempt 的结果提交或状态复活；
+- **Runtime revocation**：ARC 在下一次 authority poll、Worker Kill 请求或 session 失联检测后，执行 KillOnly 并回收 sandbox。
+
+在两者之间可能存在一个有界的 runtime observation window。该窗口内 Executor 可能仍消耗受限 CPU/内存，但由于其无网络、无业务凭据、无 DB/File Service/Artifact API 访问能力，不能产生业务副作用或提交结果。输出在 DeathConfirmed 前不可读取。此窗口是安全模型的一部分，必须有明确上界和监控，不得描述成“cancel commit 后进程瞬间停止”。
+
+必须满足：
+1. ARC 在 Start 前执行 authority validation；若非 active，拒绝 Start。
+2. ARC 在运行期间以固定、可测的最大间隔重新验证 authority；cancel/stale/deadline/unknown/DB timeout 均进入 KillOnly。
+3. Worker 收到 cancel_requested、stale 或 deadline_exceeded 时立即请求 ARC Kill；该快速路径不能替代 ARC 自主 watchdog。
+4. 定义最大 observation window：authority poll interval + validation RPC timeout + scheduler jitter + kill-to-death-confirm upper bound。参数需在目标节点实测后冻结；不能只给默认值。
+5. 若无法证明该窗口有界，节点不得进入生产 Ready。
+6. DB 状态撤销后，ARC 不得接受任何新的 Start/Resume/Exec；已有 sandbox 只允许 Kill/Inspect/WaitForDeath。
+7. DB cancelled 但 ARC 尚未 DeathConfirmed 的期间，运维界面必须分别展示两种状态，不能用单一“已取消”掩盖回收延迟。
+
+这避免对 PostgreSQL 与 OCI runtime 作出不可能的原子性承诺，同时依靠 sandbox 无副作用与 ARC 有界回收保持安全。
+
 ## 10. 故障处理矩阵
 
 | 故障 | ARC 行为 | DB/Worker 行为 | 资源处理 |
