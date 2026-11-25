@@ -5,7 +5,8 @@
 - 唯一规范性依据：ART-04G v3（§1–§9 + §10 冻结修订）。ART-04I 仅作为第三轮挑战评审记录，
   其结论已并入 v3 §10，不作为并列规范。
 - 范围：仅 AS-2。未涉及 AS-3（`target_version_id` 原子绑定）、AS-4（HTTP 生成入口接线）、
-  PM-1/2/3、AI-PM、SeeCode/LMMS/File Service 实施，未合并 PR #8。
+  PM-1/2/3、AI-PM、SeeCode/LMMS/File Service 实施。
+- 合并状态（2026-11-25 后续状态补记）：本报告对应的 AS-2 已通过 PR #9 合并至 `main`，merge commit `b5095cf4a4065d417ae3fed3250dda4cd78d010a`；其前置 AS-1 已通过 PR #8 合并，merge commit `9d50f520bd0413889294d0d1d30163f6865328f3`。以上仅表示代码进入主干，不表示执行 Migration 0004/0005、部署服务或开放生成链路。
 
 ## 1. 变更文件清单
 
@@ -263,8 +264,8 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 | 是否启用 Generator / Worker？ | **否** |
 | 是否实施 AS-3（`target_version_id` 原子绑定）？ | **否** |
 | 是否修改 AI-PM？ | **否** |
-| 是否合并 PR #8？ | **否** |
-| 是否合并 AS-2 PR？ | **否（保持 Draft）** |
+| PR #8（AS-1）是否合并？ | **是，已合并至 main（`9d50f520`）；仅代码集成** |
+| PR #9（AS-2）是否合并？ | **是，已合并至 main（`b5095cf4`）；仅代码集成** |
 
 ## 11. 已知风险与未关闭事项
 
@@ -291,3 +292,8 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 即假设第一方必为 created；改为顺序无关断言——恰好一方 created、另一方按 caller 解析，
 与矩阵 AS2-17 语义一致，连续 8 次本地复跑通过）。
 其余 AS-2 与 AS-1 测试不受影响，全量回归通过。
+
+
+## 13. 合并状态补记（2026-11-25）
+
+本报告在 PR #9 合并前形成，原始实施阶段记录与 CI 证据保留为历史事实。后续状态以本节为准：PR #8（AS-1）和 PR #9（AS-2）均已合并至 `main`。合并不代表生产数据库已执行 0004/0005，不代表服务已部署，也不代表 Generation Create、Generator、Worker 或 SeeCode 已启用。AS2-46 仍需部署窗口实测证据；AS-1 #35/#52/#53/#55 人工部署门禁仍未关闭。
