@@ -96,6 +96,8 @@ Additional implementation requirements:
 5. Artifact deletion/archive does not release the key. Identity rows are retained for at least as long as the Artifact identity can be referenced or reconciled.
 6. The identity row's composite FK enforces that the referenced Artifact belongs to the same tenant/project.
 7. Do not store the original input/spec body in this table. Store only the canonical fingerprint and the minimal identity metadata.
+8. Add a **deferred constraint trigger** for newly inserted or key-mutated Artifact rows: at transaction commit, any Artifact row with non-null `artifact_key` that was inserted/changed in that transaction must have its matching creation-identity row. The trigger must allow pre-existing legacy rows to remain identity-less until touched, and must not permit a new keyed Artifact to commit without identity. The identity insert may occur after the Artifact insert in the same transaction because the check is deferred.
+9. Enforce `artifact_key` immutability after creation in the same migration. A key must not be changed to evade the permanent identity mapping; a separate future migration/reconciliation process is required for any exceptional correction.
 
 ### 3.1 Why a separate table
 
@@ -146,7 +148,7 @@ Version 1 MUST specify and test all of the following:
 
 The API implementation must calculate the fingerprint from the validated semantic DTO, not from raw JSON bytes. Equivalent JSON property ordering/whitespace must produce the same fingerprint.
 
-If canonicalization semantics change, introduce fingerprint version 2. Never reinterpret or rewrite existing version-1 fingerprints in place. On lookup, compare using the stored version's canonicalization implementation; if an old version can no longer be evaluated, fail closed with an explicit recoverability error rather than treating it as a new create.
+If canonicalization semantics change, introduce fingerprint version 2. Never reinterpret or rewrite existing version-1 fingerprints in place. On lookup, canonicalize the incoming semantic DTO using the **stored identity's fingerprint version**, then compare hashes. This lets a current server compare a retry against an older identity without changing the old record. If an old version's canonicalizer can no longer be evaluated, fail closed with an explicit recoverability error rather than treating it as a new create.
 
 ### 4.3 Actor identity
 
