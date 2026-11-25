@@ -295,6 +295,25 @@ Death predicate 至少包含：
 
 节点掉电时 OS 进程随节点停止，但重启后必须扫描残留 runtime metadata/cgroup；没有被 ARC 识别的 Attempt 容器必须隔离并删除，不得自动恢复执行。
 
+
+### 7.5 ARC 自身故障的独立 fail-safe 回收（新增强制门禁）
+
+ARC 是 runtime 控制者，但不能同时成为自己故障时唯一的恢复机制。containerd/cgroup 不会因为 ARC 进程退出或卡死而自动终止现有 Executor。因此，“ARC 重启后 reconciliation”只能描述恢复步骤，不能单独证明 observation window 有界。
+
+生产节点必须增加一个**独立于 Worker 与 ARC 生命周期的 Node Runtime Guardian（NRG，节点级 fail-safe guardian）**，或提供经独立评审证明等价的内核/runtime 强制期限机制：
+
+- NRG 只拥有 Attempt 专属 cgroup 根范围内的 KillOnly 能力；不得创建 sandbox、启动 Executor、读取输出、访问 DB、操作 Artifact/File Service 或推进 Job 状态。
+- ARC 必须向 NRG 续租节点级控制租约/心跳。NRG 超过固定失联阈值未收到有效续租，必须禁止该节点新 Start，并对该节点所有由 Artifact Service 管理的 Attempt cgroup 执行 fail-safe kill。
+- NRG 必须由独立节点服务管理器监督（例如 systemd watchdog/restart）；其检测、重启、扫描和 kill 的最坏时延必须纳入 observation window。ARC 与 NRG 不得共享同一个进程、线程池、事件循环或可共同阻塞的 RPC 依赖。
+- NRG 不依赖 PostgreSQL 可用性；DB 不可达时仍能执行本地 KillOnly。NRG 无法确认自身健康、权限或 cgroup 根范围时，节点不得 Ready。
+- NRG 重启后先枚举其授权范围内的 Artifact Attempt cgroup；未知、journal 不一致、ARC lease 过期或无法识别的资源一律 KillOnly，不得恢复执行。
+- NRG 不能确认 kill 时，节点进入 Quarantined；禁止新 Attempt、禁止输出读取和目录清理，保留证据并人工处置。
+- 必须明确节点管理器、NRG、ARC、kernel/runtime 各自的故障假设。若无法给出 ARC 失联至 NRG kill 的实测上界，不能声称 bounded fail-closed。
+
+NRG 是宿主机 fail-safe kill-only 组件，不是第二个 ARC，不成为 Job/Attempt 状态权威，也不向 Worker 暴露通用控制 API。
+
+新增验收：ARC 在 Create/Start/Running/Kill 任意阶段被 SIGKILL 或永久挂起，NRG 必须在冻结的上界内阻止新 Start 并终止全部受管 Attempt；同时注入 NRG 进程崩溃、watchdog 超时、权限丢失、cgroupfs 异常，验证节点 fail closed。该测试必须覆盖 ARC 与 Worker 同时故障。
+
 ## 8. 输出冻结、目录保留与清理
 
 ARC 不把宿主 scratch path 暴露给 Worker。所有输出通过 ReadFrozenOutput RPC 读取。
@@ -352,6 +371,32 @@ PostgreSQL 事务与 containerd/cgroup 操作之间没有分布式原子提交�
 7. DB cancelled 但 ARC 尚未 DeathConfirmed 的期间，运维界面必须分别展示两种状态，不能用单一“已取消”掩盖回收延迟。
 
 这避免对 PostgreSQL 与 OCI runtime 作出不可能的原子性承诺，同时依靠 sandbox 无副作用与 ARC 有界回收保持安全。
+
+
+### 9.2 DB 授权检查与 Runtime Start 的不可原子竞态（新增强制语义）
+
+PostgreSQL validation 与 containerd Start 是两个独立系统操作，不能通过“Start 前再查一次 DB”获得跨系统原子性。以下时序始终可能发生：
+
+1. ARC 的 authority validation 读取到 active；
+2. PostgreSQL 随后提交 cancel/stale/deadline；
+3. ARC 的 Start 请求随后才到达 containerd，Executor 因而短暂启动或继续运行。
+
+因此，原文中“DB 状态撤销后，ARC 不得接受任何新的 Start/Resume/Exec”必须按可实现语义收敛，不能暗示 DB commit 能瞬时 fencing 一个尚未观察到撤销的 runtime。
+
+规范语义：
+
+- DB commit 立即撤销 DB 侧 complete/fail/confirm/heartbeat 的旧 Attempt 权限；这是数据库内的提交 fencing。
+- ARC 的 Start 只能使用 DB authority validation 签发/确认的短时 StartPermit。Permit 必须绑定 job/attempt/attempt_number、worker session、runtime identity、单调递增 operation generation、到期 duration 与唯一 nonce；不可跨 Attempt、跨 session 或跨 runtime 重用。
+- StartPermit 的最大有效期必须明确，且由 ARC 使用暂停感知 monotonic clock 保守执行；不得只依赖 ARC 本机 wall clock。Permit 到期或 ARC 失去 DB authority 验证能力后，禁止新的 Start/Resume/Exec。
+- 已经取得有效 Permit、但尚未完成的 Start 与 DB cancel commit 仍可能竞争。该竞态不得被描述为“绝不启动”；必须将 Permit 最大寿命、在途 Start RPC 上界、NRG 失联回收上界、kill-to-death-confirm 上界统一纳入 observation window。
+- ARC 一旦观察到 cancel/stale/deadline/unknown，或 Permit 到期，必须先持久化 KillRequested fencing，再拒绝所有新 Start/Resume/Exec；对已经 in-flight 的 Start 执行同一 operation generation 的状态复核，确保它不能在 KillRequested 后转为可运行状态。若 runtime API 无法提供可证明的取消/检查顺序，则必须由 NRG 的 kill-only fencing 收敛，不得宣称 ARC 内部锁可以原子化 PostgreSQL 与 containerd。
+- DB cancel commit 后，在观察窗口内可能发生的仅是无副作用 sandbox 内的受限计算；不得有网络、业务凭据、DB/File Service/Artifact API 或宿主控制面访问。窗口到期仍未 DeathConfirmed 时节点 Quarantined，不能继续运行或清理。
+- 指标必须记录最后一次 active validation、Permit expiry、Start operation generation、cancel 首次观察、KillRequested、NRG kill、DeathConfirmed 时间戳；使用单调时钟并记录时钟源/误差预算。
+
+更新后的最大 observation window 至少覆盖：
+max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll interval + validation timeout + scheduler jitter, ARC failure detection + NRG watchdog/restart + NRG kill latency) + kill-to-death-confirm upper bound + safety margin。
+
+上述每项必须在目标 kernel、containerd、节点服务管理器和实际部署拓扑上实测。任一项无上界、NRG 不可用或时钟不满足暂停感知要求，节点不得 Ready。
 
 ## 10. 故障处理矩阵
 
@@ -471,6 +516,16 @@ PostgreSQL 事务与 containerd/cgroup 操作之间没有分布式原子提交�
 - 并发运行多个 Attempt，验证 CPU/memory/PID/scratch 隔离；一个 Attempt 被 kill 不得影响其他 Attempt。
 - 测试必须保留可审计证据：内核版本、runtime 版本、cgroup 配置、测试镜像 digest、日志、指标和失败样本。
 
+
+新增验收矩阵（必须纳入 ARC-T 系列并在实施前冻结编号）：
+- ARC-T38：ARC 在 Create/Start/Running/Kill 阶段 SIGKILL/永久挂起；NRG 在上界内 kill 全部 Attempt，禁止新 Start。
+- ARC-T39：ARC 与 Worker 同时崩溃，NRG 独立回收；DB 不可达不影响本地 KillOnly。
+- ARC-T40：NRG 崩溃/卡死/watchdog 超时/重启；节点不得 Ready，恢复后先全量扫描并 KillOnly 未知资源。
+- ARC-T41：DB cancel 与 StartPermit 签发、Start RPC 交错；验证 Permit 最大寿命和完整 observation window，不出现窗口外运行。
+- ARC-T42：Start RPC 响应丢失且 KillRequested 并发提交；迟到 Start completion 不得使 Executor 运行或复活。
+- ARC-T43：journal 在 intent fsync、runtime create/start/kill、completion fsync 各边界崩溃；重启后无重复资源，未知资源全部 KillOnly。
+- ARC-T44：journal 损坏、磁盘满、fsync 错误、runtime label 缺失/重复；ARC/NRG fail closed，禁止 Start 与 cleanup。
+
 ## 13. 分阶段实施顺序
 
 ### Phase 0 — 节点能力探测与威胁模型确认
@@ -511,6 +566,11 @@ PostgreSQL 事务与 containerd/cgroup 操作之间没有分布式原子提交�
 | ART-03B-02 Supervisor FSM v2.2 | 定义 Worker 与 ARC 的调用时序/不确定状态 | 设计候选，未批准实施 |
 | DB-BLOCKER-01 | 定义取消优先、Attempt/Job 锁序与终态 | PR #5 设计中 |
 | DB-BLOCKER-02 | 为 ARC 提供可验证的 lease/deadline 剩余时间 | 设计候选，未实现 |
+
+| ARC 自身故障的独立回收 | 原设计未给出 ARC 失联时的独立 kill watchdog | 新增 NRG/等价机制与故障上界实测，未完成前生产阻断 |
+| DB validation → runtime Start 竞态 | 两系统无原子提交，原“撤销后绝不 Start”过强 | 短时 StartPermit + 在途操作 fencing + NRG kill 收敛，完整窗口实测 |
+| journal 持久化故障语义 | 原文提出 durable journal，但未定义 fsync 顺序/损坏/磁盘满处理 | 明确 write-ahead intent、fsync、runtime label 对账；不确定一律 KillOnly |
+
 | Runtime authority validation DB function | ARC 独立验证 Attempt 权限 | 未设计/未实现，需独立 SQL 审查 |
 | Linux cgroup v2 + OCI runtime | 硬隔离与进程树终止 | 目标平台待选型/实测 |
 | LMMS delegation P0 / File Service finalize P0 | Artifact 正式提交与 READY | 独立生产 P0，不能由本设计绕过 |
