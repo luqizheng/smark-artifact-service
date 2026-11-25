@@ -269,7 +269,7 @@ ART-03B-01（迁移 0002）评审发现 §3 至 §5 的部分裁决没有落到�
 - A3A-04 §4.1 的"已到期的 retry_wait"由 `next_attempt_at` 落实，§4.2 的续租上限由 `deadline_at` 落实。
 - ART-03B-01 的 Worker 构建不含任何 Adapter，因此 `run` 只做协调维护（租约恢复与输入清理），不领取 Job。领取与执行循环属于 ART-03B-02。
 
-API 契约的配套增量已由用户确认，并由 AI-PM 的 ART-01 V1 API Errata 001 纳入正式 V1 契约（2026-11-25）。增量均为向后兼容的新增：`GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；`requestGeneration` 文档化 409 `IDEMPOTENCY_KEY_REUSED` 与 413 `PAYLOAD_TOO_LARGE`。该确认不代表生成 API 启用；无 SeeCode Adapter 时仍 fail-closed 返回 503 `GENERATOR_UNAVAILABLE`。
+API 契约的配套增量已由用户确认，并由本仓库 `docs/architecture/ART-01-V1-API-ERRATA-001.md` 纳入正式 V1 契约（2026-11-25）。增量均为向后兼容的新增：`GenerationJob` 响应新增 `error_code`、`attempt_count`、`max_attempts`、`cancel_requested`；`requestGeneration` 文档化 409 `IDEMPOTENCY_KEY_REUSED` 与 413 `PAYLOAD_TOO_LARGE`。该确认不代表生成 API 启用；无 SeeCode Adapter 时仍 fail-closed 返回 503 `GENERATOR_UNAVAILABLE`。
 
 部署顺序固定为：迁移，然后执行 `deploy/db-roles.sql`，再启动服务。迁移若重建函数，其 EXECUTE 授权随旧函数丢失，所以每次迁移之后都必须重新执行授权脚本。
 
