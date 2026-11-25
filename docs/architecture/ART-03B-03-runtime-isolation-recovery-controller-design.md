@@ -334,6 +334,44 @@ NRG 是宿主机 fail-safe kill-only 组件，不是第二个 ARC，不成为 Jo
 
 该协议仍不能使 PostgreSQL 与 containerd 原子化；它只解决 ARC 自身操作日志与 runtime 副作用之间的崩溃一致性。必须通过 ARC-T43/T44 故障注入验证。
 
+
+### 7.7 Start admission revoke 的执行机制尚未裁决（第二轮复审阻断）
+
+当前信任拓扑仍让 ARC 直接持有 containerd socket 和 cgroup 管理权限，同时要求 NRG 在 ARC 失联时撤销 ARC 的 Start admission。这两个要求之间缺少一个可验证的强制执行点。关闭 UDS、关闭客户端 socket 或更新 NRG admission generation，都不能自动证明已经进入 containerd 的 Start RPC 不会在稍后生效。
+
+**禁止把“NRG 关闭 ARC control channel”直接当作 in-flight Start 已被取消。** gRPC/UDS 客户端断开不等价于服务端操作已回滚；必须在目标 containerd/OCI runtime 上证明请求取消、任务删除和迟到响应的顺序。
+
+实施前必须在以下两种拓扑中明确选择并完成真实 runtime 原型，不得混用术语：
+
+**方案 A — NRG 独占 Attempt cgroup execution fence（候选，优先验证）**
+- NRG 独占 Attempt cgroup 的 cgroup.freeze / cgroup.kill 写权限；ARC、Worker、Executor 均无 cgroup 写权限。
+- NRG 撤销 admission 时，先将对应 Attempt cgroup freeze，并等待 cgroup.events 报告 frozen；freeze 未确认前不声称执行已被 fencing。
+- 所有 Executor 进程必须在执行第一条用户态指令前进入该 Attempt cgroup；目标 OCI runtime 必须证明 Start 不会先在 cgroup 外执行再迁入。
+- cgroup 保持 frozen，直到 StartPermit/NRG admission generation 已失效、所有 in-flight runtime Start 操作已确定结束、runtime task/container 已删除；随后 NRG 执行 cgroup.kill 并确认 populated=0，再移除 cgroup。
+- 若 ARC/容器 runtime 可以解除 freeze、迁移进程、重新创建同一 Attempt cgroup，或无法证明 Start 进程先入组再执行，则方案 A 不成立，节点不得 Ready。
+- 必须对 freeze 与 Start 同时发生、freeze 返回后迟到 Start、containerd/runc 重试、ARC crash 后 runtime shim 继续执行做真实并发测试。
+
+**方案 B — NRG 成为唯一受限 Runtime Broker（备选）**
+- ARC 不再持有 containerd socket/cgroup 写权限；所有 Create/Start/Stop/Delete 请求经 NRG 的窄 RPC。
+- NRG 在单一持久化 admission generation 下串行化 Start 与 revoke；revoke 与 Start 的线性化点必须位于同一控制进程/持久化状态机内。
+- NRG 故障时由独立节点服务管理器执行节点级 fail-closed；必须定义 NRG 已发送但 containerd 尚未完成的 RPC 如何被 fence，不能只依赖 gRPC cancel。
+- 此方案意味着 NRG 不再是纯 KillOnly 组件；它是最小权限 runtime broker，需重新评审其 Create/Start 权限、攻击面和故障恢复。
+
+在 A/B 方案未选定前，NRG 的 Start-admission revoke 只是一项要求，不是已经定义的能力；ARC-T45 不能仅以关闭 socket 后 cgroup populated=0 作为通过标准。
+
+### 7.8 DeathConfirmed 的 runtime 侧关闭条件（第二轮复审补充）
+
+cgroup.events populated=0 是一个观察点，不单独证明之后不会有迟到 Start 创建新 task。DeathConfirmed 必须同时满足：
+
+1. Attempt cgroup 已由 NRG freeze，且 frozen 状态得到内核事件确认；
+2. StartPermit 与 NRG admission generation 已撤销，旧 generation 的请求不可再获准；
+3. 所有可能创建该 Attempt task 的 runtime 操作均已完成、明确失败或被目标 runtime 证明不可再提交；客户端断开不能作为该证据；
+4. OCI runtime task/container 已停止并删除，restart policy 明确为 disabled；不存在会自动重建 task 的外部 supervisor；
+5. NRG 执行 cgroup.kill 后，cgroup.events populated=0，并确认 cgroup 不可再被旧 runtime operation 重新填充；
+6. cgroup 已移除或保持永久不可执行的隔离状态，runtime metadata/tombstone 能拒绝旧 operation_id 重放。
+
+任一项未知、超时或无法证明，状态必须是 DeathUnconfirmed/Quarantined；不允许读取输出、提交或清理。必须保留 frozen cgroup 作为安全隔离，不得为了清理而解除 freeze。
+
 ## 8. 输出冻结、目录保留与清理
 
 ARC 不把宿主 scratch path 暴露给 Worker。所有输出通过 ReadFrozenOutput RPC 读取。
@@ -417,6 +455,21 @@ PostgreSQL validation 与 containerd Start 是两个独立系统操作，不能�
 max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll interval + validation timeout + scheduler jitter, ARC failure detection + NRG watchdog/restart + NRG kill latency) + kill-to-death-confirm upper bound + safety margin。
 
 上述每项必须在目标 kernel、containerd、节点服务管理器和实际部署拓扑上实测。任一项无上界、NRG 不可用或时钟不满足暂停感知要求，节点不得 Ready。
+
+
+### 9.3 StartPermit 的时间锚定与 DB 线性化契约（第二轮复审补充）
+
+StartPermit 不能只定义一个到期时间字段。DB 与节点时钟不同源，且验证响应可能延迟。DB-BLOCKER-02 必须提供可保守换算的剩余时长契约：
+
+- authority validation 在数据库内读取当前 Job/Attempt 状态，并返回 active/cancel_requested/stale/deadline_exceeded/unknown 与向下取整的 start_permit_remaining_ms；该时长不得超过当前 lease/deadline 中较早者的剩余时间，也不得超过配置的 StartPermit 上限。
+- ARC 在发出 validation RPC 前记录本机 CLOCK_BOOTTIME（或经证明同样计入系统 suspend 的等价时钟）发送锚点 t_send；本机 permit cutoff 采用 t_send + remaining_ms - transport_guard - scheduler_guard，绝不能使用收到响应时的 t_receive + remaining_ms。
+- 若响应到达时 cutoff 已过、剩余时间不足以覆盖 Start RPC 与最坏 kill 预算，拒绝 Start 并进入 KillOnly/Abandon。
+- 同一 StartPermit 只允许一个 operation_id；Start 超时/响应不确定后，不得用同一 permit 盲目发起第二个 Start。必须 Inspect/冻结并按 §7.7 收敛。
+- DB 函数的读取语义、隔离级别、是否需要锁定 Attempt/Job、与 cancel/recovery 的锁序必须在 DB-BLOCKER-02 独立 SQL 设计中明确。若函数不锁行，必须证明 permit TTL 上界足以覆盖读取与撤销竞态；若函数锁行，必须证明不会引入与 DB-BLOCKER-01 相反的锁顺序。
+- DB cancel commit 后允许已经签发的短时 Permit 在其剩余有效期内与 Start 竞争；这属于明示的有限窗口，不是取消失效。DB 侧 complete/fail/confirm 必须立即按 DB 状态拒绝旧 Attempt。
+- Linux 节点 suspend/resume 后，ARC/NRG 必须先用 suspend-aware 时钟检查 Permit/admission lease；在完成 authority refresh 和 cgroup reconciliation 前，不得解除任何 frozen cgroup 或接受 Start。
+
+CLOCK_MONOTONIC 在 Linux 系统 suspend 期间不计时；生产契约必须使用 CLOCK_BOOTTIME 或证明等价的 suspend-aware 时钟，不能只写泛称 monotonic clock。
 
 ## 10. 故障处理矩阵
 
@@ -545,7 +598,10 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 - ARC-T42：Start RPC 响应丢失且 KillRequested 并发提交；迟到 Start completion 不得使 Executor 运行或复活。
 - ARC-T43：journal 在 intent fsync、runtime create/start/kill、completion fsync 各边界崩溃；重启后无重复资源，未知资源全部 KillOnly。
 - ARC-T44：journal 损坏、磁盘满、fsync 错误、runtime label 缺失/重复；ARC/NRG fail closed，禁止 Start 与 cleanup。
-- ARC-T45：NRG 撤销 admission 时存在 in-flight Start；先撤销 ARC runtime control channel，再核验 runtime/cgroup，不允许迟到 Start 在 kill 后复活；无法证明则 Quarantined。
+- ARC-T45：NRG 撤销 admission 时存在 in-flight Start；验证所选方案 A/B 的实际 fencing 点、迟到 Start 与 runtime task 删除顺序；仅关闭客户端 channel 不算通过，无法证明则 Quarantined。
+- ARC-T46：freeze 与 Start 并发/迟到 Start；所有 Executor 必须在第一条用户态指令前进入冻结的 Attempt cgroup，不能在 cgroup 外短暂执行。
+- ARC-T47：ARC/NRG 节点 suspend/resume；Permit/admission cutoff 使用 CLOCK_BOOTTIME 或等价时钟，恢复后先 reconciliation，绝不因 suspend 延长执行权。
+- ARC-T48：containerd/runc Start RPC 超时、客户端断开、shim 延迟响应、runtime 重试；DeathConfirmed 前证明所有创建 task 的在途操作已收敛，不能仅依据一次 populated=0。
 
 ## 13. 分阶段实施顺序
 
@@ -573,10 +629,10 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 - DeathUnconfirmed 隔离与人工处置。
 
 ### Phase 4 — 安全复核与生产门禁
-- ARC-T01–T44 通过；
+- ARC-T01–T48 通过；
 - 资源限制与网络逃逸负向测试通过；
 - 1,000+ 故障注入矩阵通过；
-- 安全复核证明 Worker 不持 runtime 特权，NRG 仅具备限定范围 KillOnly + Start admission revoke 权限；
+- 安全复核证明 Worker 不持 runtime 特权，NRG 的 cgroup freeze/kill 权限或受限 runtime broker 权限经独立验证；
 - 与 ART-03B-02 FSM、DB-BLOCKER-01/02 真实集成通过。
 
 ## 14. 依赖、阻断与最终裁决
