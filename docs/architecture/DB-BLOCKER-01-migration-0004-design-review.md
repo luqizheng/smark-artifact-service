@@ -123,3 +123,36 @@ Supervisor/平台测试另需证明：
 | cgroup/container controller | 必须在 Worker/Supervisor 崩溃后仍可回收 | 未关闭，属于 03B-03 实施证据 |
 
 **总裁决仍为 Design Changes Required / Not approved for implementation。** 本补充消除了 DB 终态与 OS 死亡的语义混淆，但没有证明当前部署具备外部隔离单元的独立回收能力，也没有真实 PostgreSQL 并发测试证据。不得据此创建 Migration 0004 SQL。
+
+
+---
+
+## 13. Preflight 与 CHECK 启用之间的并发写入竞态（独立复审补充）
+
+### 13.1 原顺序存在竞态
+
+仅按 §4.1 的文字顺序“先查询异常行，再 ADD CHECK”并不充分：如果 preflight 查询结束后、CHECK 约束生效前仍有并发写路径提交 queued/retry_wait + cancel_requested_at 非空，迁移可能在未检查该新行的情况下完成，或在约束验证时失败。不能把“现有函数按约定不会写入”当作数据库级证明。
+
+### 13.2 规范迁移顺序
+
+未来 Migration 0004 必须采用 race-free 顺序。首选候选如下，最终仍需按目标 PostgreSQL 版本和迁移框架验证锁级别：
+
+1. 在受控事务中先添加目标 CHECK，使用 NOT VALID 形式。该约束不扫描历史行，但自创建后必须对后续 INSERT/UPDATE 生效。
+2. 在同一事务/受控迁移窗口中执行历史异常行 preflight，并同时检查相关 Attempt 状态。
+3. 若异常行数量非零，显式抛出迁移错误并回滚整个迁移；不清理、不改写历史数据。
+4. 若为零，执行 VALIDATE CONSTRAINT。
+5. 提交前确认约束为 validated，并运行约束定义与异常行数量的只读断言。
+
+如果迁移框架无法保证上述 DDL 与 preflight 的事务边界，则必须先证明替代锁策略能够阻止 preflight 与约束生效之间的并发写入；否则不得实施。
+
+### 13.3 锁与并发证明要求
+
+- 记录目标 PostgreSQL 主版本下 ADD CHECK NOT VALID、VALIDATE CONSTRAINT 的实际锁模式及锁持有时长；不得凭经验假设。
+- 明确迁移期间已有的 INSERT/UPDATE 事务如何被约束创建锁阻塞，以及约束创建提交后新事务如何受到 CHECK 检查。
+- VALIDATE 阶段必须允许/拒绝哪些并发 DML，由 PostgreSQL 实际锁语义与真实多连接测试证明。
+- Migration 中任何失败必须使函数替换、约束对象和迁移 ledger 保持原子回滚；若迁移工具不支持事务 DDL，必须单独给出安全升级状态机。
+- 预检命中异常行时，错误输出只包含必要 ID/计数，不泄露输入正文或租户敏感内容；历史数据修复仍是独立审批操作。
+
+**验收新增 DB01-0004-T27：** 在迁移执行期间并发提交一条试图写入 queued/retry_wait + cancel_requested_at 非空的事务。该写入必须被新 CHECK 拒绝，或在约束建立前被迁移锁阻塞并在约束生效后重新检查；绝不允许 Migration 成功而留下非法行。
+
+本节是设计要求，不代表已在目标 PostgreSQL 版本或当前迁移框架上验证。
