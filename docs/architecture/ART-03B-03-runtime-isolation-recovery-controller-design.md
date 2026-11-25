@@ -137,7 +137,8 @@ ARC 与 Worker 位于同一节点但不同进程身份。ARC 由 systemd/节点�
 | RequestAttemptKill | 单向进入 KillOnly 并终止整棵隔离单元 | 幂等；不允许取消 kill |
 | WaitForDeath | 等待并确认 cgroup/container 中不存在进程 | 有 deadline；超时返回 DeathUnconfirmed |
 | ReadFrozenOutput | 读取 death-confirm 后冻结的 allowlisted 输出 | 只读、文件数/单文件/总字节限额、拒绝 symlink/path traversal |
-| CleanupAttemptSandbox | 清理已 death-confirm 且输出已消费/放弃的资源 | 需 cleanup capability 和幂等 tombstone |
+| AcknowledgeOutputDisposition | Worker 声明输出已消费或明确放弃 | 必须携带 ARC 签发的 output receipt；幂等 |
+| CleanupAttemptSandbox | 清理已 death-confirm 且输出 disposition 已确认的资源 | 需 ARC 签发的 cleanup capability 和幂等 tombstone |
 
 协议禁止：
 - 任意命令、shell、可执行路径、环境变量、mount、host path、container runtime 参数；
@@ -148,6 +149,8 @@ ARC 与 Worker 位于同一节点但不同进程身份。ARC 由 systemd/节点�
 
 所有请求有 request_id、worker_session_id、job_id、attempt_id、attempt_number、protocol_version。ARC 从服务端配置推导镜像 digest、资源配额、seccomp profile、mount allowlist、网络策略，不接受 Worker 覆盖安全配置。
 
+ARC 必须对同一 runtime identity 的 Create/Start/Kill/Inspect/Freeze/Cleanup 操作提供线性化裁决：使用 per-attempt durable operation journal + 单一状态转换锁/CAS。KillRequested 一旦持久化即成为不可逆 fencing point；所有尚未完成的 Start/Create completion 在继续前必须重新检查 generation/state，不能在 KillRequested 之后启动 Executor。多个 ARC 实例若部署在同一节点，必须由节点级单实例锁或共享一致性协调保证只有一个控制者；首版推荐每节点单 ARC active instance。
+
 ### 5.2 Worker 身份与 Attempt capability
 
 不能只依赖 Worker 自报 `job_id/attempt_id`。ARC 必须验证调用者身份和 Attempt 的 DB 执行权：
@@ -157,6 +160,7 @@ ARC 与 Worker 位于同一节点但不同进程身份。ARC 由 systemd/节点�
 - capability 至少绑定 service audience、worker identity/session、job_id、attempt_id、attempt_number、lease token 或其不可逆证明、到期时间、nonce。
 - ARC 使用独立 DB role 调用**只读、窄权限的 Attempt runtime authority 验证函数**，验证 capability 对应的 token hash、Job/Attempt 仍 running、Lease/deadline 与 cancel 状态；ARC role 仅有该函数 EXECUTE，不获得业务表 SELECT/DML。
 - DB 验证函数的具体 schema、参数、返回枚举与权限在 DB-BLOCKER-02/后续 DB 设计中单独评审；本文不创建函数或 Migration。
+- capability 必须绑定 ARC 建立的 worker session nonce。Worker 进程重启后不得继承旧 session；新 session 不能凭相同 worker_id 接管旧 Attempt。
 - capability 不得成为 Artifact/File Service 的业务授权，不得用于上传或 READY 提交。
 
 ARC 的独立 DB 验证是安全边界，不是让 ARC 变成第二个 Job worker。ARC 只验证是否允许创建/继续该隔离单元，不领取 Job、不推进 Job 状态、不执行结果结算。
@@ -165,7 +169,7 @@ ARC 的独立 DB 验证是安全边界，不是让 ARC 变成第二个 Job worke
 
 ### 5.3 Worker session 与资源归属
 
-ARC 为每个 Worker 连接建立 session，并为每个 Attempt 记录不可复用的 runtime identity：
+ARC 为每个 Worker 进程建立 session，并为每个 Attempt 记录不可复用的 runtime identity：
 - worker service identity + worker process/session nonce；
 - job_id / attempt_id / attempt_number；
 - runtime resource ID（由 ARC 生成，不接受 Worker 指定）；
@@ -174,7 +178,9 @@ ARC 为每个 Worker 连接建立 session，并为每个 Attempt 记录不可复
 - 当前 Runtime lifecycle state；
 - death-confirm 与 cleanup 证据摘要。
 
-一个 Worker session 不能操作另一个 session 的 sandbox；即使相同 Worker ID 重启，新的 session nonce 也不能直接继承旧 Attempt 的执行权，必须重新通过 DB authority 验证。
+Worker session nonce 是进程级随机值，只在该 Worker 进程内存中持有；ARC 同时维护 session 连接状态。ARC 重启后，仍存活的同一 Worker 进程必须通过原 session secret 完成 reattach；ARC 通过 UDS peer credential + session proof 双重确认。Worker 进程已重启、secret 丢失或 session 身份不匹配时，不得 re-adopt 旧 sandbox，即使 DB lease 暂时仍显示 active；ARC 必须 KillOnly，让 DB recovery 按既定协议处理。这样避免“新 Worker 进程凭同一 worker_id 接管旧 Executor”的身份混淆。
+
+一个 Worker session 不能操作另一个 session 的 sandbox；相同 Worker ID 不代表相同进程所有权。
 
 ## 6. Sandbox 安全配置基线
 
@@ -279,9 +285,12 @@ Death predicate 至少包含：
 - containerd/cgroup 资源可能仍存在，不能假设 ARC 进程退出会自动杀死所有容器；
 - ARC 重启后先进入 Reconciliation，不接受新 Create/Start；
 - 按 runtime labels 与持久化 journal 枚举所有本服务 Attempt resource；
-- 对每个资源调用 DB authority 验证：仍有效且可安全 re-adopt 的，重新建立监控；cancelled/stale/expired/unknown 的，立即 KillOnly；
+- 对每个资源先验证 runtime identity、原 worker session 与 durable journal；只有原 Worker 进程仍存活并使用原 session secret 成功 reattach，且 DB authority 仍 active，才允许 re-adopt 并继续监控；
+- 若 Worker 进程已重启、session secret 丢失/不匹配、session 已断开超过策略窗口，或 ARC 无法证明原所有者仍存活，则即使 DB lease 尚未过期也 KillOnly；不允许新 Worker 进程接管旧 Executor；
+- cancelled/stale/expired/unknown 的资源立即 KillOnly；
 - DB 不可达时，不重新启动任何容器；已有容器进入 KillOnly，直至可确认死亡或人工隔离；
 - 完成全量 reconciliation、确认不存在未知/重复 runtime identity 后才进入 Ready；
+- Create 在 runtime create 成功但 journal 写入前崩溃时，通过 runtime label 中的 operation_id/attempt_id 发现孤儿；同一 Attempt 出现多个 runtime resource 时全部 KillOnly 并隔离节点，不任选一个继续；
 - 重复 create/kill/cleanup 通过 idempotency key + runtime identity 防止双资源。
 
 节点掉电时 OS 进程随节点停止，但重启后必须扫描残留 runtime metadata/cgroup；没有被 ARC 识别的 Attempt 容器必须隔离并删除，不得自动恢复执行。
@@ -294,8 +303,8 @@ ARC 不把宿主 scratch path 暴露给 Worker。所有输出通过 ReadFrozenOu
 1. DeathConfirmed 后，ARC 对输出目录做只读冻结（mount/permission/immutable snapshot 以平台能力实现），禁止任何进程继续写入。
 2. ARC 构造输出 manifest：规范化相对路径、文件类型、长度、SHA-256、总字节数；拒绝 symlink、hardlink、特殊文件、路径穿越和超限。
 3. Worker 只通过 ReadFrozenOutput 读取 manifest 中允许的普通文件；读取过程使用 fd-relative/no-follow 语义，防止 TOCTOU。
-4. Worker 完成安全检查与后续 File Service 协议后，发出 CleanupAttemptSandbox；若结果被放弃，也需明确终结 disposition。
-5. ARC 删除容器、cgroup、scratch，保留最小 tombstone（Attempt ID、runtime ID hash、death-confirm 时间、cleanup 时间、结果码、manifest hash），不保留输入/输出正文。
+4. Worker 完成安全检查与后续 File Service 协议后，调用 AcknowledgeOutputDisposition(consumed)；若结果被放弃，也必须明确调用 AcknowledgeOutputDisposition(discarded)。ARC 校验 output receipt 后签发一次性 cleanup capability。
+5. Worker 使用 cleanup capability 调用 CleanupAttemptSandbox。ARC 删除容器、cgroup、scratch，保留最小 tombstone（Attempt ID、runtime ID hash、death-confirm 时间、cleanup 时间、结果码、manifest hash），不保留输入/输出正文。
 6. 若 DeathUnconfirmed、ARC 状态未知或 cleanup 操作不确定，目录继续隔离，不允许 TTL 自动删除。
 
 输出读取和清理必须幂等。Worker 重试读取同一冻结 manifest，必须得到相同字节/hash；不允许 Executor 再次运行后覆盖同一 Attempt 的输出。
@@ -400,10 +409,12 @@ ARC 不改变 DB Job 状态。Worker 仍调用 DB 受控函数完成 heartbeat/c
 |---|---|---|
 | ARC-T17 | Worker 在 Create/Start/Kill/ReadOutput/Cleanup 每个 RPC 前后崩溃 | 每种不确定性可 inspect/reconcile，不创建第二隔离单元 |
 | ARC-T18 | ARC 在 Create/Start/Kill/DeathConfirm/Cleanup 每个阶段崩溃 | 重启全量 reconcile，状态单调收敛 |
-| ARC-T19 | ARC 重启时发现 DB active 的 sandbox | 仅经 DB authority + runtime identity 校验后 re-adopt |
+| ARC-T19 | ARC 重启时发现 DB active 的 sandbox，原 Worker 进程仍存活并提供原 session proof | 仅经 DB authority + runtime identity 校验后 re-adopt |
+| ARC-T19a | ARC 重启时原 Worker 已重启，session secret 不存在 | 不允许新进程接管；旧 sandbox KillOnly，DB recovery 收敛 |
 | ARC-T20 | ARC 重启时发现 cancelled/stale/expired/unknown sandbox | 不 re-adopt，立即 KillOnly |
 | ARC-T21 | DB 不可达时 ARC 重启 | 不 Start/不恢复；已有 sandbox fail closed 并回收 |
 | ARC-T22 | 同一 Create/Kill/Cleanup 请求重复发送 | 幂等，同一 Attempt 最多一个 runtime resource |
+| ARC-T22a | Start 与 Kill 并发/响应乱序 | KillRequested fencing point 后绝不允许 Start 生效 |
 | ARC-T23 | 旧 Worker session 重放 capability | 拒绝；新 session 不能继承旧 session 控制权 |
 | ARC-T24 | 伪造 job_id/attempt_id/runtime_id 控制其他 Worker sandbox | 拒绝，不影响其他 Attempt |
 
@@ -417,6 +428,7 @@ ARC 不改变 DB Job 状态。Worker 仍调用 DB 受控函数完成 heartbeat/c
 | ARC-T28 | 输出文件数/单文件/总大小超限 | fail closed，不上传 |
 | ARC-T29 | DeathUnconfirmed 时 TTL 到期 | 不清理、不复用 scratch |
 | ARC-T30 | cleanup 响应丢失后重复 cleanup | 幂等；保留 tombstone，不误删其他资源 |
+| ARC-T30a | Worker 未提交 output disposition 就请求 cleanup | ARC 拒绝；资源继续保留 |
 | ARC-T31 | 清理完成后旧 capability 再次访问 | 拒绝，Removed 不可复活 |
 
 ### 12.5 数据库授权与时间
