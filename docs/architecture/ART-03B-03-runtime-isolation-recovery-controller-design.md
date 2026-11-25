@@ -571,10 +571,10 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 - DeathUnconfirmed 隔离与人工处置。
 
 ### Phase 4 — 安全复核与生产门禁
-- ARC-T01–T37 通过；
+- ARC-T01–T44 通过；
 - 资源限制与网络逃逸负向测试通过；
 - 1,000+ 故障注入矩阵通过；
-- 安全复核证明 Worker 不持 runtime 特权；
+- 安全复核证明 Worker 不持 runtime 特权，NRG 仅具备限定范围 KillOnly 权限；
 - 与 ART-03B-02 FSM、DB-BLOCKER-01/02 真实集成通过。
 
 ## 14. 依赖、阻断与最终裁决
@@ -585,11 +585,9 @@ max(StartPermit lifetime + in-flight Start upper bound, ARC authority poll inter
 | ART-03B-02 Supervisor FSM v2.2 | 定义 Worker 与 ARC 的调用时序/不确定状态 | 设计候选，未批准实施 |
 | DB-BLOCKER-01 | 定义取消优先、Attempt/Job 锁序与终态 | PR #5 设计中 |
 | DB-BLOCKER-02 | 为 ARC 提供可验证的 lease/deadline 剩余时间 | 设计候选，未实现 |
-
 | ARC 自身故障的独立回收 | 原设计未给出 ARC 失联时的独立 kill watchdog | 新增 NRG/等价机制与故障上界实测，未完成前生产阻断 |
 | DB validation → runtime Start 竞态 | 两系统无原子提交，原“撤销后绝不 Start”过强 | 短时 StartPermit + 在途操作 fencing + NRG kill 收敛，完整窗口实测 |
 | journal 持久化故障语义 | 原文提出 durable journal，但未定义 fsync 顺序/损坏/磁盘满处理 | 明确 write-ahead intent、fsync、runtime label 对账；不确定一律 KillOnly |
-
 | Runtime authority validation DB function | ARC 独立验证 Attempt 权限 | 未设计/未实现，需独立 SQL 审查 |
 | Linux cgroup v2 + OCI runtime | 硬隔离与进程树终止 | 目标平台待选型/实测 |
 | LMMS delegation P0 / File Service finalize P0 | Artifact 正式提交与 READY | 独立生产 P0，不能由本设计绕过 |
