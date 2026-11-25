@@ -306,6 +306,69 @@ fn as2_38_new_error_codes_are_mapped() {
     }
 }
 
+/// P1-03（独立审查修复）：Error.code 枚举必须覆盖服务端实际会产生的全部
+/// 稳定错误码。每个 DomainError::code() 都必须出现在 OpenAPI 枚举中，
+/// 防止新增错误变体时契约静默漂移；HTTP status 语义由 as2_38 与
+/// ErrorEnvelope::http_status 映射负责，数据库内部 token 不直接越过该映射。
+/// 注意：新增 DomainError 变体时必须同步扩展下方的显式清单。
+#[test]
+fn error_code_enum_covers_every_domain_error() {
+    use artifact_domain::DomainError;
+
+    let spec = load_spec();
+    let enum_values: Vec<String> =
+        spec["components"]["schemas"]["Error"]["properties"]["error"]["properties"]["code"]["enum"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+    let produced = [
+        DomainError::InvalidRequest(String::new()),
+        DomainError::ScopeDenied(String::new()),
+        DomainError::NotFound,
+        DomainError::VersionConflict(String::new()),
+        DomainError::IdempotencyKeyReused(String::new()),
+        DomainError::CallerRequestIdReused(String::new()),
+        DomainError::FingerprintVersionMismatch(String::new()),
+        DomainError::IdempotencyKeyCrossIdentity(String::new()),
+        DomainError::InvalidIdempotencyKey(String::new()),
+        DomainError::ArtifactKeyConflict(String::new()),
+        DomainError::ArtifactKeyLegacyUnverifiable(String::new()),
+        DomainError::UnsupportedMediaType(String::new()),
+        DomainError::PayloadTooLarge(String::new()),
+        DomainError::StorageUnavailable(String::new()),
+        DomainError::GeneratorUnavailable(String::new()),
+        DomainError::GeneratorValidationFailed(String::new()),
+        DomainError::PersistenceUnavailable(String::new()),
+        DomainError::Internal(String::new()),
+    ];
+    for code in produced.iter().map(|err| err.code()) {
+        assert!(
+            enum_values.iter().any(|v| v == code),
+            "the OpenAPI error code enum must document {code}"
+        );
+    }
+    // 认证失败信封由 ApiError::Unauthenticated 产生，同样必须入库。
+    assert!(
+        enum_values.iter().any(|v| v == "UNAUTHENTICATED"),
+        "UNAUTHENTICATED must stay documented"
+    );
+    // 独立审查 P1-03 点名的四个 AS-2 新增码，显式固化。
+    for code in [
+        "CALLER_REQUEST_ID_REUSED",
+        "CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH",
+        "IDEMPOTENCY_KEY_CROSS_IDENTITY",
+        "INVALID_IDEMPOTENCY_KEY",
+    ] {
+        assert!(
+            enum_values.iter().any(|v| v == code),
+            "the AS-2 error code {code} must stay in the enum"
+        );
+    }
+}
+
 #[test]
 fn every_business_path_documents_401() {
     // 无 DB 依赖的静态部分：规范中每个业务路径都声明了 401。

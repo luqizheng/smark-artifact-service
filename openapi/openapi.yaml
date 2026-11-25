@@ -624,7 +624,10 @@ components:
           properties:
             code:
               type: string
-              description: 稳定错误码（ART-01 §8.1）
+              description: 稳定错误码（ART-01 §8.1）。本枚举必须覆盖服务端实际会返回的
+                全部稳定错误码（DomainError::code() 与 UNAUTHENTICATED），由
+                contract_openapi::error_code_enum_covers_every_domain_error 双向校验。
+                GENERATION_TIMEOUT 同时是 GenerationJob.error_code 的终态值。
               enum:
                 - INVALID_REQUEST
                 - UNAUTHENTICATED
@@ -632,6 +635,13 @@ components:
                 - RESOURCE_NOT_FOUND
                 - VERSION_CONFLICT
                 - IDEMPOTENCY_KEY_REUSED
+                - CALLER_REQUEST_ID_REUSED
+                - INVALID_IDEMPOTENCY_KEY
+                - CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH
+                - IDEMPOTENCY_KEY_CROSS_IDENTITY
+                - ARTIFACT_KEY_CONFLICT
+                - ARTIFACT_KEY_LEGACY_UNVERIFIABLE
+                - PERSISTENCE_UNAVAILABLE
                 - PAYLOAD_TOO_LARGE
                 - UNSUPPORTED_MEDIA_TYPE
                 - GENERATOR_VALIDATION_FAILED
