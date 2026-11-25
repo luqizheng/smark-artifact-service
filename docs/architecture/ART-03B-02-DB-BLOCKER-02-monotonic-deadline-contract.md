@@ -131,10 +131,11 @@ claim 成功不等于一定可以 spawn：
 
 ## 6. 时钟与运行时前提
 
-- Worker 使用 OS monotonic clock（例如 .NET Stopwatch），不得用 DateTime.UtcNow/系统 wall clock 计算 cutoff。
-- Supervisor 进程内所有 deadline、lease、RPC timeout、shutdown budget 使用同一 monotonic 时间域。
+- Worker 使用**暂停感知的单调时钟**，不得默认 .NET Stopwatch/QueryPerformanceCounter/CLOCK_MONOTONIC 在所有平台都包含系统睡眠时间；不得用 DateTime.UtcNow/系统 wall clock 计算 cutoff。
+- 平台适配层必须证明时钟在 VM suspend、宿主睡眠期间仍推进，或具备可靠的 resume 检测并在恢复时强制 KillOnly。Linux 优先评估 CLOCK_BOOTTIME；Windows 选择包含低功耗睡眠时间的单调计时源（例如 GetTickCount64），并验证其分辨率/回绕语义。未通过验证的平台不得运行生成 Executor。
+- Supervisor 进程内所有 deadline、lease、RPC timeout、shutdown budget 使用同一暂停感知 monotonic 时间域。
 - monotonic clock 进程重启后不可恢复；Supervisor 崩溃后不得恢复旧 Attempt 的本地执行资格，只能由 DB lease/recovery 处理。
-- VM suspend/resume、宿主机睡眠、容器暂停可能影响不同平台 monotonic clock 的计时语义；必须在支持矩阵中说明并测试。若平台不能保证暂停期间 deadline 仍按预期推进，恢复后必须做保守校验并在不确定时 KillOnly。
+- VM suspend/resume、宿主机睡眠、容器暂停必须有平台级测试；不能证明计时持续推进时，恢复后无条件 KillOnly，不得继续 Executor。
 - 不假设 NTP 无偏差；DB wall clock 只用于 DB 自身生成 deadline 与剩余时长。
 - DB 主机时钟必须保持单调合理性（系统时钟大幅回拨/跳跃仍可能影响 timestamptz deadline）；这属于 DB 平台时钟运维约束，应记录为基础设施风险。duration 协议解决 DB 与 Worker 之间的时钟映射，不解决 DB 自身时钟回拨。
 
