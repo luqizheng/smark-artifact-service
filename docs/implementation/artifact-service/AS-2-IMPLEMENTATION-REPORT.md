@@ -17,7 +17,7 @@
 | `crates/artifact-application/src/service/generation_fingerprint.rs` | 指纹 v1 canonicalizer（显式 code point 排序）与 golden/边界单测 |
 | `crates/artifact-application/src/port/keyed_job_create.rs` | GenerationJob keyed-create 端口、validated DTO、outcome/error 分层 |
 | `crates/artifact-infrastructure/src/postgres/keyed_job_create.rs` | 单事务 PostgreSQL 实现、token-first 分类、有界重试 |
-| `tests/tests/as2_caller_identity.rs` | 32 项真实 PostgreSQL 16 集成/并发/故障注入测试 |
+| `tests/tests/as2_caller_identity.rs` | 34 项真实 PostgreSQL 16 集成/并发/故障注入测试 |
 
 修改：
 
@@ -146,7 +146,7 @@ key 冲突判定）、`input_sha256`（持久化输入快照哈希）。v1 froze
 | AS2-07 | `unknown_fingerprint_version_fails_closed` | PASS |
 | AS2-08 | `as2_08_validation_failure_leaves_no_residue` | PASS |
 | AS2-09 | `as2_09_replay_after_commit_returns_same_job` | PASS |
-| AS2-10 | `as2_10_killed_transaction_leaves_no_half_row`（INSERT 后、COMMIT 前真实 `pg_terminate_backend`） | PASS |
+| AS2-10 | 三阶段：`as2_10a_termination_before_insert_leaves_nothing` / `as2_10b_termination_before_commit_rolls_back` / `as2_10c_termination_after_commit_is_durable_and_replayable`（真实 `pg_terminate_backend` + `pg_stat_activity` 退出确认，见 §8） | PASS |
 | AS2-11 | `as2_11_key_bound_to_other_job_rejects_without_identity` | PASS |
 | AS2-12 | `as2_12_generator_unavailable_leaves_no_residue` | PASS |
 | AS2-13 | `as2_13_replay_survives_generator_disabled` | PASS |
@@ -159,7 +159,7 @@ key 冲突判定）、`input_sha256`（持久化输入快照哈希）。v1 froze
 | AS2-20 | `as2_20_same_caller_isolated_across_scopes` | PASS |
 | AS2-21 | `as2_21_lookup_requires_project_authorization` | PASS |
 | AS2-22 | `as2_22_lookup_does_not_leak_across_scopes` | PASS |
-| AS2-23 | `as2_23_lookup_rejects_invalid_uuid` | PASS |
+| AS2-23 | `as2_23_lookup_rejects_invalid_uuid`（含不回显原始输入断言，见 §12） | PASS |
 | AS2-24 | `as2_24_lookup_sees_only_committed_jobs` | PASS |
 | AS2-25 | `as2_25_unkeyed_semantics_preserved` | PASS |
 | AS2-26 | `as2_26_legacy_job_lookup_returns_none` | PASS |
@@ -187,7 +187,7 @@ key 冲突判定）、`input_sha256`（持久化输入快照哈希）。v1 froze
 | AS2-47 | `as2_47_48_cross_key_requests_are_rejected` | PASS |
 | AS2-48 | `as2_47_48_cross_key_requests_are_rejected` | PASS |
 | AS2-49 | `as2_49_precommitted_cross_requests_both_conflict`（先全部提交再并发） | PASS |
-| AS2-50 | `as2_50_exception_block_reapplies_key_gate`（行锁屏障，见 §8） | PASS |
+| AS2-50 | `as2_50_exception_block_reapplies_key_gate`（真实 caller 唯一索引竞争，见 §8） | PASS |
 | AS2-51 | `as2_51_generator_unavailable_is_a_business_error` | PASS |
 | AS2-52 | `as2_52_padded_key_hits_normalized_binding`（`' K2 '` → 409） | PASS |
 | AS2-52a | `as2_52a_blank_keys_equal_none_and_htab_is_kept` | PASS |
@@ -211,12 +211,29 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 - AS2-49：两个交叉请求涉及的 Job A/B 与 key 绑定全部先提交，再并发发起
   `{caller A, F_A, K2}` 与 `{caller B, F_B, K1}`；两侧 caller 命中后 key gate 必见已提交的外来绑定，
   因此**确定**双双 409（不依赖随机调度）。
-- AS2-50：使用 `BEFORE INSERT` 行锁屏障 + `pg_blocking_pids()` 观测：
-  1. 主连接 `UPDATE artifact.as2_barrier ... FOR UPDATE`（未提交）；
-  2. T1（caller A + K50）在 `BEFORE INSERT` 触发器中 `FOR UPDATE` 阻塞 → 尚未写入任何唯一索引条目；
-     测试以 `pg_blocking_pids(T1) ∋ 主连接 pid` 证明阻塞位置（有界 `yield_now` 轮询 + 10s 上限，无 sleep）；
-  3. T2（caller B + K50，不同 raw hash）提交；T3（caller A + K3）提交；
-  4. 主连接提交释放屏障 → T1 违例进入异常块 → 必须返回 409 `IDEMPOTENCY_KEY_REUSED`，K50 仍只绑定 T2。
+- AS2-50（R1 修复后）：真实 `uq_generation_job_caller_request` 唯一索引竞争，无测试辅助表：
+  1. T3 开启事务创建 caller A + K3 并保持未提交 —— caller A 唯一索引条目的未提交持有者；
+  2. T1 请求 caller A + K50：读前查未命中（T3 未提交）→ INSERT 真实阻塞在 caller 唯一索引上，
+     等待 T3 的事务（`wait_event = transactionid`）。阻塞位置以三项证据证明：
+     `pg_blocking_pids(T1) == [T3]`、`wait_event_type='Lock'`、活跃语句即本创建调用
+     （有界 `yield_now` 轮询 + 10s 上限，无 sleep）；
+  3. T2（caller B + K50，不同 raw hash）在 T1 仍阻塞时提交（§10.3 时序前提）；
+  4. T3 提交 → T1 确认 `unique_violation` 进入异常块 → 新语句快照重读 caller A（指纹一致）→
+     key gate 必见 T2 已提交的绑定 → 409 `IDEMPOTENCY_KEY_REUSED`；终态断言：恰好 2 个 Job，
+     caller A/caller B/K50 各只绑定 T3/T2/T2 的行，T1 无残留、无改写。
+  - 索引处理顺序说明：PostgreSQL 按索引 OID 升序执行插入期唯一性检查；测试以同名同定义
+    重建 `uq_generation_job_idempotency_key`（仅 OID 变化，唯一性语义与谓词逐字不变），
+    使 caller 索引先于 key 索引被检查，避免 T1 的 speculative K50 条目反向阻塞 T2、
+    破坏 §10.3 的提交顺序前提。
+- AS2-10 三阶段（R1 修复后，分别实现、分别断言）：
+  - 阶段 A：未提交的 `SHARE` 表锁作为 INSERT 前注入点（函数的 SELECT 仅需 ACCESS SHARE，
+    不冲突；INSERT 的 ROW EXCLUSIVE 与 SHARE 冲突）→ `pg_terminate_backend` → 轮询
+    `pg_stat_activity` 确认 backend 真正退出 → 断言无 Job / 无身份 / 无 key 绑定；
+  - 阶段 B：显式 BEGIN + 函数返回 `'created'` 证明 INSERT 已执行 → 独立管理连接终止 →
+    等待 backend 退出（不凭 `pg_terminate_backend` 返回值或客户端断开推断回滚）→
+    断言数据库无持久化残留，重试收敛一个 Job；
+  - 阶段 C：COMMIT 后终止连接（响应丢失）→ 断言 Job/身份/key 完整持久化，
+    同 caller + 同指纹重放返回同一 Job、不创建重复。
 - AS2-53：R2 创建事务先开启并 INSERT（未提交）→ R1 重放完整返回（gate 早于 R2 提交）→ R2 提交。
   断言 R1=200 `caller_request_replay` 且解析回 A，R2=created B，K2 最终只绑定 B，A 的身份/key/hash 未被改写。
 - AS2-19：用 `BEFORE INSERT` 触发器注入 `40001`，以 sequence（非事务性）计数，验证端口恰好重试 3 次后
@@ -232,7 +249,9 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 - `GenerationJobResponse.caller_request_id: Option<Uuid>`（legacy 为 null）。
 - OpenAPI：create 请求 `required` 增加 `caller_request_id`；GenerationJob 增加可空字段；
   POST 增加 200 重放响应与 `X-Generation-Job-Resolution` 头（header 组件三值）；
-  409 说明并入 `CALLER_REQUEST_ID_REUSED`；500 说明两个完整性错误码；Idempotency-Key 规范化语义写入参数描述。
+  409 说明并入 `CALLER_REQUEST_ID_REUSED`；500 说明两个完整性错误码；Idempotency-Key 规范化语义写入参数描述；
+  `Error.code` 枚举补齐服务端实际产出的全部稳定错误码（4 个 AS-2 新码 + AS-1 既有产出码），
+  由 `contract_openapi::error_code_enum_covers_every_domain_error` 固化覆盖关系。
 - SDK：新增 `ArtifactClient::get_generation_job_by_caller_request`。按 AS-4 边界，未新增 SDK 的
   get/cancel job 方法。
 
@@ -253,3 +272,19 @@ SELECT count(*) FROM artifact.generation_job WHERE caller_request_id IS NOT NULL
 - `request_hash` 由传输层提供，本工作包未接线 HTTP create（AS-4 门禁），因此端口的 `request_hash`
   目前只有测试使用；AS-4 接线时必须取自真实请求体哈希。
 - 指纹 v1 一经发布不得原地修改；未来语义变化必须新增 `fingerprint_version` 并保留 v1 解析。
+
+## 12. R1 独立审查修复记录（2026-11-25）
+
+针对独立审查提出的五项问题，本分支追加以下修复（不改变 §1–§11 的契约语义）：
+
+| 问题 | 修复 |
+|---|---|
+| P1-01 AS2-50 未证明真实唯一索引竞争 | 重设计为三独立连接（T1 竞争者 / T2 key holder / T3 未提交 caller 索引持有者）的真实 `uq_generation_job_caller_request` 竞争；删除 `as2_barrier` 辅助表与触发器；以 `pg_blocking_pids`、`wait_event` 与活跃查询证明阻塞位置；T2 在 T1 异常块 gate 之前提交（§10.3）；结果确定 409 `IDEMPOTENCY_KEY_REUSED` |
+| P1-02 AS2-10 只覆盖单阶段 | 拆分为三阶段独立测试（INSERT 前 / INSERT 后 COMMIT 前 / COMMIT 后），全部以 `pg_stat_activity` 确认 backend 真正退出后再断言数据库持久化状态；阶段 B 由原测试演化而来，断言更强（INSERT 已执行证据 + key 绑定断言） |
+| P1-03 OpenAPI 错误码枚举缺失 | `Error.code` 枚举补齐 `CALLER_REQUEST_ID_REUSED`、`INVALID_IDEMPOTENCY_KEY`、`CALLER_REQUEST_ID_FINGERPRINT_VERSION_MISMATCH`、`IDEMPOTENCY_KEY_CROSS_IDENTITY` 及 AS-1 已产出码（`ARTIFACT_KEY_CONFLICT`、`ARTIFACT_KEY_LEGACY_UNVERIFIABLE`、`PERSISTENCE_UNAVAILABLE`）；新增 parity 测试 `error_code_enum_covers_every_domain_error` 强制枚举覆盖全部 `DomainError::code()`；真实 HTTP 证据由 `as2_41`（503 GENERATOR_UNAVAILABLE 信封）与 `as2_23`（400 信封）覆盖；HTTP status 映射（contract `http_status()`）此前已正确，未改动 |
+| P2-01 非法 UUID 回显原始输入 | `parse_path_uuid` 错误消息不再包含原始路径参数（保持 400 + `INVALID_REQUEST` 稳定码，合法 UUID 处理不变）；`as2_23` 增加哨兵值断言响应（message + details）不含输入 |
+| P2-02 `.trae` 本地计划文件入库 | 确认为 TRAE 本地执行计划（正式记录已由本报告与 ART-04G v3 覆盖）：从 PR 变更中移除（本地文件保留），`.gitignore` 增加 `.trae/`；无正式内容需迁移 |
+
+受本次修复影响的既有测试：`as2_10_*`（拆分为三阶段）、`as2_23`（增强断言）、
+`as2_50`（重写）、`as2_37`/`as2_38`（保持不变，新增独立枚举 parity 测试）。
+其余 AS-2 与 AS-1 测试不受影响，全量回归通过。

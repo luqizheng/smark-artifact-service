@@ -3,3 +3,4 @@
 *.local.env
 coverage/
 .workbuddy/
+.trae/
