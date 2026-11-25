@@ -20,7 +20,7 @@
 - §7.5 Node Runtime Guardian（NRG）独立 KillOnly fail-safe 及其故障假设；
 - §7.6 journal write-ahead/fsync/reconciliation 协议；
 - §9.2 StartPermit 与 DB→runtime 不可原子竞态语义；
-- ARC-T38–T44 故障注入验收项；
+- ARC-T38–T45 故障注入验收项；
 - §14 新增阻断记录。
 
 NRG 是新增架构依赖，尚未选型、实现或实测，不得把它视为现有能力。
@@ -111,6 +111,22 @@ per-Attempt journal + CAS 只是抽象。原稿没有定义在 runtime create/st
 
 **状态：已写入设计修订；需真实故障注入验证，P1 仍开放。**
 
+
+### AR-03B-03-04 — P0：NRG 必须能撤销 Start admission，单纯 KillOnly 不足以 fencing 在途 Start
+
+**问题**
+
+NRG 被定义为 KillOnly 组件，但设计同时要求它“禁止节点新 Start”。如果 NRG 只有 cgroup.kill 权限，却不能撤销 ARC 对 containerd 的 Start 控制通道，那么 ARC 可能存在已发送但尚未完成的 Start RPC；NRG kill 后，迟到的 Start 仍可能启动容器或复活 task。
+
+**必须修正**
+- NRG 需要最小化的 Start-admission revoke 权限，但不得获得创建/启动 sandbox 的权限；
+- 每次 Start 绑定当前 NRG admission generation，不能跨 generation 重放；
+- NRG 失联时先撤销 ARC runtime control channel/Start admission，再处理所有 in-flight Start 和 cgroup kill；
+- 对无法确认是否存在迟到 Start 的 Attempt 保持 Quarantined；不能只看一次 cgroup populated=0；
+- 增加 NRG revoke 与 in-flight Start 响应乱序的真实 runtime 故障注入测试。
+
+**状态：已写入设计修订；NRG 与 runtime control channel 的具体实现尚未设计/实测，P0 仍开放。**
+
 ## 4. 跨 PR 依赖一致性
 
 ### 与 PR #4（ART-03B-02 v2.2）
@@ -125,7 +141,7 @@ PR #5 允许 DB recovery 先撤销 Job/Attempt 的执行/提交资格，前提�
 
 | 项目 | 当前状态 | 关闭证据 |
 |---|---|---|
-| NRG 方案与权限边界 | 新增设计候选 | 独立安全设计审查、最小 KillOnly 权限验证 |
+| NRG 方案与权限边界 | 新增设计候选 | 独立安全设计审查、KillOnly + Start admission revoke 最小权限验证 |
 | ARC/NRG/节点管理器故障上界 | 未知 | 目标节点实测与最坏时序证明 |
 | StartPermit DB 契约 | 未设计 | DB-BLOCKER-02/独立 SQL 审查、nonce/expiry/generation 并发测试 |
 | ARC journal 实现语义 | 已补设计要求 | fsync/磁盘故障/响应丢失/重启故障注入 |
@@ -138,6 +154,6 @@ PR #5 允许 DB recovery 先撤销 Job/Attempt 的执行/提交资格，前提�
 
 **Changes Required / Not approved for implementation。**
 
-本轮确认 ARC + OCI + cgroup v2 是合理的目标方向，但当前不能批准实施。新增 NRG、StartPermit 语义和 journal write-ahead 协议只是设计修订，不是实现证据。
+本轮确认 ARC + OCI + cgroup v2 是合理的目标方向，但当前不能批准实施。新增 NRG、StartPermit 语义和 journal write-ahead 协议只是设计修订，不是实现证据。NRG 如何可靠撤销 ARC 的 in-flight Start admission 仍是 P0 设计与实测门禁。
 
 PR #6 必须保持 Open / Draft。不得创建 Worker/ARC/NRG 业务代码、Migration、Compose 或生产 Executor 启用开关；先对修订后的设计做第二轮独立复审。
