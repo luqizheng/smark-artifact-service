@@ -124,3 +124,46 @@ AI-PM:
 - apps/pm-api/src/viz_handlers.rs
 
 This review is based on repository source, not a runtime deployment or production data assertion.
+
+
+## 6. Follow-up review against revised ART-04A / ART-04B (2026-11-25)
+
+This section supersedes the *open/required-correction status* of individual findings only where the later documents explicitly corrected the proposal. It does not claim implementation closure.
+
+| Finding | Revised-document status | Implementation status |
+|---|---|---|
+| AR04C-01 unsupported `viz_artifact` Reference owner | **Closed in design**: ART-04B removes per-record Reference; version binding is authoritative | No implementation required for the rejected proposal |
+| AR04C-02 Reference replay mismatch | **Contained in design**: Reference is optional and excluded from the mandatory saga | Existing API/OpenAPI mismatch remains a separate Artifact Service contract defect if Reference is used |
+| AR04C-03 stale Idempotency-Key reservation on Artifact create | **Partially addressed in design**: ART-04A §8 and ART-04B §4 require stable `artifact_key` recovery independent of stale response-cache reservation; AI-PM may use a fresh/omitted Idempotency-Key after exact lookup returns empty | **Open P1**: server-side key-first/unique-conflict recovery and crash-injection tests are not implemented |
+| AR04C-04 Reference is not Version provenance | **Closed in design**: ART-04B keeps exact version binding in AI-PM | No implementation closure claimed |
+| AR04C-05 one Job per business-version binding | **Closed in design**: ART-04B now specifies a partial unique constraint on non-null `generation_job_id` | Migration and constraint tests not implemented |
+| AR04C-06 Reference must not be mandatory | **Closed in design**: Reference is explicitly optional and excluded from the saga | No implementation closure claimed |
+
+### 6.1 Additional cross-document correction: historical backfill
+
+ART-04B previously retained a historical Artifact/Version/Output backfill procedure. This contradicted the already-approved ART-02F product decision: no real users/business data; no historical `viz.*` backfill, old-ID mapping or dual-write.
+
+ART-04B has now been revised:
+- Pre-cutover schema/row-count verification remains mandatory.
+- Unexpected non-test/business rows stop the cutover and require investigation plus a new explicit product decision.
+- No automatic backfill is authorized.
+- Test fixtures are handled by test-environment cleanup.
+- Legacy table retirement follows removal of all old code dependencies.
+
+This is **closed at document level** after the ART-04B revision. It is not a claim that a live database was inspected in this review.
+
+### 6.2 Remaining P1 / P2 gates
+
+1. **P1 — Artifact stable-key create recovery**: implement `artifact_key` exact lookup, create convergence, stale idempotency reservation bypass and crash-injection tests. A unique index alone is insufficient; concurrent loser behavior must re-read and validate the winner.
+2. **P1 — GenerationJob durable caller identity**: implement `caller_request_id` durable uniqueness, lookup, canonical request fingerprint conflict, and atomic create/reconcile behavior. The identity record must outlive the 24-hour idempotency cache.
+3. **P1 — Exact Job→Version result**: expose immutable `target_version_id`; enforce `succeeded ⇒ target_version_id IS NOT NULL` and committed READY Version + Output invariants in the completion transaction.
+4. **P1 — AI-PM local saga atomicity**: implement business-record + operation-ledger persistence in one AI-PM transaction before any remote call; recovery must be restart-safe and must not mint new identities after uncertain outcomes.
+5. **P2 — SDK consumer surface**: typed get/cancel Job calls, stable create/reconciliation DTOs and contract tests remain outstanding.
+6. **P2 — ArtifactReference contract drift**: if Reference is used by any consumer, align OpenAPI with the actual behavior or implement race-safe create-or-return-existing semantics; ART-04B V1 does not depend on Reference.
+7. **P2 — Version binding enforcement**: implement AI-PM version-binding constraints, including unique non-null `generation_job_id`, immutable version binding and artifact/slot consistency.
+
+### 6.3 Current verdict
+
+**Changes Required / Not approved for implementation.** The document-level contradictions AR04C-01/02/04/05/06 and the no-backfill conflict are corrected or contained in the revised proposal. The remaining items require implementation feasibility proof and tests; none is closed merely because a document now describes the intended behavior.
+
+No application code, migration, SDK, Worker, API contract implementation, deployment configuration or runtime data was changed by this follow-up review.
