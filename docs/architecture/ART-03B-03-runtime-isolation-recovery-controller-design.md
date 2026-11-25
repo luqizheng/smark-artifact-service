@@ -74,7 +74,7 @@ ARC 不处理业务 Job，不执行 SeeCode，不访问 Artifact API 或 File Se
 
 cgroup v2 是进程树资源和生命周期边界；OCI container 提供 namespace、mount、seccomp 等隔离组合。cgroup.freeze/cgroup.kill 的唯一写入者必须是 NRG（方案 A）或其选定的 runtime broker 边界（方案 B），不得由 ARC 与 NRG 双写。**容器名称、PID、进程组、PID 1、PDEATHSIG 都不能单独作为进程树死亡证明。**
 
-若目标节点不支持统一 cgroup v2、runtime 无法将容器放入 ARC 管理的专属 cgroup，或无法证明进程不能迁移/逃逸，则节点健康检查失败，ARC 不得启动生产 Attempt。
+若目标节点不支持统一 cgroup v2、runtime 无法将容器放入 NRG 管理的专属 cgroup，或无法证明进程不能迁移/逃逸，则节点健康检查失败，ARC 不得启动生产 Attempt。
 
 ### 3.3 Windows 支持策略
 
@@ -98,17 +98,19 @@ Windows 实现候选为每 Attempt 一个受控 Job Object：
              controlled RPC       validate runtime authority
                          |             |
                          |             |
-                 +-------+-------------+-------+
-                 |                             |
-          Artifact Worker                Runtime Controller
-          / Supervisor                   (node service)
-                 |                             |
-           Unix Domain Socket --------------> |
-                 |                       containerd socket
-                 |                             |
-           no runtime privilege          OCI runtime / cgroup v2
-                                               |
-                                       Attempt container
+                 +-------------+---------------+----------------+
+                 |             |                                |
+          Artifact Worker    ARC                         Node Runtime Guardian
+          / Supervisor       (coordinator)                (fence / broker)
+                 |             |                                |
+           UDS RPC ---------->|---- selected runtime path ---->|
+                 |             |                                |
+           no runtime       DB authority                 cgroup freeze/kill
+           privilege        validation                   or runtime broker
+                                                               |
+                                                     OCI runtime / cgroup v2
+                                                               |
+                                                       Attempt container
                                        - no network
                                        - no credentials
                                        - bounded scratch
@@ -246,23 +248,23 @@ DB Job/Attempt 状态与 ARC 状态是两个不同维度。允许：
 ### 7.2 启动与运行
 
 1. Worker claim 得到 Job/Attempt 和 DB lease token。
-2. Worker 请求 ARC 创建 sandbox；ARC 校验 capability 和 DB authority。
+2. Worker 请求 ARC 创建 sandbox；ARC 校验 capability 和 DB authority，并按 §7.7 选定的权限拓扑向 runtime control plane 发起请求。
 3. ARC 生成不可复用 runtime ID，创建 cgroup/container、受控目录和资源策略；先 Created，不运行 Executor。
-4. ARC 再次验证 DB authority；成功后 Start，失败则销毁 Created resource。
+4. ARC 再次验证 DB authority；成功后通过方案 A 的受限 runtime path 或方案 B 的 NRG broker Start，失败则销毁 Created resource。
 5. Worker/Supervisor 通过 ARC 控制接口执行有限操作；Executor 本身只运行 SeeCode。
 6. ARC 周期性独立验证 DB authority/lease/deadline；cancel、lease expired、deadline reached 或 DB 不可验证时，转 KillRequested。
 7. Worker 也可主动 RequestAttemptKill；kill 只能单向触发，不能撤销。
 
-DB-BLOCKER-02 的 remaining-duration + monotonic anchor 契约是 ARC 计算本地 fail-safe cutoff 的前置条件。ARC 不得用本机 wall clock 与 PostgreSQL wall clock 直接比较。
+DB-BLOCKER-02 的 remaining-duration + CLOCK_BOOTTIME anchor 契约是 ARC/NRG 计算本地 fail-safe cutoff 的前置条件。ARC 不得用本机 wall clock 与 PostgreSQL wall clock 直接比较。
 
 ### 7.3 Kill 与死亡确认
 
-Kill 流程必须由 ARC 执行，不依赖 Worker 仍在线：
+Kill 流程由 ARC 编排、NRG 执行独占的 cgroup freeze/kill（方案 A）；方案 B 下由 NRG runtime broker 执行。流程不依赖 Worker 仍在线：
 
-1. 原子记录 KillRequested；禁止 Start/Resume/新 IPC。
+1. ARC/NRG 在同一 Attempt generation 下原子记录 KillRequested；禁止 Start/Resume/新 IPC。
 2. 先由 NRG freeze Attempt cgroup，再调用 runtime task stop/delete，并由 NRG 使用 cgroup v2 整组终止能力（如 cgroup.kill）；不只 kill 主 PID/进程组。
 3. 在有界 deadline 内等待 runtime task exit、cgroup `cgroup.events populated=0`，并确认 cgroup 不再允许新进程加入。
-4. 关闭/撤销容器控制通道，移除可执行 runtime task；记录 runtime inspect 证据。
+4. 关闭/撤销容器控制通道，移除可执行 runtime task；记录 runtime inspect 证据。该步骤不能替代 §7.7 的在途 Start 收敛证明。
 5. 满足所有 death predicate 后转 DeathConfirmed；否则 DeathUnconfirmed，保留隔离资源并告警。
 
 Death predicate 至少包含：
@@ -270,7 +272,7 @@ Death predicate 至少包含：
 - Attempt 专属 cgroup populated=0；
 - 无可写路径允许 Executor 将进程迁移到其他 cgroup；
 - 不存在仍能重启该 container/task 的未撤销启动请求；
-- ARC 已撤销 Start/Exec 控制能力。
+- ARC/NRG 已按 §7.7 撤销 Start/Exec admission，且不存在可迟到生效的 runtime 操作。
 
 不得把 kill RPC 返回 0、主 PID 不存在、进程组为空、Worker 退出或 lease 过期作为充分死亡证明。
 
