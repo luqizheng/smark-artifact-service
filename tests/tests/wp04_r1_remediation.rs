@@ -154,25 +154,105 @@ async fn seed_query_fixtures(pool: &PgPool) -> Vec<QuerySpec> {
     .await
     .unwrap();
     common::sql_enable_seecode(pool, "q-adapter").await;
-    let job = common::sql_create_job(pool, TENANT, PROJECT_1, artifact, &common::JobOptions::default()).await;
+    let job = common::sql_create_job(
+        pool,
+        TENANT,
+        PROJECT_1,
+        artifact,
+        &common::JobOptions::default(),
+    )
+    .await;
     let keyed_body = create_body(PROJECT_1, "q-w1", Some("q.w1.key"));
     let patch_body = json!({ "name": "q-patch" });
     let session_body = json!({ "source_format": "yaml" });
     let current_body = json!({ "version_id": ready, "expected_current_version_id": Value::Null });
-    let ref_body = json!({ "owner_type": "adr", "owner_id": "q-new", "relation_type": "illustrates" });
+    let ref_body =
+        json!({ "owner_type": "adr", "owner_id": "q-new", "relation_type": "illustrates" });
     let job_caller = Uuid::new_v4();
     let job_body = json!({ "generator_id": "seecode", "caller_request_id": job_caller, "input": common::minimal_input() });
     let job_caller_opt = Some(job_caller);
     vec![
-        QuerySpec { label: "W1", method: "POST", path: "/v1/artifacts".into(), body: Some(keyed_body), project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W2", method: "PATCH", path: format!("/v1/artifacts/{artifact}"), body: Some(patch_body), project: PROJECT_1, if_match: true, caller: None },
-        QuerySpec { label: "W3", method: "POST", path: format!("/v1/artifacts/{artifact}/versions"), body: Some(session_body), project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W4", method: "POST", path: format!("/v1/artifacts/{artifact}/versions/{ready}/commit"), body: None, project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W5", method: "POST", path: format!("/v1/artifacts/{artifact}/current-version"), body: Some(current_body), project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W6", method: "POST", path: format!("/v1/artifacts/{artifact}/references"), body: Some(ref_body), project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W7", method: "DELETE", path: format!("/v1/artifacts/{artifact}/references/{reference}"), body: None, project: PROJECT_1, if_match: false, caller: None },
-        QuerySpec { label: "W8", method: "POST", path: format!("/v1/artifacts/{artifact}/generation-jobs"), body: Some(job_body), project: PROJECT_1, if_match: false, caller: job_caller_opt },
-        QuerySpec { label: "W9", method: "POST", path: format!("/v1/generation-jobs/{job}/cancel"), body: None, project: PROJECT_1, if_match: false, caller: None },
+        QuerySpec {
+            label: "W1",
+            method: "POST",
+            path: "/v1/artifacts".into(),
+            body: Some(keyed_body),
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W2",
+            method: "PATCH",
+            path: format!("/v1/artifacts/{artifact}"),
+            body: Some(patch_body),
+            project: PROJECT_1,
+            if_match: true,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W3",
+            method: "POST",
+            path: format!("/v1/artifacts/{artifact}/versions"),
+            body: Some(session_body),
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W4",
+            method: "POST",
+            path: format!("/v1/artifacts/{artifact}/versions/{ready}/commit"),
+            body: None,
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W5",
+            method: "POST",
+            path: format!("/v1/artifacts/{artifact}/current-version"),
+            body: Some(current_body),
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W6",
+            method: "POST",
+            path: format!("/v1/artifacts/{artifact}/references"),
+            body: Some(ref_body),
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W7",
+            method: "DELETE",
+            path: format!("/v1/artifacts/{artifact}/references/{reference}"),
+            body: None,
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
+        QuerySpec {
+            label: "W8",
+            method: "POST",
+            path: format!("/v1/artifacts/{artifact}/generation-jobs"),
+            body: Some(job_body),
+            project: PROJECT_1,
+            if_match: false,
+            caller: job_caller_opt,
+        },
+        QuerySpec {
+            label: "W9",
+            method: "POST",
+            path: format!("/v1/generation-jobs/{job}/cancel"),
+            body: None,
+            project: PROJECT_1,
+            if_match: false,
+            caller: None,
+        },
     ]
 }
 
@@ -211,14 +291,18 @@ async fn send_with_query_suffix(
 
 /// 可变写表面的行数快照（artifacts, references, jobs, idempotency records）。
 async fn write_surface_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
-    let artifacts: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM artifact.artifact").fetch_one(pool).await.unwrap();
+    let artifacts: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.artifact")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     let references: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.artifact_reference")
         .fetch_one(pool)
         .await
         .unwrap();
-    let jobs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job").fetch_one(pool).await.unwrap();
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     let idem: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.idempotency_record")
         .fetch_one(pool)
         .await
@@ -231,15 +315,29 @@ async fn f1_query_with_params_is_rejected_on_every_write_route(pool: PgPool) {
     let (base, verifier) = spawn(&pool).await;
     let specs = seed_query_fixtures(&pool).await;
     let before = write_surface_counts(&pool).await;
-    assert_eq!(before, (1, 1, 1, 0), "fixture surface: 1 artifact, 1 reference, 1 job");
+    assert_eq!(
+        before,
+        (1, 1, 1, 0),
+        "fixture surface: 1 artifact, 1 reference, 1 job"
+    );
 
     for spec in &specs {
         let (status, value) = send_with_query_suffix(&base, &verifier, spec, "?x=1").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{} must reject ?x=1: {value}", spec.label);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{} must reject ?x=1: {value}",
+            spec.label
+        );
         assert_eq!(value["error"]["code"], "INVALID_REQUEST", "{}", spec.label);
         // 副作用门未触达的可观察证明：不是 503（storage/generator 门）、
         // 不是 200/201/204（写入）、不是 409（幂等仲裁）。
-        assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE, "{} gate must not be reached", spec.label);
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{} gate must not be reached",
+            spec.label
+        );
         if matches!(spec.label, "W3" | "W8") {
             assert_eq!(
                 value["error"]["code"], "INVALID_REQUEST",
@@ -264,12 +362,20 @@ async fn f2_bare_empty_query_is_rejected_on_every_write_route(pool: PgPool) {
         // 保留并拒绝（Uri::query() == Some("")）——这正是不能用解析后
         // query map 判断的原因。
         let (status, value) = send_with_query_suffix(&base, &verifier, spec, "?").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{} must reject bare '?': {value}", spec.label);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{} must reject bare '?': {value}",
+            spec.label
+        );
         assert_eq!(value["error"]["code"], "INVALID_REQUEST", "{}", spec.label);
     }
 
     let after = write_surface_counts(&pool).await;
-    assert_eq!(after, before, "bare-query rejections must leave zero DB writes");
+    assert_eq!(
+        after, before,
+        "bare-query rejections must leave zero DB writes"
+    );
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -287,7 +393,12 @@ async fn f3_positive_control_without_query_still_passes_query_gate(pool: PgPool)
             "W7" => assert_eq!(status, StatusCode::NO_CONTENT, "{}: {value}", spec.label),
             // 功能门类：503（query 门未拦截无 query 的合法请求）。
             "W3" | "W4" | "W8" => {
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}: {value}", spec.label);
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{}: {value}",
+                    spec.label
+                );
             }
             other => panic!("unexpected spec {other}"),
         }
@@ -302,10 +413,19 @@ async fn g1_w8_artifact_id_claim_matching_path_passes_target_binding(pool: PgPoo
     let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "g1").await;
     let path = format!("/v1/artifacts/{artifact}/generation-jobs");
     let caller = Uuid::new_v4();
-    let body =
-        json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
+    let body = json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
     // artifact_id claim == 路径 artifact → 目标绑定通过 → 到达 generator 门。
-    let token = mint(&verifier, TENANT, PROJECT_1, write_actions(), "POST", &path, &body, Some(caller), Some(artifact));
+    let token = mint(
+        &verifier,
+        TENANT,
+        PROJECT_1,
+        write_actions(),
+        "POST",
+        &path,
+        &body,
+        Some(caller),
+        Some(artifact),
+    );
     let (status, value) = send(
         req_for("POST", format!("{base}{path}"), &token, Some(PROJECT_1)),
         Some(&body),
@@ -320,7 +440,10 @@ async fn g1_w8_artifact_id_claim_matching_path_passes_target_binding(pool: PgPoo
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(jobs, 0, "gate is functionally closed; no job may be created");
+    assert_eq!(
+        jobs, 0,
+        "gate is functionally closed; no job may be created"
+    );
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -330,11 +453,20 @@ async fn g2_w8_artifact_id_claim_mismatch_is_403_with_no_side_effects(pool: PgPo
     let other = Uuid::new_v4();
     let path = format!("/v1/artifacts/{artifact}/generation-jobs");
     let caller = Uuid::new_v4();
-    let body =
-        json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
+    let body = json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
     // artifact_id claim 绑定到别的 artifact → 403 绑定拒绝（≠ 503 功能门），
     // generator 门未触达，零 DB 写入。
-    let token = mint(&verifier, TENANT, PROJECT_1, write_actions(), "POST", &path, &body, Some(caller), Some(other));
+    let token = mint(
+        &verifier,
+        TENANT,
+        PROJECT_1,
+        write_actions(),
+        "POST",
+        &path,
+        &body,
+        Some(caller),
+        Some(other),
+    );
     let (status, value) = send(
         req_for("POST", format!("{base}{path}"), &token, Some(PROJECT_1)),
         Some(&body),
@@ -355,20 +487,32 @@ async fn g3_w8_artifact_id_claim_absent_follows_frozen_contract_shape(pool: PgPo
     let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "g3").await;
     let path = format!("/v1/artifacts/{artifact}/generation-jobs");
     let caller = Uuid::new_v4();
-    let body =
-        json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
+    let body = json!({ "generator_id": "seecode", "caller_request_id": caller, "input": common::minimal_input() });
     // artifact_id claim 缺省：契约 §3.1.2 #1 冻结规则是"存在时校验"，
     // §3.1.1 示例中 generation:request 携带 artifact_id:null 合法（决策项 D4：
     // 必填性属签发侧契约、未冻结——本测试如实记录现状，未新增必填拒绝）。
     // caller+hash 轴仍完整绑定该请求（路径 artifact ID 进指纹）。
-    let token = mint(&verifier, TENANT, PROJECT_1, write_actions(), "POST", &path, &body, Some(caller), None);
+    let token = mint(
+        &verifier,
+        TENANT,
+        PROJECT_1,
+        write_actions(),
+        "POST",
+        &path,
+        &body,
+        Some(caller),
+        None,
+    );
     let (status, value) = send(
         req_for("POST", format!("{base}{path}"), &token, Some(PROJECT_1)),
         Some(&body),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["error"]["code"], "GENERATOR_UNAVAILABLE", "functional gate, not a binding denial");
+    assert_eq!(
+        value["error"]["code"], "GENERATOR_UNAVAILABLE",
+        "functional gate, not a binding denial"
+    );
     let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
         .fetch_one(&pool)
         .await
