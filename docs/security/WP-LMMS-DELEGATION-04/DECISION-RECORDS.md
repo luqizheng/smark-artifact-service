@@ -31,15 +31,35 @@
 
 ---
 
-## D2 · 无目标路由上的 artifact_id claim → 字面 fail-closed 拒绝
+## D2 · 真正无目标路由（W1/W9）上的 artifact_id claim → 字面 fail-closed 拒绝
+### （WP-04-R1 修订：W8 从本裁决中移出）
 
-**事实**：契约 §3.1.2 #1"artifact_id 存在时请求目标 artifact 必须相等"。W1/W8/W9 的请求**没有**目标 artifact（创建型/仅 job_id）——字面应用即"不可能相等 → 拒绝"。
+> **R1 修订原因**：WP-04 原文把 W8（`POST /v1/artifacts/{artifact_id}/generation-jobs`）误列为无目标路由。实际 handler 向绑定事实传入 `Some(路径 artifact_id)`，W8 是**目标寻址路由**，其 `artifact_id` claim 与路径 artifact ID **精确比对**（不一致 → 403；一致 → 通过目标绑定检查；`wp04 :: g1/g2`）。行为自 WP-04 起一直如此（handler 即传 `Some`），本修订只纠正文档/注释与事实的不一致，**未放宽任何 fail-closed 行为**。
 
-**实现**：这三类路由上携带 `artifact_id` 的 token → 403 `SCOPE_DENIED`（稳定消息）。
+**事实**：契约 §3.1.2 #1"artifact_id 存在时请求目标 artifact 必须相等"。真正没有目标 artifact 的路由只有两个：W1（artifact 创建，目标尚不存在）与 W9（取消，路径仅含 job_id）——字面应用即"无目标即不可能相等 → 拒绝"。
 
-**后果（签发侧须知）**：绑定到特定 artifact 的 token 不得授予创建动作（artifact:create / generation:request）或 generation:cancel——语义上也自洽：单 artifact 窄化委托不应用于创建新资源。
+**实现**：W1/W9 上携带 `artifact_id` 的 token → 403 `SCOPE_DENIED`（稳定消息）。W2–W8：claim 存在时与请求目标 artifact 精确比对。
 
-**测试**：`wp04 :: b5`（第三段）。
+**后果（签发侧须知）**：绑定到特定 artifact 的 token 不得用于 W1/W9；用于 W2–W8 时必须与路径目标一致。
+
+**测试**：`wp04 :: b5`（W1 无目标拒绝 + W8 匹配 200 / 失配 403）、`wp04 :: g1/g2`（W8 目标绑定专项）。
+
+---
+
+## D4 · W8 上 artifact_id claim 缺省是否应拒绝 —— 决策项（待契约澄清，未实现）
+
+> **WP-04-R1 新增**。复评修复要求"W8 缺少必需目标 claim：按现有安全契约拒绝"；经契约原文核对，该要求与冻结文本存在冲突，按 §12 停止并记录，**未擅自实现**。
+
+**契约证据**：
+1. §3.1.2 #1 冻结规则："artifact_id **存在时**请求目标 artifact 必须相等"——只规定存在时的比对，未规定任何路由的必填性。
+2. §3.1.1 示例 payload（冻结文档）：`generation:request` token 携带 `"artifact_id": null`——**缺省形态在契约自己的示例中合法**。
+3. §3.3："操作绑定字段按意图填入"——必填性属签发侧意图映射，未在 AS 侧冻结。
+
+**实现**：维持现状——W8 上 artifact_id 缺省 → artifact_id 轴不拒绝（无 claim 即无比对对象），caller+hash(v1) 轴仍完整绑定该请求（method/path/目标/body 全部进指纹），到达 generator 门 503（`wp04 :: g3`）。
+
+**若未来契约澄清"目标寻址路由必填 artifact_id"**：接线是 `enforce_write_binding` 内的单分支（W2–W8 claim 缺省 → 403）+ 测试，不触碰其余强制点；同时必须修订契约 §3.1.1 示例。
+
+**残余风险**：未绑定 artifact 的 W8 token 依赖 caller+hash 轴提供目标绑定（指纹覆盖路径 artifact ID，跨目标复用仍被拒）；artifact_id 轴是纵深防御而非唯一防线，与 D1 残余风险同级。
 
 ---
 
