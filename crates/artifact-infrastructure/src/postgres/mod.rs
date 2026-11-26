@@ -21,10 +21,12 @@ use uuid::Uuid;
 
 pub mod keyed_create;
 pub mod keyed_job_create;
+pub mod unkeyed_create;
 pub mod worker;
 
 pub use keyed_create::PgKeyedArtifactCreator;
 pub use keyed_job_create::PgKeyedGenerationJobCreator;
+pub use unkeyed_create::PgUnkeyedArtifactCreator;
 pub use worker::PgWorkerCoordination;
 
 // ── 行类型 ──────────────────────────────────────────────────────────────

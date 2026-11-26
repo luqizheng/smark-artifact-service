@@ -4,7 +4,7 @@ use artifact_application::{ArtifactService, DelegationVerifier, GeneratorService
 use artifact_infrastructure::delegation::ClosedDelegationVerifier;
 use artifact_infrastructure::postgres::{
     PgArtifactRepository, PgAuditSink, PgGeneratorRepository, PgIdempotencyStore, PgJobRepository,
-    PgKeyedArtifactCreator, PgReferenceRepository, PgVersionRepository,
+    PgKeyedArtifactCreator, PgReferenceRepository, PgUnkeyedArtifactCreator, PgVersionRepository,
 };
 use artifact_infrastructure::storage::ProtocolBlockedStorage;
 use sqlx::PgPool;
@@ -73,6 +73,7 @@ pub fn app_state_with_verifier(pool: PgPool, verifier: Arc<dyn DelegationVerifie
         storage: Arc::new(ProtocolBlockedStorage::new()),
         idempotency: Arc::new(PgIdempotencyStore { pool: pool.clone() }),
         keyed_create: Arc::new(PgKeyedArtifactCreator { pool: pool.clone() }),
+        unkeyed_create: Arc::new(PgUnkeyedArtifactCreator { pool: pool.clone() }),
         audit: Arc::new(PgAuditSink { pool: pool.clone() }),
     });
     let generators = Arc::new(GeneratorService {

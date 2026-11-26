@@ -20,6 +20,9 @@ pub use port::keyed_job_create::{
 pub use port::revocation::{
     DelegationRevocationChecker, FailClosedRevocationChecker, RevocationCheckUnavailable,
 };
+pub use port::unkeyed_create::{
+    UnkeyedArtifactCreate, UnkeyedArtifactCreateOutcome, UnkeyedArtifactCreationPort,
+};
 
 pub use port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
@@ -50,6 +53,9 @@ pub use service::job_input::{
     INPUT_SCHEMA, INPUT_SCHEMA_VERSION, InputValidationError, MAX_COLLECTION_ITEMS, MAX_DEPTH,
     MAX_EDGES, MAX_ENVELOPE_BYTES, MAX_JSON_NODES, MAX_NODES, MAX_TEXT_BYTES,
     validate_job_input_envelope,
+};
+pub use service::operation_binding::{
+    WriteOperationBinding, WriteOperationType, enforce_write_binding,
 };
 pub use service::worker::{
     MAX_DIAGNOSTIC_CHARS, is_valid_error_code, run_coordination_maintenance, sanitize_diagnostic,

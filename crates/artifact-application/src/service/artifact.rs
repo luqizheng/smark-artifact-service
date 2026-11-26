@@ -15,6 +15,10 @@ use crate::port::repo::{
     JobRepository, NewArtifact, ReferenceRepository, VersionRepository,
 };
 use crate::port::storage::{StorageError, StoragePort};
+use crate::port::unkeyed_create::{
+    UnkeyedArtifactCreate, UnkeyedArtifactCreateOutcome, UnkeyedArtifactCreationPort,
+};
+use crate::service::operation_binding::{WriteOperationBinding, enforce_write_binding};
 use artifact_contract::{
     ArtifactPage, ArtifactResponse, ArtifactVersionResponse, CreateArtifactRequest,
     CreateGenerationJobRequest, CreateReferenceRequest, CreateVersionSessionRequest,
@@ -73,12 +77,14 @@ pub struct ArtifactService {
     pub storage: Arc<dyn StoragePort>,
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub keyed_create: Arc<dyn KeyedArtifactCreationPort>,
+    pub unkeyed_create: Arc<dyn UnkeyedArtifactCreationPort>,
     pub audit: Arc<dyn AuditSink>,
 }
 
 impl ArtifactService {
     // ── Artifact 元数据 ────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_artifact(
         &self,
         delegation: &Delegation,
@@ -87,14 +93,17 @@ impl ArtifactService {
         req: CreateArtifactRequest,
         idempotency_key: Option<String>,
         request_hash: String,
+        binding: &WriteOperationBinding,
     ) -> Result<ArtifactCreateOutcome, DomainError> {
+        // 授权 → V10 操作绑定（WP-04：全部写路径副作用之前强制），再输入校验。
+        delegation.require(Action::ArtifactCreate, scope)?;
+        enforce_write_binding(delegation, binding)?;
         ArtifactType::parse(&req.artifact_type).ok_or_else(|| {
             DomainError::InvalidRequest(format!("unknown artifact_type '{}'", req.artifact_type))
         })?;
         if req.name.trim().is_empty() {
             return Err(DomainError::InvalidRequest("name must not be blank".into()));
         }
-        delegation.require(Action::ArtifactCreate, scope)?;
 
         // AS-1：带 artifact_key 的创建走持久化创建身份 + 单事务端口。
         // 不得让 unkeyed 旧流程意外进入新路径。
@@ -112,42 +121,55 @@ impl ArtifactService {
                 .await;
         }
 
-        let reservation = match &idempotency_key {
-            Some(key) => Some(
-                self.idempotency
-                    .reserve(
-                        scope.tenant_id,
-                        scope.project_id,
-                        ENDPOINT_CREATE_ARTIFACT,
-                        key,
-                        &request_hash,
-                    )
-                    .await?,
-            ),
-            None => None,
-        };
-        if let Some(outcome) = &reservation
-            && !outcome.fresh
-        {
-            if outcome.conflicting_hash {
-                return Err(DomainError::IdempotencyKeyReused(
-                    "this Idempotency-Key was already used with a different request body".into(),
-                ));
+        // unkeyed + Idempotency-Key：单事务端口（WP-04 G2-1/G2-2 修复——
+        // 幂等决定与副作用原子提交；业务失败不留任何幂等痕迹）。
+        if let Some(key) = idempotency_key.clone() {
+            let unkeyed = UnkeyedArtifactCreate {
+                tenant_id: scope.tenant_id,
+                project_id: scope.project_id,
+                name: req.name,
+                description: req.description,
+                artifact_type: req.artifact_type,
+                category: req.category,
+                created_by: delegation.actor.subject.clone(),
+            };
+            let idempotency = IdempotencyInput {
+                endpoint: ENDPOINT_CREATE_ARTIFACT.to_string(),
+                key,
+                request_hash,
+            };
+            let outcome = self
+                .unkeyed_create
+                .create_or_replay_unkeyed(unkeyed, idempotency)
+                .await?;
+            let (artifact, resolution, replayed) = match outcome {
+                UnkeyedArtifactCreateOutcome::Created(artifact) => {
+                    (artifact, CreateResolution::Created, false)
+                }
+                UnkeyedArtifactCreateOutcome::Replayed(artifact) => {
+                    (artifact, CreateResolution::IdempotencyReplay, true)
+                }
+            };
+            let dto = to_artifact_dto(&artifact);
+            if !replayed {
+                self.audit_allowed(
+                    scope,
+                    delegation,
+                    "artifact.create",
+                    artifact.id,
+                    request_id,
+                )
+                .await;
             }
-            if let Some(snapshot) = &outcome.replay_response {
-                let dto: ArtifactResponse = serde_json::from_value(snapshot.clone())
-                    .map_err(|e| DomainError::Internal(format!("idempotency snapshot: {e}")))?;
-                return Ok(ArtifactCreateOutcome {
-                    resource: dto,
-                    replayed: true,
-                    resolution: CreateResolution::IdempotencyReplay,
-                });
-            }
-            return Err(DomainError::IdempotencyKeyReused(
-                "an identical request with this key is still in progress; retry later".into(),
-            ));
+            return Ok(ArtifactCreateOutcome {
+                resource: dto,
+                replayed,
+                resolution,
+            });
         }
 
+        // unkeyed 且无 Idempotency-Key：非幂等直通（矩阵分类：重试产生重复
+        // Artifact；该限制在 ROUTE-IDEMPOTENCY-MATRIX 中明示）。
         let artifact = self
             .repo
             .insert(NewArtifact {
@@ -160,24 +182,7 @@ impl ArtifactService {
                 category: req.category,
                 created_by: delegation.actor.subject.clone(),
             })
-            .await;
-        let artifact = match artifact {
-            Ok(a) => a,
-            Err(err) => {
-                // 业务失败：幂等记录以错误码收尾，同 key 同 body 重试可复得一致结果。
-                if let Some(outcome) = &reservation {
-                    let _ = self
-                        .idempotency
-                        .complete(
-                            outcome.record_id,
-                            serde_json::json!({ "error": err.code() }),
-                            None,
-                        )
-                        .await;
-                }
-                return Err(err);
-            }
-        };
+            .await?;
         let dto = to_artifact_dto(&artifact);
         self.audit_allowed(
             scope,
@@ -187,15 +192,6 @@ impl ArtifactService {
             request_id,
         )
         .await;
-        if let Some(outcome) = &reservation {
-            self.idempotency
-                .complete(
-                    outcome.record_id,
-                    serde_json::to_value(&dto).expect("artifact dto is serializable"),
-                    Some(artifact.id),
-                )
-                .await?;
-        }
         Ok(ArtifactCreateOutcome {
             resource: dto,
             replayed: false,
@@ -377,6 +373,7 @@ impl ArtifactService {
         Ok(references.iter().map(to_reference_dto).collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn patch_artifact(
         &self,
         delegation: &Delegation,
@@ -385,8 +382,10 @@ impl ArtifactService {
         expected_revision: i64,
         req: UpdateArtifactRequest,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<ArtifactResponse, DomainError> {
         delegation.require(Action::ArtifactUpdateMetadata, scope)?;
+        enforce_write_binding(delegation, binding)?;
         if req.name.as_ref().is_some_and(|n| n.trim().is_empty()) {
             return Err(DomainError::InvalidRequest("name must not be blank".into()));
         }
@@ -421,8 +420,10 @@ impl ArtifactService {
         artifact_id: Uuid,
         req: SetCurrentVersionRequest,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<ArtifactResponse, DomainError> {
         delegation.require(Action::VersionSetCurrent, scope)?;
+        enforce_write_binding(delegation, binding)?;
         let artifact = self
             .repo
             .get((scope.tenant_id, scope.project_id), artifact_id)
@@ -472,8 +473,10 @@ impl ArtifactService {
         scope: &TenantScope,
         artifact_id: Uuid,
         _req: CreateVersionSessionRequest,
+        binding: &WriteOperationBinding,
     ) -> Result<ArtifactVersionResponse, DomainError> {
         delegation.require(Action::VersionCreate, scope)?;
+        enforce_write_binding(delegation, binding)?;
         let artifact = self
             .repo
             .get((scope.tenant_id, scope.project_id), artifact_id)
@@ -506,8 +509,10 @@ impl ArtifactService {
         scope: &TenantScope,
         artifact_id: Uuid,
         version_id: Uuid,
+        binding: &WriteOperationBinding,
     ) -> Result<ArtifactVersionResponse, DomainError> {
         delegation.require(Action::VersionCommit, scope)?;
+        enforce_write_binding(delegation, binding)?;
         self.repo
             .get((scope.tenant_id, scope.project_id), artifact_id)
             .await?;
@@ -545,8 +550,10 @@ impl ArtifactService {
         artifact_id: Uuid,
         req: CreateReferenceRequest,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<CreateOutcome<ReferenceResponse>, DomainError> {
         delegation.require(Action::ReferenceWrite, scope)?;
+        enforce_write_binding(delegation, binding)?;
         let artifact = self
             .repo
             .get((scope.tenant_id, scope.project_id), artifact_id)
@@ -599,8 +606,10 @@ impl ArtifactService {
         artifact_id: Uuid,
         reference_id: Uuid,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<(), DomainError> {
         delegation.require(Action::ReferenceRemove, scope)?;
+        enforce_write_binding(delegation, binding)?;
         self.references
             .soft_delete(
                 (scope.tenant_id, scope.project_id),
@@ -628,8 +637,12 @@ impl ArtifactService {
         artifact_id: Uuid,
         req: CreateGenerationJobRequest,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<GenerationJobResponse, DomainError> {
         delegation.require(Action::GenerationRequest, scope)?;
+        // V10：body caller_request_id 与 token claim 交叉比对 + v1 指纹绑定
+        // （WP-04；先于 generator 注册表查询与任何可能的 job 写入）。
+        enforce_write_binding(delegation, binding)?;
         let artifact = self
             .repo
             .get((scope.tenant_id, scope.project_id), artifact_id)
@@ -711,8 +724,12 @@ impl ArtifactService {
         scope: &TenantScope,
         job_id: Uuid,
         request_id: Option<&str>,
+        binding: &WriteOperationBinding,
     ) -> Result<GenerationJobResponse, DomainError> {
         delegation.require(Action::GenerationCancel, scope)?;
+        // V10：含契约冻结语法 `generation_job:{job_id}` 的 operation_id 比对
+        // （契约 §5.3；先于受控取消函数调用）。
+        enforce_write_binding(delegation, binding)?;
         let (job, outcome) = self
             .jobs
             .cancel((scope.tenant_id, scope.project_id), job_id)
