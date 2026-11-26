@@ -89,3 +89,7 @@ path = "tests/delegation_security.rs"
 [[test]]
 name = "wp04_operation_binding"
 path = "tests/wp04_operation_binding.rs"
+
+[[test]]
+name = "wp04_r1_remediation"
+path = "tests/wp04_r1_remediation.rs"
