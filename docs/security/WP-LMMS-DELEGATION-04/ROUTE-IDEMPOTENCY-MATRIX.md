@@ -13,7 +13,7 @@
 | **caller_request_id** | 服务层 `enforce_write_binding`（`operation_binding.rs`），`Delegation::require` 之后、任何副作用之前 | 403 `SCOPE_DENIED`；Job 创建路由 body caller 与 claim 交叉比对 |
 | **request_hash（v1 冻结）** | 同上：`canonical_request_fingerprint(method, 实例化path, caller, 原始bodyValue)` 重算 vs `biz.request_hash` | 403；method/path/目标/body 任一变异 → 指纹不同 |
 | **artifact_id** | 同上：claim 存在时请求目标必须相等；**W2–W8 为目标寻址路由（含 W8：与路径 artifact ID 精确比对，R1 P2 修正）**；真正无目标路由（W1/W9）出现该 claim → 403（裁决 D2）；缺省时不拒绝（决策项 D4）| 403（失配/无目标出现）|
-| **operation_id** | 仅 W9 落地 `generation_job:{job_id}` 精确比对（契约 §5.3 语法）；其余七条路由语法未冻结（裁决 D1：存在时**不比对也不拒绝**，现状保持；未完成语义绑定的路由清单见 TEST-EVIDENCE §6）| W9 不匹配 → 403 |
+| **operation_id** | 仅 W9 落地 `generation_job:{job_id}` 精确比对（契约 §5.3 语法）；其余七条路由语法未冻结（裁决 D1：存在时**不比对也不拒绝**，现状保持；未完成语义绑定的路由清单见 TEST-EVIDENCE §7.4）| W9 不匹配 → 403 |
 | 幂等仲裁 | 每路由独立机制（§3） | 见分类表 |
 
 ## 2. 写路由矩阵（9 条）
