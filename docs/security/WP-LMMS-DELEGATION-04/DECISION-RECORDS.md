@@ -6,14 +6,16 @@
 
 ## D1 · operation_id 语法表（除取消路由外）—— 停止，待设计裁决
 
+> **R1-R1 文档修正（纯文档，零代码改动）**：本节及全仓原文的"其余 7 条/七条"计数有误——9 条写路由中仅 W9（cancel）落地比对，其余保持"存在时不比对也不拒绝"的写路由实为 **W1–W8 共 8 条**（原文按下方提案表 W2–W8 共 7 行计数，遗漏了同属未比对集合的 W1 create_artifact）。提案表保持原样（仍不含 W1；W1 与 W8 的 operation_id 语法同属待契约裁决项，本文档不发明语法）。**D1 当前仍待裁决：W1–W8 共 8 条写路由尚未完成 operation_id 语义绑定；W9 已按当前冻结契约语法执行对应比对。此处仅描述当前实现状态，不构成对 W1–W8 operation_id 语法的冻结或认可。**下文正文的计数已同步更正为 8，修订仅涉文字，实现行为与测试证据无变化。
+
 **触发条件**：任务书停止条件 + WP-04 §5.2"不得发明新 claim；契约无法表达时先出裁决记录"。
 
 **事实**：
 1. 契约 §3.1.2 仅规定"operation_id 存在时服务操作必须映射到同一稳定操作"，**未冻结逐路由的稳定操作标识语法**。
 2. 契约 §3.1.1 示例 payload 在 `generation:request` token 上给出 `operation_id: "generation_job:9d2c…"`，而 AS 实现（`PgKeyedGenerationJobCreator`）由服务端 `Uuid::new_v4()` 铸造 job id，客户端无法预知——**契约示例与 AS 实现存在真实分歧**。
-3. 自行发明 7 条路由的语法表并强制比对 = 超出 v0.3 冻结文本的解释权。
+3. 自行发明其余 8 条写路由（W1–W8）的语法表并强制比对 = 超出 v0.3 冻结文本的解释权。
 
-**本 WP 的处理**：仅 `generation:cancel` 落地精确比对 `generation_job:{job_id}`（该语法在契约 §5.3 原文 + §3.1.1 示例中直接给出）；**其余 7 条写路由对 operation_id 保持"存在时不比对也不拒绝"的现状**（`enforce_write_binding` 分支有显式注释，分支不得静默扩大）。
+**本 WP 的处理**：仅 `generation:cancel` 落地精确比对 `generation_job:{job_id}`（该语法在契约 §5.3 原文 + §3.1.1 示例中直接给出）；**其余 8 条写路由（W1–W8）对 operation_id 保持"存在时不比对也不拒绝"的现状**（`enforce_write_binding` 分支有显式注释，分支不得静默扩大）。
 
 **待批准的提案**（若批准则在后续 WP 接线，均为既有 claim 的比对规则、无新 claim）：
 
@@ -27,7 +29,7 @@
 | DELETE .../references/{rid} | `reference_remove:{artifact_id}:{reference_id}` |
 | POST .../generation-jobs | ⚠ 需契约修订：选项 a) 签发方预铸 job id 并作为请求参数（改 AS-2 输入面）；选项 b) 修订契约示例，明确创建型操作不使用 operation_id 绑定 |
 
-**残余风险**（现状）：携带 operation_id 的 token 在这 7 条路由上不获得 operation_id 轴的额外约束；但 caller+hash(v1) 轴已覆盖 method/path/body 全部实例化事实——"同 token 用于不同操作"在指纹层已拒绝，operation_id 轴是纵深防御而非唯一防线。
+**残余风险**（现状）：携带 operation_id 的 token 在这 8 条路由（W1–W8）上不获得 operation_id 轴的额外约束；但 caller+hash(v1) 轴已覆盖 method/path/body 全部实例化事实——"同 token 用于不同操作"在指纹层已拒绝，operation_id 轴是纵深防御而非唯一防线。
 
 ---
 

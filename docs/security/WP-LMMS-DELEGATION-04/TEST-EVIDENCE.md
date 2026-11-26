@@ -62,7 +62,7 @@
 
 ## 5. 遗留裁决与阻断项（WP-04 时点；R1 更新见 §7.4）
 
-- **D1（待批准）**：operation_id 语法表——除 cancel 外 7 条写路由保持"存在时不比对不拒绝"；提案见 `DECISION-RECORDS.md`。
+- **D1（待批准）**：operation_id 语法表——除 cancel 外 7 条写路由保持"存在时不比对不拒绝"；提案见 `DECISION-RECORDS.md`。（R1-R1 文档修正：该数量应为 **8 条（W1–W8）**——9 条写路由中仅 W9 比对，原文"7 条"计数错误；WP-04 原文按历史记录保留，现状描述见 §7.4。）
 - D2/D3（已实现，留档复评）：无目标路由 artifact_id fail-closed；If-Match 不在 v1 指纹。（R1 修订：D2 的无目标集合修正为 W1/W9，W8 为目标寻址路由——见 §7.3 与 DECISION-RECORDS D2 修订版。）
 - 未解决阻断项（本 WP 范围外）：V11、AI-PM 全部阶段项、PC-O6-3、F-22 轮换证据、PR #12/#14 的 review 与 CI。
 
@@ -129,7 +129,7 @@
 
 - **D2 修订**：无目标路由集合修正为 **W1/W9**；**W8 为目标寻址路由**（handler 传 `Some(路径 artifact_id)`，claim 与路径 ID 精确比对——行为自 WP-04 起一直正确，本轮只修文档/注释不一致，未放宽任何 fail-closed 行为）。
 - **D4 新增（决策项，未实现）**：复评要求"W8 缺少必需目标 claim → 拒绝"与契约冻结文本冲突（§3.1.2 #1 只规定存在时校验；§3.1.1 示例 `generation:request`+`artifact_id:null` 合法；§3.3"绑定字段按意图填入"属签发侧）→ 按 §12 停止并记录，未擅自新增必填拒绝；若契约未来澄清，接线为单分支+测试。
-- **D1 状态不变（待裁决）**：七条未完成 operation_id 语义绑定的路由 = W1 create_artifact、W2 patch_artifact、W3 create_version_session、W4 commit_version、W5 set_current_version、W6 create_reference、W7 remove_reference（W8 request_generation 同属 D1 未接线集合；W9 cancel 已按契约语法比对）。
+- **D1 状态不变（待裁决）**：D1 当前仍待裁决。W1–W8 共 8 条写路由尚未完成 operation_id 语义绑定：W1 create_artifact、W2 patch_artifact、W3 create_version_session、W4 commit_version、W5 set_current_version、W6 create_reference、W7 remove_reference、W8 request_generation；W9 cancel 已按当前冻结契约语法执行对应比对。此处仅描述当前实现状态，不构成对 W1–W8 operation_id 语法的冻结或认可。（R1-R1 文档修正：本条原表述"七条 = W1–W7"与其自身括注"W8 同属 D1 未接线集合"矛盾，正确数量为 8；仅纠正文字，实现与证据无变化。）
 - 矩阵/设计说明已同步：query 禁带轴（新）、artifact_id 轴 W8 归类修正、operation_id 轴未完成清单引用。
 
 ### 7.5 R1 CI 状态
