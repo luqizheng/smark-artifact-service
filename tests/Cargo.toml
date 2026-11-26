@@ -85,3 +85,7 @@ path = "tests/as2_caller_identity.rs"
 [[test]]
 name = "delegation_security"
 path = "tests/delegation_security.rs"
+
+[[test]]
+name = "wp04_operation_binding"
+path = "tests/wp04_operation_binding.rs"

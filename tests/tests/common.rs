@@ -3,9 +3,11 @@
 // 测试工具模块整体豁免。
 #![allow(dead_code)]
 
-use artifact_application::{AdapterCapabilities, DelegationVerifier};
+use artifact_application::{
+    AdapterCapabilities, DelegationVerifier, canonical_request_fingerprint,
+};
 use artifact_domain::{Action, Actor, ActorType, Delegation, TenantScope};
-use artifact_infrastructure::test_support::TestDelegationVerifier;
+use artifact_infrastructure::test_support::{TestDelegationVerifier, TestTokenBinding};
 use sha2::Digest;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -65,7 +67,7 @@ pub async fn spawn_app_closed(pool: sqlx::PgPool) -> String {
 
 /// 建一个登记了指定动作的测试委托验证器。
 pub fn verifier_with(tokens: &[(&str, Uuid, Uuid, &[Action])]) -> Arc<TestDelegationVerifier> {
-    let mut verifier = TestDelegationVerifier::new();
+    let verifier = TestDelegationVerifier::new();
     for (token, tenant, project, actions) in tokens {
         verifier.allow(
             *token,
@@ -77,6 +79,65 @@ pub fn verifier_with(tokens: &[(&str, Uuid, Uuid, &[Action])]) -> Arc<TestDelega
         );
     }
     Arc::new(verifier)
+}
+
+/// v1 指纹（测试侧计算；AS 服务层独立重算，两者一致即跨层证明，WP-04 §5.3）。
+pub fn v1_fingerprint(method: &str, path: &str, caller: Uuid, body: &serde_json::Value) -> String {
+    canonical_request_fingerprint(method, path, Some(caller), body)
+}
+
+/// 为具体写请求铸造一枚 V10 绑定 token（caller 随机 + v1 指纹），返回 caller。
+/// `body` 必须与随后 HTTP 请求发送的序列化体完全一致（用
+/// `serde_json::to_value(&dto)` 构造，保证未知字段/null 语义对齐）。
+#[allow(clippy::too_many_arguments)]
+pub fn mint_write_token(
+    verifier: &Arc<TestDelegationVerifier>,
+    token: &str,
+    tenant: Uuid,
+    project: Uuid,
+    actions: &[Action],
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Uuid {
+    let caller = Uuid::new_v4();
+    let hash = v1_fingerprint(method, path, caller, body);
+    verifier.allow_with_binding(
+        token,
+        tenant,
+        project,
+        "test-user",
+        ActorType::User,
+        actions,
+        TestTokenBinding {
+            artifact_id: None,
+            operation_id: None,
+            caller_request_id: Some(caller),
+            request_hash: Some(hash),
+        },
+    );
+    caller
+}
+
+/// 完全受控的绑定登记（负面测试：缺 hash / 错 hash / artifact_id / operation_id）。
+#[allow(clippy::too_many_arguments)]
+pub fn mint_bound_token(
+    verifier: &Arc<TestDelegationVerifier>,
+    token: &str,
+    tenant: Uuid,
+    project: Uuid,
+    actions: &[Action],
+    binding: TestTokenBinding,
+) {
+    verifier.allow_with_binding(
+        token,
+        tenant,
+        project,
+        "test-user",
+        ActorType::User,
+        actions,
+        binding,
+    );
 }
 
 pub fn read_actions() -> &'static [Action] {

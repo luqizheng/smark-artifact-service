@@ -15,6 +15,35 @@ fn client(base: &str) -> ArtifactClient {
     ArtifactClient::new(ArtifactClientConfig::new(base)).unwrap()
 }
 
+/// 为一次 SDK 写调用铸造 V10 绑定 token（WP-04）：method/path/body 指纹绑定。
+fn write_ctx(
+    verifier: &std::sync::Arc<artifact_infrastructure::test_support::TestDelegationVerifier>,
+    project: Uuid,
+    method: &str,
+    path: String,
+    body: &serde_json::Value,
+    caller: Option<Uuid>,
+) -> CallContext {
+    use artifact_infrastructure::test_support::TestTokenBinding;
+    let token = format!("sdk-wt-{}", Uuid::new_v4());
+    let caller = caller.unwrap_or_else(Uuid::new_v4);
+    let hash = common::v1_fingerprint(method, &path, caller, body);
+    common::mint_bound_token(
+        verifier,
+        &token,
+        common::TENANT,
+        project,
+        &common::all_actions(),
+        TestTokenBinding {
+            artifact_id: None,
+            operation_id: None,
+            caller_request_id: Some(caller),
+            request_hash: Some(hash),
+        },
+    );
+    CallContext::new().token(token).project(project)
+}
+
 #[sqlx::test(migrations = "../migrations")]
 async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
     let verifier = common::verifier_with(&[(
@@ -23,38 +52,55 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
         common::PROJECT_1,
         &common::all_actions(),
     )]);
-    let base = common::spawn_app(pool, verifier).await;
+    let base = common::spawn_app(pool, verifier.clone()).await;
     let client = client(&base);
     let ctx = CallContext::new()
         .token("sdk-tok")
         .project(common::PROJECT_1);
 
-    // 创建 → 读取 → 更新 → 列表。
+    // 创建 → 读取 → 更新 → 列表。（WP-04：每次写调用一枚绑定 token。）
+    let create_req = CreateArtifactRequest {
+        project_id: common::PROJECT_1,
+        name: "SDK flow".into(),
+        artifact_type: "diagram".into(),
+        artifact_key: None,
+        description: None,
+        category: None,
+    };
     let created = client
         .create_artifact(
-            CreateArtifactRequest {
-                project_id: common::PROJECT_1,
-                name: "SDK flow".into(),
-                artifact_type: "diagram".into(),
-                artifact_key: None,
-                description: None,
-                category: None,
-            },
-            &ctx,
+            create_req.clone(),
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "POST",
+                "/v1/artifacts".into(),
+                &serde_json::to_value(&create_req).unwrap(),
+                None,
+            ),
         )
         .await
         .unwrap();
     let got = client.get_artifact(created.id, &ctx).await.unwrap();
     assert_eq!(got.id, created.id);
+    let patch_req = UpdateArtifactRequest {
+        name: Some("SDK renamed".into()),
+        description: None,
+        category: None,
+    };
     let patched = client
         .patch_artifact(
             created.id,
-            UpdateArtifactRequest {
-                name: Some("SDK renamed".into()),
-                description: None,
-                category: None,
-            },
-            &ctx.clone().if_match(&created.etag),
+            patch_req.clone(),
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "PATCH",
+                format!("/v1/artifacts/{created_id}", created_id = created.id),
+                &serde_json::to_value(&patch_req).unwrap(),
+                None,
+            )
+            .if_match(&created.etag),
         )
         .await
         .unwrap();
@@ -74,53 +120,90 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
     assert_eq!(page.items.len(), 1);
 
     // 引用。
+    let reference_req = CreateReferenceRequest {
+        owner_type: "requirement".into(),
+        owner_id: "req-1".into(),
+        relation_type: "supports".into(),
+    };
     let reference = client
         .create_reference(
             created.id,
-            CreateReferenceRequest {
-                owner_type: "requirement".into(),
-                owner_id: "req-1".into(),
-                relation_type: "supports".into(),
-            },
-            &ctx,
+            reference_req.clone(),
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "POST",
+                format!("/v1/artifacts/{}/references", created.id),
+                &serde_json::to_value(&reference_req).unwrap(),
+                None,
+            ),
         )
         .await
         .unwrap();
     client
-        .remove_reference(created.id, reference.id, &ctx)
+        .remove_reference(
+            created.id,
+            reference.id,
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "DELETE",
+                format!("/v1/artifacts/{}/references/{}", created.id, reference.id),
+                &serde_json::Value::Null,
+                None,
+            ),
+        )
         .await
         .unwrap();
 
     // current-version：SDK 侧同样只允许 READY（无版本 → 404）。
+    let set_current_req = SetCurrentVersionRequest {
+        version_id: uuid::Uuid::new_v4(),
+        expected_current_version_id: None,
+    };
     let err = client
         .set_current_version(
             created.id,
-            SetCurrentVersionRequest {
-                version_id: uuid::Uuid::new_v4(),
-                expected_current_version_id: None,
-            },
-            &ctx,
+            set_current_req.clone(),
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "POST",
+                format!("/v1/artifacts/{}/current-version", created.id),
+                &serde_json::to_value(&set_current_req).unwrap(),
+                None,
+            ),
         )
         .await
         .unwrap_err();
     assert_eq!(err.code(), "RESOURCE_NOT_FOUND");
 
     // 生成请求：输入信封合法，但 Adapter 未实现 → GENERATOR_UNAVAILABLE，且不可重试。
+    // （WP-04：请求侧 caller = body.caller_request_id，与 claim 交叉比对。）
+    let job_caller = uuid::Uuid::new_v4();
+    let job_req = CreateGenerationJobRequest {
+        generator_id: "seecode".into(),
+        input: serde_json::json!({
+            "schema": "smark.seecode.input",
+            "schema_version": "1",
+            "diagram": {"type": "architecture", "title": "SDK", "nodes": [], "edges": []}
+        }),
+        options: None,
+        expected_current_version_id: None,
+        caller_request_id: job_caller,
+    };
     let generation = client
         .request_generation(
             created.id,
-            CreateGenerationJobRequest {
-                generator_id: "seecode".into(),
-                input: serde_json::json!({
-                    "schema": "smark.seecode.input",
-                    "schema_version": "1",
-                    "diagram": {"type": "architecture", "title": "SDK", "nodes": [], "edges": []}
-                }),
-                options: None,
-                expected_current_version_id: None,
-                caller_request_id: uuid::Uuid::new_v4(),
-            },
-            &ctx,
+            job_req.clone(),
+            &write_ctx(
+                &verifier,
+                common::PROJECT_1,
+                "POST",
+                format!("/v1/artifacts/{}/generation-jobs", created.id),
+                &serde_json::to_value(&job_req).unwrap(),
+                Some(job_caller),
+            ),
         )
         .await
         .unwrap_err();
