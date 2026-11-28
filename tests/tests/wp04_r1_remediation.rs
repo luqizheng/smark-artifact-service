@@ -141,6 +141,18 @@ struct QuerySpec {
 async fn seed_query_fixtures(pool: &PgPool) -> Vec<QuerySpec> {
     let artifact = common::sql_insert_artifact(pool, TENANT, PROJECT_1, "q-fix").await;
     let ready = common::sql_insert_version(pool, TENANT, PROJECT_1, artifact, "ready").await;
+    // WP-AS-05：W4 commit 需要 pending 版本且声明对象齐备（state 检查前移、
+    // 输入必填），否则 400/409 先于存储门。
+    let pending = common::sql_insert_version(pool, TENANT, PROJECT_1, artifact, "pending").await;
+    sqlx::query(
+        "UPDATE artifact.artifact_version          SET source_object_id = $2, source_sha256 = $3 WHERE id = $1",
+    )
+    .bind(pending)
+    .bind(Uuid::new_v4().to_string())
+    .bind(common::sha256_hex("q-fix-w4"))
+    .execute(pool)
+    .await
+    .unwrap();
     let reference: Uuid = sqlx::query_scalar(
         "INSERT INTO artifact.artifact_reference \
          (id, tenant_id, project_id, artifact_id, owner_type, owner_id, relation_type, created_by) \
@@ -164,7 +176,12 @@ async fn seed_query_fixtures(pool: &PgPool) -> Vec<QuerySpec> {
     .await;
     let keyed_body = create_body(PROJECT_1, "q-w1", Some("q.w1.key"));
     let patch_body = json!({ "name": "q-patch" });
-    let session_body = json!({ "source_format": "yaml" });
+    // WP-AS-05：source_object_id/sha256 必填（调用方先上传对象再建会话）。
+    let session_body = json!({
+        "source_format": "yaml",
+        "source_object_id": Uuid::new_v4().to_string(),
+        "source_sha256": common::sha256_hex("q-fix-w3"),
+    });
     let current_body = json!({ "version_id": ready, "expected_current_version_id": Value::Null });
     let ref_body =
         json!({ "owner_type": "adr", "owner_id": "q-new", "relation_type": "illustrates" });
@@ -202,7 +219,7 @@ async fn seed_query_fixtures(pool: &PgPool) -> Vec<QuerySpec> {
         QuerySpec {
             label: "W4",
             method: "POST",
-            path: format!("/v1/artifacts/{artifact}/versions/{ready}/commit"),
+            path: format!("/v1/artifacts/{artifact}/versions/{pending}/commit"),
             body: None,
             project: PROJECT_1,
             if_match: false,
