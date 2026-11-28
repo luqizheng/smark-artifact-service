@@ -374,19 +374,12 @@ pub async fn get_version(
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
     let version_id = parse_path_uuid(&version_id, "version_id")?;
-    let version = state
+    // 授权（version:read）在服务层执行且前置于任何数据读取（WP-03 R2-F-03）。
+    let dto = state
         .artifacts
-        .versions
-        .get(
-            (req.scope.tenant_id, req.scope.project_id),
-            artifact_id,
-            version_id,
-        )
+        .get_version(&req.delegation, &req.scope, artifact_id, version_id)
         .await?;
-    Ok(json_response(
-        StatusCode::OK,
-        artifact_application::to_version_dto(&version),
-    ))
+    Ok(json_response(StatusCode::OK, dto))
 }
 
 pub async fn list_versions(
@@ -400,19 +393,11 @@ pub async fn list_versions(
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
-    let versions = state
+    // 授权（version:read）在服务层执行且前置于任何数据读取（WP-03 R2-F-03）。
+    let items = state
         .artifacts
-        .versions
-        .list(
-            (req.scope.tenant_id, req.scope.project_id),
-            artifact_id,
-            limit,
-        )
+        .list_versions(&req.delegation, &req.scope, artifact_id, limit)
         .await?;
-    let items: Vec<_> = versions
-        .iter()
-        .map(artifact_application::to_version_dto)
-        .collect();
     Ok(json_response(
         StatusCode::OK,
         serde_json::json!({ "items": items, "next_cursor": serde_json::Value::Null }),
@@ -447,19 +432,11 @@ pub async fn list_references(
     Path(artifact_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
-    let references = state
+    // 授权（artifact:read）在服务层执行且前置于任何数据读取（WP-03 R2-F-03）。
+    let items = state
         .artifacts
-        .references
-        .list(
-            (req.scope.tenant_id, req.scope.project_id),
-            artifact_id,
-            100,
-        )
+        .list_references(&req.delegation, &req.scope, artifact_id)
         .await?;
-    let items: Vec<_> = references
-        .iter()
-        .map(artifact_application::to_reference_dto)
-        .collect();
     Ok(json_response(
         StatusCode::OK,
         serde_json::json!({ "items": items, "next_cursor": serde_json::Value::Null }),

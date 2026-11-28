@@ -24,3 +24,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+# WP 契约 v0.2 §3/§4：AI-PM 委托 Token 验签（RS256）与 JWKS 拉取。
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+base64 = { workspace = true }

@@ -40,6 +40,11 @@ impl TestDelegationVerifier {
                 actor: Actor::new(subject, actor_type),
                 actions: actions.iter().copied().collect(),
                 expires_at: Utc::now() + Duration::minutes(5),
+                lmms_tid: None,
+                artifact_id: None,
+                operation_id: None,
+                caller_request_id: None,
+                request_hash: None,
             },
         );
         self

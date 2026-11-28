@@ -180,9 +180,19 @@ async fn sdk_surfaces_error_envelope_fields(pool: sqlx::PgPool) {
         }
         other => panic!("expected Api error, got {other:?}"),
     }
-    // 文档化的元端点：SDK 无凭证可用。
+    // 文档化的元端点：健康/就绪探针无凭证可用（WP-03 起 generators 需要
+    // 委托凭证 + generation:read，不再属于无凭证面）。
     client.health().await.unwrap();
-    client.generators().await.unwrap();
+    client.ready().await.unwrap();
+    // generators 无凭证同样得到 401 信封（Q3 全量 delegation）。
+    let err = client.generators(&CallContext::new()).await.unwrap_err();
+    match &err {
+        artifact_client::SdkError::Api { status, code, .. } => {
+            assert_eq!(*status, 401);
+            assert_eq!(code, "UNAUTHENTICATED");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
 }
 
 #[test]

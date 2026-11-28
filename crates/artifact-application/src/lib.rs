@@ -17,6 +17,9 @@ pub use port::keyed_job_create::{
     KeyedGenerationJobCreatePort, KeyedJobCreateError, KeyedJobCreateOutcome,
     ValidatedCreateGenerationJobRequest,
 };
+pub use port::revocation::{
+    DelegationRevocationChecker, FailClosedRevocationChecker, RevocationCheckUnavailable,
+};
 
 pub use port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
@@ -34,6 +37,9 @@ pub use service::artifact::{
 pub use service::creation_fingerprint::{
     CURRENT_FINGERPRINT_VERSION, FingerprintError, canonical_fingerprint, current_fingerprint,
     normalize_optional_text, normalize_text,
+};
+pub use service::delegation_request::{
+    REQUEST_HASH_ALGORITHM_V1, assert_delegation_matches_request, canonical_request_fingerprint,
 };
 pub use service::generation_fingerprint::{
     CURRENT_JOB_FINGERPRINT_VERSION, GENERATION_JOB_CREATE_DOMAIN, JobFingerprintError,

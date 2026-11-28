@@ -29,6 +29,34 @@ pub fn default_verifier() -> Arc<dyn DelegationVerifier> {
     Arc::new(ClosedDelegationVerifier::new())
 }
 
+/// 按配置装配委托验证器（WP 契约 v0.2 §4）：
+/// * 清单为空（默认）→ [`ClosedDelegationVerifier`]：全拒，生产姿态不变；
+/// * 非空 → [`AiPmDelegationVerifier`]：候选 B（AI-PM 签发，AS 以其 JWKS 验签）。
+///
+/// https 强制与 issuer 唯一性已由 `Config::from_env` 校验；这里只做组装。
+pub fn verifier_from_config(
+    issuers: &[crate::config::DelegationIssuerConfig],
+) -> Arc<dyn DelegationVerifier> {
+    if issuers.is_empty() {
+        return default_verifier();
+    }
+    let trusted = issuers
+        .iter()
+        .map(|entry| artifact_infrastructure::delegation::TrustedIssuer {
+            issuer: entry.issuer.clone(),
+            jwks_url: entry.jwks_url.clone(),
+        })
+        .collect();
+    match artifact_infrastructure::delegation::AiPmDelegationVerifier::new(trusted) {
+        Ok(verifier) => Arc::new(verifier),
+        // Config::from_env 已校验；不可达的防御分支仍按 fail-closed 处理。
+        Err(reason) => {
+            tracing::error!(%reason, "delegation issuer assembly failed; staying fail-closed");
+            default_verifier()
+        }
+    }
+}
+
 pub fn app_state(pool: PgPool) -> AppState {
     app_state_with_verifier(pool, default_verifier())
 }

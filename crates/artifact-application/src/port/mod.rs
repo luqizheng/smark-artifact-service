@@ -4,5 +4,6 @@ pub mod idempotency;
 pub mod keyed_create;
 pub mod keyed_job_create;
 pub mod repo;
+pub mod revocation;
 pub mod storage;
 pub mod worker;

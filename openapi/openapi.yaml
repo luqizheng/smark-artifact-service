@@ -71,8 +71,11 @@ paths:
     get:
       operationId: listGenerators
       tags: [generators]
-      security: []
-      summary: 查询 Generator 注册表（未实现 Adapter 如实上报 unavailable）
+      summary: 查询 Generator 注册表（需委托凭证 + generation:read 动作；未实现 Adapter 如实上报 unavailable）
+      description: >-
+        WP-03 认证修复（Q3）：本端点要求有效 delegation（Bearer）；无凭证 → 401，
+        缺 `generation:read` 动作 → 403。注册表全局共享（不按 project 分片），
+        无需 X-Project-Id 头。
       responses:
         "200":
           description: Generator 列表
@@ -85,6 +88,8 @@ paths:
                   generators:
                     type: array
                     items: { $ref: "#/components/schemas/Generator" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
 
   /v1/artifacts:
     post:

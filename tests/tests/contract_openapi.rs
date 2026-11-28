@@ -377,7 +377,8 @@ fn every_business_path_documents_401() {
     let map = paths.as_mapping().unwrap();
     for (path, item) in map {
         let path_str = path.as_str().unwrap();
-        if path_str == "/v1/health" || path_str == "/v1/ready" || path_str == "/v1/generators" {
+        if path_str == "/v1/health" || path_str == "/v1/ready" {
+            // 进程存活/就绪探针是仅有的无凭证端点（WP-03 起 generators 不再豁免）。
             continue;
         }
         for (method, op) in item.as_mapping().unwrap() {
@@ -397,7 +398,15 @@ fn every_business_path_documents_401() {
 
 #[sqlx::test(migrations = "../migrations")]
 async fn served_responses_match_openapi_shapes(pool: sqlx::PgPool) {
-    let base = common::spawn_app_closed(pool).await;
+    // /v1/generators 现要求 generation:read（WP-03）；登记一枚测试替身凭证，
+    // 未登记请求仍走 401（下方"业务端点无凭证"断言不受影响）。
+    let verifier = common::verifier_with(&[(
+        common::GENERATORS_TOKEN,
+        common::TENANT,
+        common::PROJECT_1,
+        &[artifact_domain::Action::GenerationRead],
+    )]);
+    let base = common::spawn_app(pool, verifier).await;
     let client = reqwest::Client::new();
 
     // /v1/health：schema 字段对齐。
@@ -426,9 +435,13 @@ async fn served_responses_match_openapi_shapes(pool: sqlx::PgPool) {
     assert!(ready["components"]["database"].is_string());
     assert!(ready["components"]["file_storage"].is_string());
 
-    // /v1/generators。
+    // /v1/generators（WP-03：需要委托凭证 + generation:read；用测试替身登记）。
     let generators: Value = client
         .get(format!("{base}/v1/generators"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", common::GENERATORS_TOKEN),
+        )
         .send()
         .await
         .unwrap()

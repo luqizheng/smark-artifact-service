@@ -63,6 +63,25 @@ impl Action {
             _ => return None,
         })
     }
+
+    /// 是否写动作（契约 §5.3 Q1 撤销检查清单的 11 个动作；WP-03 PC-O5-1
+    /// 以同一集合强制"写路径 delegation 必带 caller_request_id"红线）。
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            Action::ArtifactCreate
+                | Action::ArtifactUpdateMetadata
+                | Action::ArtifactArchive
+                | Action::ArtifactDelete
+                | Action::VersionCreate
+                | Action::VersionCommit
+                | Action::VersionSetCurrent
+                | Action::ReferenceWrite
+                | Action::ReferenceRemove
+                | Action::GenerationRequest
+                | Action::GenerationCancel
+        )
+    }
 }
 
 impl fmt::Display for Action {
@@ -73,9 +92,15 @@ impl fmt::Display for Action {
 
 /// 委托凭证（验证通过后的领域表示）。
 ///
-/// claims 结构对齐 ART-01 §5.2：aud 固定为 Artifact Service，tenant/project/action
-/// 全部来自凭证而非请求体。签名/JWKS 验证由 [`crate`] 之外的
-/// `DelegationVerifier`（application ports）实现方负责。
+/// claims 结构对齐 ART-01 §5.2 与 WP-LMMS-DELEGATION-01 契约 v0.2 §3.1.1：
+/// aud 固定为 Artifact Service，tenant/project/action 全部来自凭证而非请求体。
+/// `scope.tenant_id` 是 AI-PM 内部租户 UUID（授权作用域唯一来源，P0-01）；
+/// `lmms_tid` 仅作来源追溯审计镜像，**不参与任何授权判定**。
+/// 操作绑定字段（§3.1.2/V10）：`artifact_id`/`operation_id`/`caller_request_id`
+/// 存在时，AS-4 接线的服务层必须校验请求目标一致性；`request_hash` 为本实现
+/// 提供的请求指纹扩展（WP-03 修订后并入契约 §3.1.1，算法 v1，见
+/// `artifact_application::canonical_request_fingerprint`）。
+/// 签名/JWKS 验证由 `DelegationVerifier`（application ports）实现方负责。
 #[derive(Debug, Clone)]
 pub struct Delegation {
     pub delegation_id: String,
@@ -84,6 +109,16 @@ pub struct Delegation {
     pub actor: crate::scope::Actor,
     pub actions: std::collections::HashSet<Action>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// 来源追溯：LMMS 数值租户标识的字符串形式（仅审计，不参与授权）。
+    pub lmms_tid: Option<String>,
+    /// 操作绑定（V10）：限定单 Artifact 的窄化委托。
+    pub artifact_id: Option<uuid::Uuid>,
+    /// 操作绑定（V10）：稳定操作标识（如 `generation_job:{uuid}`）。
+    pub operation_id: Option<String>,
+    /// 操作绑定：AS-2 调用方请求幂等键（Job 创建路径必填，§3.1.2）。
+    pub caller_request_id: Option<uuid::Uuid>,
+    /// 扩展（O-5）：签发方对规范化请求的 SHA-256 指纹（64 位小写十六进制）。
+    pub request_hash: Option<String>,
 }
 
 impl Delegation {

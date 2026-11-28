@@ -37,11 +37,25 @@ impl FromRequestParts<AppState> for Authed {
                 ),
             )
         })?;
-        let delegation = state
-            .verifier
-            .verify(token)
-            .await
-            .map_err(|e| api_error(request_id, &ApiError::Unauthenticated(e.to_string())))?;
+        let delegation = state.verifier.verify(token).await.map_err(|e| {
+            // token 级拒绝 → 401 UNAUTHENTICATED；验证器依赖不可用（JWKS 断供）
+            // → 503 DELEGATION_VERIFIER_UNAVAILABLE（失败关闭，可重试，绝不放行）。
+            let api = match &e {
+                artifact_application::VerificationError::VerifierUnavailable(reason) => {
+                    ApiError::Envelope(artifact_contract::ErrorEnvelope::new(
+                        "DELEGATION_VERIFIER_UNAVAILABLE",
+                        reason.clone(),
+                        None,
+                        true,
+                        serde_json::Value::Null,
+                    ))
+                }
+                artifact_application::VerificationError::Unauthenticated(reason) => {
+                    ApiError::Unauthenticated(reason.clone())
+                }
+            };
+            api_error(request_id, &api)
+        })?;
         Ok(Self {
             delegation,
             request_id,

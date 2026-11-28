@@ -327,6 +327,56 @@ impl ArtifactService {
         })
     }
 
+    /// 版本详情读取（WP-03 R2-F-03 修复：动作检查前置于任何数据读取，
+    /// Q3"所有受保护 API 含 GET 均要求 delegation"）。
+    pub async fn get_version(
+        &self,
+        delegation: &Delegation,
+        scope: &TenantScope,
+        artifact_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<ArtifactVersionResponse, DomainError> {
+        delegation.require(Action::VersionRead, scope)?;
+        let version = self
+            .versions
+            .get((scope.tenant_id, scope.project_id), artifact_id, version_id)
+            .await?;
+        Ok(to_version_dto(&version))
+    }
+
+    /// 版本列表读取（WP-03 R2-F-03 修复：`version:read` 动作强制 + 范围谓词）。
+    pub async fn list_versions(
+        &self,
+        delegation: &Delegation,
+        scope: &TenantScope,
+        artifact_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ArtifactVersionResponse>, DomainError> {
+        delegation.require(Action::VersionRead, scope)?;
+        let versions = self
+            .versions
+            .list((scope.tenant_id, scope.project_id), artifact_id, limit)
+            .await?;
+        Ok(versions.iter().map(to_version_dto).collect())
+    }
+
+    /// 引用列表读取（WP-03 R2-F-03 修复）。动作映射依据：冻结契约 Q4 固定
+    /// 15 动作、无 `reference:read`；引用是 Artifact 的内容元数据，读取映射到
+    /// `artifact:read`（精确动作，非通配），已在契约 §3.1.1 读端点动作表中登记。
+    pub async fn list_references(
+        &self,
+        delegation: &Delegation,
+        scope: &TenantScope,
+        artifact_id: Uuid,
+    ) -> Result<Vec<ReferenceResponse>, DomainError> {
+        delegation.require(Action::ArtifactRead, scope)?;
+        let references = self
+            .references
+            .list((scope.tenant_id, scope.project_id), artifact_id, 100)
+            .await?;
+        Ok(references.iter().map(to_reference_dto).collect())
+    }
+
     pub async fn patch_artifact(
         &self,
         delegation: &Delegation,
