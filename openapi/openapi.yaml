@@ -210,7 +210,13 @@ paths:
     post:
       operationId: createVersionSession
       tags: [artifacts]
-      summary: 创建上传版本会话（P0 阻断：file-service 协议缺失 → 503）
+      summary: 创建 pending 版本会话（WP-AS-05：对象须已上传 file-service）
+      description: |
+        调用方须先把对象上传至 file-service（自行持服务身份），再以
+        `source_object_id` + `source_sha256` 创建会话。创建时 AS 以带 tid
+        的服务令牌 head 对象（fail-early）；sha256 在 commit 时下载重算比对。
+        Version 以 `pending` 状态创建（version_number 由服务端分配），
+        `Location` 头指向版本资源。
       parameters:
         - { $ref: "#/components/parameters/ArtifactId" }
         - { $ref: "#/components/parameters/ProjectIdHeader" }
@@ -221,7 +227,11 @@ paths:
             schema: { $ref: "#/components/schemas/CreateVersionSessionRequest" }
       responses:
         "201":
-          description: （未实现，P0 关闭前不可达）
+          description: "pending Version 已创建（Location 头指向版本资源）"
+          headers:
+            Location:
+              description: "/v1/artifacts/{artifact_id}/versions/{version_id}"
+              schema: { type: string }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ArtifactVersion" }
@@ -230,7 +240,7 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "503":
-          description: STORAGE_UNAVAILABLE（阻断原因见 details）
+          description: STORAGE_UNAVAILABLE（对象面不可达 / 委托缺 lmms_tid；阻断原因见 details）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -276,18 +286,20 @@ paths:
     post:
       operationId: commitVersion
       tags: [artifacts]
-      summary: 完成上传校验并提交 Version（P0 阻断 → 503）
+      summary: 校验对象指纹并提交 Version（WP-AS-05 提交协议）
       description: |
-        提交协议要求：通过 file-service 读取可信元数据并校验 hash/大小/MIME，
-        与 ArtifactOutput 写入、current_version_id 切换在同一事务完成。
-        该协议当前被存储 P0 阻断，本端点诚实返回 503，不伪造成功。
+        提交协议（WP 契约 v0.3 §12"上传+校验+补偿"近似）：AS 以带 tid 的
+        服务令牌下载对象并重算 sha256，与会话声明比对（不符 400）；随后
+        单事务写入 ArtifactOutput（primary）并驱动 Version `pending → ready`
+        （DB 触发器强制；READY 终态不可再变）。失败路径不删除调用方对象
+        （重试幂等）；Version 非 pending → 409。
       parameters:
         - { $ref: "#/components/parameters/ArtifactId" }
         - { $ref: "#/components/parameters/VersionId" }
         - { $ref: "#/components/parameters/ProjectIdHeader" }
       responses:
         "200":
-          description: （未实现，P0 关闭前不可达）
+          description: Version 已提交（state=ready，manifest 含校验事实）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ArtifactVersion" }
@@ -295,8 +307,9 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
         "503":
-          description: STORAGE_UNAVAILABLE
+          description: STORAGE_UNAVAILABLE（对象面不可达 / 委托缺 lmms_tid）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -759,10 +772,15 @@ components:
 
     CreateVersionSessionRequest:
       type: object
+      required: [source_object_id, source_sha256]
       properties:
         source_format: { type: string }
-        source_object_id: { type: string }
-        source_sha256: { type: string }
+        source_object_id:
+          type: string
+          description: file-service 对象 id（调用方先上传；创建时 AS head 校验存在性）
+        source_sha256:
+          type: string
+          description: 调用方声明的对象 SHA-256（64 位 hex；commit 时下载重算比对）
 
     ArtifactVersion:
       type: object

@@ -6,4 +6,5 @@ pub mod keyed_job_create;
 pub mod repo;
 pub mod revocation;
 pub mod storage;
+pub mod unkeyed_create;
 pub mod worker;

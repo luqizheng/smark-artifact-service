@@ -19,7 +19,12 @@ const OTHER_TENANT: Uuid = Uuid::from_u128(0x0002);
 const OTHER_TENANT_TOKEN: &str = "gen-api-other-tenant";
 const READ_ONLY_TOKEN: &str = "gen-api-read-only";
 
-async fn spawn(pool: &PgPool) -> String {
+async fn spawn(
+    pool: &PgPool,
+) -> (
+    String,
+    std::sync::Arc<artifact_infrastructure::test_support::TestDelegationVerifier>,
+) {
     let verifier = common::verifier_with(&[
         (TOKEN, TENANT, PROJECT_1, &common::all_actions()),
         (
@@ -35,7 +40,63 @@ async fn spawn(pool: &PgPool) -> String {
             &[Action::GenerationRequest, Action::GenerationRead],
         ),
     ]);
-    common::spawn_app(pool.clone(), verifier).await
+    let base = common::spawn_app(pool.clone(), verifier.clone()).await;
+    (base, verifier)
+}
+
+/// 写请求：铸造 V10 绑定 token 并附加鉴权头（caller 随机或指定，
+/// v1 指纹按 method/path/body 计算；WP-04）。
+#[allow(clippy::too_many_arguments)]
+fn bound_auth(
+    verifier: &std::sync::Arc<artifact_infrastructure::test_support::TestDelegationVerifier>,
+    req: reqwest::RequestBuilder,
+    tenant: Uuid,
+    project: Uuid,
+    method: &str,
+    path: &str,
+    body: &Value,
+    caller: Option<Uuid>,
+) -> reqwest::RequestBuilder {
+    use artifact_infrastructure::test_support::TestTokenBinding;
+    let token = format!("gen-bound-{}", Uuid::new_v4());
+    let caller = caller.unwrap_or_else(Uuid::new_v4);
+    let hash = common::v1_fingerprint(method, path, caller, body);
+    common::mint_bound_token(
+        verifier,
+        &token,
+        tenant,
+        project,
+        &common::all_actions(),
+        TestTokenBinding {
+            artifact_id: None,
+            operation_id: None,
+            caller_request_id: Some(caller),
+            request_hash: Some(hash),
+        },
+    );
+    req.header("x-project-id", project.to_string())
+        .header("authorization", format!("Bearer {token}"))
+}
+
+/// 取消请求绑定（无 body：v1 指纹 body 段 = null）。
+fn bound_cancel(
+    verifier: &std::sync::Arc<artifact_infrastructure::test_support::TestDelegationVerifier>,
+    base: &str,
+    tenant: Uuid,
+    project: Uuid,
+    job_id: Uuid,
+) -> reqwest::RequestBuilder {
+    let path = format!("/v1/generation-jobs/{job_id}/cancel");
+    bound_auth(
+        verifier,
+        reqwest::Client::new().post(format!("{base}{path}")),
+        tenant,
+        project,
+        "POST",
+        &path,
+        &Value::Null,
+        None,
+    )
 }
 
 /// 建一个 queued Job，返回 (job_id, artifact_id)。
@@ -85,7 +146,7 @@ async fn cancel_count(pool: &PgPool, job_id: Uuid) -> i64 {
 #[sqlx::test(migrations = "../migrations")]
 async fn get_job_serves_the_documented_shape(pool: PgPool) {
     let (job_id, _) = seed(&pool).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
 
     let body = get_job(&base, job_id).await;
     let spec: serde_yaml::Value =
@@ -121,10 +182,10 @@ async fn get_job_serves_the_documented_shape(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn cancel_queued_job_and_terminal_noop(pool: PgPool) {
     let (job_id, _) = seed(&pool).await;
-    let base = spawn(&pool).await;
-    let url = format!("{base}/v1/generation-jobs/{job_id}/cancel");
+    let (base, verifier) = spawn(&pool).await;
+    let _url = format!("{base}/v1/generation-jobs/{job_id}/cancel");
 
-    let res = auth(reqwest::Client::new().post(&url), PROJECT_1)
+    let res = bound_cancel(&verifier, &base, TENANT, PROJECT_1, job_id)
         .send()
         .await
         .unwrap();
@@ -136,7 +197,7 @@ async fn cancel_queued_job_and_terminal_noop(pool: PgPool) {
     assert_eq!(cancel_count(&pool, job_id).await, 1);
 
     // 再次取消：终态原样返回。
-    let res = auth(reqwest::Client::new().post(&url), PROJECT_1)
+    let res = bound_cancel(&verifier, &base, TENANT, PROJECT_1, job_id)
         .send()
         .await
         .unwrap();
@@ -162,15 +223,15 @@ async fn cancel_running_job_reports_cancel_requested(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    let base = spawn(&pool).await;
-    let url = format!("{base}/v1/generation-jobs/{job_id}/cancel");
+    let (base, verifier) = spawn(&pool).await;
+    let _url = format!("{base}/v1/generation-jobs/{job_id}/cancel");
 
     let running = get_job(&base, job_id).await;
     assert_eq!(running["status"], "running");
     assert_eq!(running["cancel_requested"], false);
     assert_eq!(running["attempt_count"], 1);
 
-    let res = auth(reqwest::Client::new().post(&url), PROJECT_1)
+    let res = bound_cancel(&verifier, &base, TENANT, PROJECT_1, job_id)
         .send()
         .await
         .unwrap();
@@ -213,7 +274,7 @@ async fn cancel_running_job_reports_cancel_requested(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn job_endpoints_enforce_scope_and_action(pool: PgPool) {
     let (job_id, _) = seed(&pool).await;
-    let base = spawn(&pool).await;
+    let (base, verifier) = spawn(&pool).await;
     let client = reqwest::Client::new();
 
     // 委托不覆盖请求的项目。
@@ -251,10 +312,9 @@ async fn job_endpoints_enforce_scope_and_action(pool: PgPool) {
     assert_eq!(res.status(), 403);
 
     // 另一个租户对同一个 project_id：取消在数据库函数内按 scope 校验，一律 not found。
-    let res = client
-        .post(format!("{base}/v1/generation-jobs/{job_id}/cancel"))
-        .header("x-project-id", PROJECT_1.to_string())
-        .header("authorization", format!("Bearer {OTHER_TENANT_TOKEN}"))
+    // （WP-04：使用一枚绑定完整的合法 token——绑定缺失的拒绝属于另一条防线，
+    // 与跨租户不可区分性语义无关。）
+    let res = bound_cancel(&verifier, &base, OTHER_TENANT, PROJECT_1, job_id)
         .send()
         .await
         .unwrap();
@@ -283,7 +343,7 @@ async fn job_endpoints_enforce_scope_and_action(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     let (_, artifact) = seed(&pool).await;
-    let base = spawn(&pool).await;
+    let (base, verifier) = spawn(&pool).await;
     let client = reqwest::Client::new();
     let url = format!("{base}/v1/artifacts/{artifact}/generation-jobs");
     let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
@@ -292,11 +352,22 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
         .unwrap();
 
     // 合法信封：生成器没有 Worker，仍然 503，且不会产生 Job。
-    let res = auth(
-        client
-            .post(&url)
-            .json(&json!({"generator_id": "seecode", "caller_request_id": Uuid::new_v4(), "input": common::minimal_input()})),
+    // （WP-04：请求侧 caller = body.caller_request_id，与 token claim 交叉比对。）
+    let valid_caller = Uuid::new_v4();
+    let valid_body = json!({
+        "generator_id": "seecode",
+        "caller_request_id": valid_caller,
+        "input": common::minimal_input()
+    });
+    let res = bound_auth(
+        &verifier,
+        client.post(&url).json(&valid_body),
+        TENANT,
         PROJECT_1,
+        "POST",
+        &format!("/v1/artifacts/{artifact}/generation-jobs"),
+        &valid_body,
+        Some(valid_caller),
     )
     .send()
     .await
@@ -444,7 +515,7 @@ async fn lookup(base: &str, caller: Uuid, project: Uuid) -> reqwest::Response {
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_36_lookup_serves_the_job_with_caller_identity(pool: PgPool) {
     let (job, _) = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
 
     let res = lookup(&base, LOOKUP_CALLER, PROJECT_1).await;
     assert_eq!(res.status(), 200);
@@ -461,7 +532,7 @@ async fn as2_36_lookup_serves_the_job_with_caller_identity(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_22_lookup_does_not_leak_across_scopes(pool: PgPool) {
     let (job, _) = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
 
     // 另一个租户查询同一个 caller_request_id：404（存在但不可见）。
     let res = reqwest::Client::new()
@@ -497,7 +568,7 @@ async fn as2_22_lookup_does_not_leak_across_scopes(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_21_lookup_requires_project_authorization(pool: PgPool) {
     let _ = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
     let res = lookup(&base, LOOKUP_CALLER, PROJECT_2).await;
     assert_eq!(res.status(), 403);
     let body: Value = res.json().await.unwrap();
@@ -509,7 +580,7 @@ async fn as2_21_lookup_requires_project_authorization(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_23_lookup_rejects_invalid_uuid(pool: PgPool) {
     let _ = seed_identified(&pool, TENANT, PROJECT_1, LOOKUP_CALLER).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
     // 哨兵值带有唯一标记，确保任何回显都能被检出。
     let malicious = "not-a-uuid-MARKER-9f3a";
     let res = auth(
@@ -550,7 +621,7 @@ async fn as2_23_lookup_rejects_invalid_uuid(pool: PgPool) {
 async fn as2_24_lookup_sees_only_committed_jobs(pool: PgPool) {
     let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "api-commit").await;
     common::sql_enable_seecode(&pool, ADAPTER).await;
-    let base = spawn(&pool).await;
+    let (base, _verifier) = spawn(&pool).await;
     let caller = Uuid::from_u128(0x0d02);
 
     // 未提交的创建事务。
@@ -590,20 +661,28 @@ async fn as2_24_lookup_sees_only_committed_jobs(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn as2_41_http_create_stays_fail_closed(pool: PgPool) {
     let (_, artifact) = seed(&pool).await;
-    let base = spawn(&pool).await;
+    let (base, verifier) = spawn(&pool).await;
     let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let res = auth(
+    let job_caller = Uuid::new_v4();
+    let job_body = json!({
+        "generator_id": "seecode",
+        "caller_request_id": job_caller,
+        "input": common::minimal_input()
+    });
+    let res = bound_auth(
+        &verifier,
         reqwest::Client::new()
             .post(format!("{base}/v1/artifacts/{artifact}/generation-jobs"))
-            .json(&json!({
-                "generator_id": "seecode",
-                "caller_request_id": Uuid::new_v4(),
-                "input": common::minimal_input()
-            })),
+            .json(&job_body),
+        TENANT,
         PROJECT_1,
+        "POST",
+        &format!("/v1/artifacts/{artifact}/generation-jobs"),
+        &job_body,
+        Some(job_caller),
     )
     .send()
     .await

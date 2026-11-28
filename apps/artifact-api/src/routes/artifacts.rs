@@ -19,16 +19,19 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use artifact_application::WriteOperationType;
+
 use crate::auth::{Authed, Scoped};
 use crate::error::{ApiError, RequestId, api_error, error_response};
 use crate::state::AppState;
 
 // ── 通用提取器 ─────────────────────────────────────────────────────────
 
-/// JSON body + 原文 sha256（幂等 request_hash 的基础）。
-/// 解析失败返回 400 INVALID_REQUEST（机器可读信封）。
+/// JSON body + 原始 Value（V10 v1 指纹绑定用，未知字段参与指纹）+ 原文
+/// sha256（幂等 request_hash 的基础）。解析失败返回 400 INVALID_REQUEST。
 pub struct ValidJson<T> {
     pub value: T,
+    pub raw: serde_json::Value,
     pub request_hash: String,
 }
 
@@ -44,19 +47,26 @@ where
             .await
             .map_err(|_| invalid_request("request body is too large or unreadable"))?;
         let request_hash = sha256_hex(&bytes);
-        let value: T = serde_json::from_slice(&bytes)
+        // 先按 Value 解析（保形），再收窄到 typed DTO：指纹与签发方对原始
+        // 请求 JSON 的计算保持一致，未知字段不会被 DTO 静默丢弃。
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
+        let value: T = serde_json::from_value(raw.clone())
             .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
         Ok(Self {
             value,
+            raw,
             request_hash,
         })
     }
 }
 
 /// 生成请求专用提取器：body 上限 256 KiB（ART-03A A3A-02），超限返回 413。
-/// 只保留原始字节数与解析后的 JSON；输入正文不进入日志/trace。
+/// 只保留原始字节数、原始 Value（V10 指纹绑定）与解析后的 JSON；
+/// 输入正文不进入日志/trace。
 pub struct ValidGenerationJson<T> {
     pub value: T,
+    pub raw: serde_json::Value,
     pub envelope_bytes: usize,
 }
 
@@ -83,10 +93,13 @@ where
                 )
             })?;
         let envelope_bytes = bytes.len();
-        let value: T = serde_json::from_slice(&bytes)
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
+        let value: T = serde_json::from_value(raw.clone())
             .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
         Ok(Self {
             value,
+            raw,
             envelope_bytes,
         })
     }
@@ -212,16 +225,49 @@ fn request_id_str(id: Option<RequestId>) -> Option<String> {
     id.map(|r| r.0.to_string())
 }
 
+/// 构造 V10 操作绑定事实（WP-04）：method + 实例化 path（字节原样）+ 原始
+/// body Value。判定在应用服务层完成；本函数只采集，不做任何策略判定。
+fn write_binding(
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+    operation_type: WriteOperationType,
+    target_artifact_id: Option<Uuid>,
+    target_job_id: Option<Uuid>,
+    raw_body: serde_json::Value,
+    request_caller: Option<Uuid>,
+) -> artifact_application::WriteOperationBinding {
+    artifact_application::WriteOperationBinding {
+        method: method.as_str().to_string(),
+        path: uri.path().to_string(),
+        operation_type,
+        target_artifact_id,
+        target_job_id,
+        body: raw_body,
+        request_caller_request_id: request_caller,
+    }
+}
+
 // ── Artifact 元数据（已实现） ──────────────────────────────────────────
 
 pub async fn create_artifact(
     State(state): State<AppState>,
     req: Authed,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: ValidJson<CreateArtifactRequest>,
 ) -> Result<Response, ApiError> {
     let scope =
         artifact_domain::TenantScope::new(req.delegation.scope.tenant_id, body.value.project_id);
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::ArtifactCreate,
+        None,
+        None,
+        body.raw,
+        None,
+    );
     let outcome = state
         .artifacts
         .create_artifact(
@@ -231,6 +277,7 @@ pub async fn create_artifact(
             body.value,
             idempotency_key(&headers),
             body.request_hash,
+            &binding,
         )
         .await?;
     // 稳定解析语义（ART-04E §7）：created → 201；existing_key / idempotency_replay → 200。
@@ -281,12 +328,23 @@ pub async fn list_artifacts(
 pub async fn patch_artifact(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
     headers: HeaderMap,
     body: ValidJson<UpdateArtifactRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
     let expected_revision = parse_if_match_revision(&headers)?;
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::ArtifactPatchMetadata,
+        Some(artifact_id),
+        None,
+        body.raw,
+        None,
+    );
     let dto = state
         .artifacts
         .patch_artifact(
@@ -296,6 +354,7 @@ pub async fn patch_artifact(
             expected_revision,
             body.value,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await?;
     Ok(etag_response(StatusCode::OK, &dto))
@@ -304,10 +363,21 @@ pub async fn patch_artifact(
 pub async fn set_current_version(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
     body: ValidJson<SetCurrentVersionRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::CurrentVersionSet,
+        Some(artifact_id),
+        None,
+        body.raw,
+        None,
+    );
     let dto = state
         .artifacts
         .set_current_version(
@@ -316,6 +386,7 @@ pub async fn set_current_version(
             artifact_id,
             body.value,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await?;
     Ok(etag_response(StatusCode::OK, &dto))
@@ -326,44 +397,77 @@ pub async fn set_current_version(
 pub async fn create_version_session(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
     body: ValidJson<CreateVersionSessionRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
-    match state
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::VersionSessionCreate,
+        Some(artifact_id),
+        None,
+        body.raw,
+        None,
+    );
+    let dto = state
         .artifacts
-        .create_version_session(&req.delegation, &req.scope, artifact_id, body.value)
-        .await
-    {
-        Err(e) => Err(e.into()),
-        // 不可达：StoragePort 生产实现为 ProtocolBlocked；若未来此处返回 Ok，
-        // 必须先落地完整版本提交协议（ART-02 存储 P0）。
-        Ok(_) => Err(DomainError::Internal(
-            "version session succeeded while storage protocol is blocked; refusing to fabricate success"
-                .into(),
+        .create_version_session(
+            &req.delegation,
+            &req.scope,
+            artifact_id,
+            body.value,
+            &binding,
+            request_id_str(req.request_id).as_deref(),
         )
-        .into()),
-    }
+        .await?;
+    // WP-AS-05：201 Created，Location 指向版本资源（提交协议见 commit）。
+    let location = format!("/v1/artifacts/{artifact_id}/versions/{}", dto.id);
+    Ok((
+        StatusCode::CREATED,
+        [("Location", location)],
+        axum::Json(dto),
+    )
+        .into_response())
 }
 
 pub async fn commit_version(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path((artifact_id, version_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
     let version_id = parse_path_uuid(&version_id, "version_id")?;
+    // 无 body 端点：v1 指纹 body 段 = 字面量 null（契约 §3.1.3）。
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::VersionCommit,
+        Some(artifact_id),
+        None,
+        serde_json::Value::Null,
+        None,
+    );
     match state
         .artifacts
-        .commit_version_session(&req.delegation, &req.scope, artifact_id, version_id)
+        .commit_version_session(
+            &req.delegation,
+            &req.scope,
+            artifact_id,
+            version_id,
+            &binding,
+            request_id_str(req.request_id).as_deref(),
+        )
         .await
     {
         Err(e) => Err(e.into()),
-        Ok(_) => Err(DomainError::Internal(
-            "version commit succeeded while storage protocol is blocked; refusing to fabricate success"
-                .into(),
-        )
-        .into()),
+        // WP-AS-05：Ok 分支由原"拒绝伪成功"守卫改为真实提交协议
+        // （inspect + sha256 比对 + 单事务 output/ready），此处保持直返。
+        Ok(dto) => Ok(json_response(StatusCode::OK, dto)),
     }
 }
 
@@ -409,10 +513,21 @@ pub async fn list_versions(
 pub async fn create_reference(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
     body: ValidJson<CreateReferenceRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::ReferenceCreate,
+        Some(artifact_id),
+        None,
+        body.raw,
+        None,
+    );
     let outcome = state
         .artifacts
         .create_reference(
@@ -421,6 +536,7 @@ pub async fn create_reference(
             artifact_id,
             body.value,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await?;
     Ok(json_response(StatusCode::CREATED, outcome.resource))
@@ -446,10 +562,22 @@ pub async fn list_references(
 pub async fn remove_reference(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path((artifact_id, reference_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
     let reference_id = parse_path_uuid(&reference_id, "reference_id")?;
+    // 无 body 端点：v1 指纹 body 段 = 字面量 null（契约 §3.1.3）。
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::ReferenceRemove,
+        Some(artifact_id),
+        None,
+        serde_json::Value::Null,
+        None,
+    );
     state
         .artifacts
         .remove_reference(
@@ -458,6 +586,7 @@ pub async fn remove_reference(
             artifact_id,
             reference_id,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -468,6 +597,8 @@ pub async fn remove_reference(
 pub async fn request_generation(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
     _headers: HeaderMap,
     body: ValidGenerationJson<CreateGenerationJobRequest>,
@@ -489,6 +620,16 @@ pub async fn request_generation(
         ));
     }
 
+    // V10：请求侧 caller = body.caller_request_id（与 token claim 交叉比对）。
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::GenerationRequest,
+        Some(artifact_id),
+        None,
+        body.raw,
+        Some(body.value.caller_request_id),
+    );
     match state
         .artifacts
         .request_generation(
@@ -497,6 +638,7 @@ pub async fn request_generation(
             artifact_id,
             body.value,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await
     {
@@ -541,9 +683,21 @@ pub async fn get_job_by_caller_request(
 pub async fn cancel_job(
     State(state): State<AppState>,
     req: Scoped,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(job_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let job_id = parse_path_uuid(&job_id, "job_id")?;
+    // 无 body 端点：v1 指纹 body 段 = 字面量 null（契约 §3.1.3）。
+    let binding = write_binding(
+        &method,
+        &uri,
+        WriteOperationType::GenerationCancel,
+        None,
+        Some(job_id),
+        serde_json::Value::Null,
+        None,
+    );
     let dto = state
         .artifacts
         .cancel_job(
@@ -551,6 +705,7 @@ pub async fn cancel_job(
             &req.scope,
             job_id,
             request_id_str(req.request_id).as_deref(),
+            &binding,
         )
         .await?;
     Ok(json_response(StatusCode::OK, dto))

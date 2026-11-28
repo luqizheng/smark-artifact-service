@@ -166,6 +166,17 @@ fn valid_token() -> String {
     mint(&KEY_PRIMARY, KID_PRIMARY, base_claims())
 }
 
+/// WP-04 V10：铸造一枚完整操作绑定的 RS256 token——
+/// `biz.request_hash` = 按 v1 冻结规范对 (method, path, caller, body) 的指纹。
+/// 测试侧独立计算 + AS 服务层重算比对 = 跨层一致性证明（真实签发链路）。
+fn bound_valid_token(method: &str, path: &str, body: &Value) -> String {
+    let mut claims = base_claims();
+    let caller = Uuid::parse_str(claims["caller_request_id"].as_str().unwrap()).unwrap();
+    let hash = canonical_request_fingerprint(method, path, Some(caller), body);
+    claims["biz"] = json!({ "request_hash": hash, "request_hash_alg": "v1" });
+    mint(&KEY_PRIMARY, KID_PRIMARY, claims)
+}
+
 // ── 场景 1：正常 Token（E2E：签发方 → AS 验证 → 业务放行） ──────────────
 
 #[sqlx::test(migrations = "../migrations")]
@@ -175,15 +186,23 @@ async fn s01_valid_token_roundtrip_creates_and_reads(pool: sqlx::PgPool) {
     let http = reqwest::Client::new();
     let token = valid_token();
 
+    // WP-04：写请求需 v1 指纹绑定（caller+hash 与 biz claim 一致）。
+    let create_body = json!({
+        "project_id": common::PROJECT_1,
+        "name": "Delegation Fixture",
+        "artifact_type": "visualization"
+    });
     let created = http
         .post(format!("{base}/v1/artifacts"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                bound_valid_token("POST", "/v1/artifacts", &create_body)
+            ),
+        )
         .header("x-project-id", common::PROJECT_1.to_string())
-        .json(&json!({
-            "project_id": common::PROJECT_1,
-            "name": "Delegation Fixture",
-            "artifact_type": "visualization"
-        }))
+        .json(&create_body)
         .send()
         .await
         .unwrap();
@@ -411,12 +430,20 @@ async fn s10_cross_tenant_access_is_isolated(pool: sqlx::PgPool) {
     let base = common::spawn_app(pool, jwks.verifier(Duration::from_secs(600))).await;
     let http = reqwest::Client::new();
 
-    // 在 (TENANT, PROJECT_1) 建资源。
+    // 在 (TENANT, PROJECT_1) 建资源（WP-04：绑定 token）。
+    let t1_body =
+        json!({"project_id": common::PROJECT_1, "name": "T1", "artifact_type": "visualization"});
     let created: Value = http
         .post(format!("{base}/v1/artifacts"))
-        .header("Authorization", format!("Bearer {}", valid_token()))
+        .header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                bound_valid_token("POST", "/v1/artifacts", &t1_body)
+            ),
+        )
         .header("x-project-id", common::PROJECT_1.to_string())
-        .json(&json!({"project_id": common::PROJECT_1, "name": "T1", "artifact_type": "visualization"}))
+        .json(&t1_body)
         .send()
         .await
         .unwrap()
@@ -503,12 +530,19 @@ async fn s18_missing_project_header_is_400(pool: sqlx::PgPool) {
     let http = reqwest::Client::new();
     let token = valid_token();
 
-    // 先合法建一个资源（create 的 project 取自请求体，ART-01 语义）。
+    // 先合法建一个资源（create 的 project 取自请求体，ART-01 语义；WP-04：绑定 token）。
+    let nh_body = json!({"project_id": common::PROJECT_1, "name": "NoHeader", "artifact_type": "visualization"});
     let created: Value = http
         .post(format!("{base}/v1/artifacts"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                bound_valid_token("POST", "/v1/artifacts", &nh_body)
+            ),
+        )
         .header("x-project-id", common::PROJECT_1.to_string())
-        .json(&json!({"project_id": common::PROJECT_1, "name": "NoHeader", "artifact_type": "visualization"}))
+        .json(&nh_body)
         .send()
         .await
         .unwrap()
@@ -916,7 +950,7 @@ async fn s06b_jwks_cache_unavailable_lookup_fails_closed() {
 
 #[tokio::test]
 async fn s22_test_double_verifier_still_fresh_after_field_extension() {
-    let mut verifier = TestDelegationVerifier::new();
+    let verifier = TestDelegationVerifier::new();
     verifier.allow(
         "tok",
         common::TENANT,

@@ -29,3 +29,7 @@ jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 base64 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }

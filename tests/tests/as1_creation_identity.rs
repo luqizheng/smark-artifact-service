@@ -20,6 +20,7 @@ const ENDPOINT: &str = "POST /v1/artifacts";
 struct Api {
     base: String,
     http: reqwest::Client,
+    verifier: std::sync::Arc<artifact_infrastructure::test_support::TestDelegationVerifier>,
 }
 
 fn create_body(project: Uuid, artifact_key: Option<&str>, name: &str) -> Value {
@@ -39,10 +40,39 @@ impl Api {
             (TOKEN_P1, TENANT, PROJECT_1, common::read_actions()),
             (TOKEN_P2, TENANT, PROJECT_2, common::read_actions()),
         ]);
-        let base = common::spawn_app(pool, verifier).await;
+        let base = common::spawn_app(pool, verifier.clone()).await;
         Self {
             base,
             http: reqwest::Client::new(),
+            verifier,
+        }
+    }
+
+    /// 为一次写请求铸造 V10 绑定 token（caller 随机 + v1 指纹），返回 bearer 原文。
+    /// WP-04：写 token 必须绑定到（method, path, caller, body）。
+    /// token 的 **scope** 由基名决定（TOKEN_P1→PROJECT_1 / TOKEN_P2→PROJECT_2），
+    /// 与请求的 project 解耦——跨 scope 负面测试的语义保持不变。
+    fn bound_token(&self, scope_project: Uuid, body: &Value, base_name: &str) -> String {
+        let token = format!("{base_name}-{}", Uuid::new_v4());
+        common::mint_write_token(
+            &self.verifier,
+            &token,
+            TENANT,
+            scope_project,
+            common::read_actions(),
+            "POST",
+            "/v1/artifacts",
+            body,
+        );
+        token
+    }
+
+    /// 基名 → 授权 scope（保持 TOKEN_P1/TOKEN_P2 的原语义）。
+    fn token_scope(&self, base_name: &str) -> Uuid {
+        if base_name == TOKEN_P2 {
+            PROJECT_2
+        } else {
+            PROJECT_1
         }
     }
 
@@ -54,10 +84,15 @@ impl Api {
         idempotency_key: Option<&str>,
         token: &str,
     ) -> reqwest::RequestBuilder {
+        let bound = self.bound_token(
+            self.token_scope(token),
+            &create_body(project, artist_key, name),
+            token,
+        );
         let mut req = self
             .http
             .post(format!("{}/v1/artifacts", self.base))
-            .bearer_auth(token)
+            .bearer_auth(bound)
             .header("x-project-id", project.to_string())
             .json(&create_body(project, artist_key, name));
         if let Some(key) = idempotency_key {
@@ -550,14 +585,26 @@ async fn forged_completed_replay_fails_closed(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn concurrent_same_key_creates_exactly_one_artifact(pool: PgPool) {
     let api = Api::spawn(pool.clone()).await;
+    // 同 body 同 caller 的同一枚绑定 token 并发提交（合法网络重试竞态）。
+    let shared_token = api.bound_token(
+        PROJECT_1,
+        &json!({
+            "project_id": PROJECT_1,
+            "name": "race",
+            "artifact_type": "visualization",
+            "artifact_key": "race.key",
+        }),
+        TOKEN_P1,
+    );
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let base = api.base.clone();
         let http = api.http.clone();
+        let token = shared_token.clone();
         tasks.push(tokio::spawn(async move {
             let res = http
                 .post(format!("{base}/v1/artifacts"))
-                .bearer_auth(TOKEN_P1)
+                .bearer_auth(token)
                 .header("x-project-id", PROJECT_1.to_string())
                 .json(&json!({
                     "project_id": PROJECT_1,
@@ -606,10 +653,21 @@ async fn concurrent_same_key_different_payload_has_single_winner(pool: PgPool) {
     for name in ["alpha", "beta", "gamma", "delta"] {
         let base = api.base.clone();
         let http = api.http.clone();
+        // 每个 payload 一枚绑定 token（body 不同 → 指纹不同）。
+        let token = api.bound_token(
+            PROJECT_1,
+            &json!({
+                "project_id": PROJECT_1,
+                "name": name,
+                "artifact_type": "visualization",
+                "artifact_key": "contended.key",
+            }),
+            TOKEN_P1,
+        );
         tasks.push(tokio::spawn(async move {
             let res = http
                 .post(format!("{base}/v1/artifacts"))
-                .bearer_auth(TOKEN_P1)
+                .bearer_auth(token)
                 .header("x-project-id", PROJECT_1.to_string())
                 .json(&json!({
                     "project_id": PROJECT_1,
@@ -648,14 +706,26 @@ async fn concurrent_same_key_different_payload_has_single_winner(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn concurrent_same_idempotency_key_yields_one_artifact(pool: PgPool) {
     let api = Api::spawn(pool.clone()).await;
+    // 同 body 同 key：共享一枚绑定 token 并发提交。
+    let shared_token = api.bound_token(
+        PROJECT_1,
+        &json!({
+            "project_id": PROJECT_1,
+            "name": "idem race",
+            "artifact_type": "visualization",
+            "artifact_key": "shared.key",
+        }),
+        TOKEN_P1,
+    );
     let mut tasks = Vec::new();
     for _ in 0..6 {
         let base = api.base.clone();
         let http = api.http.clone();
+        let token = shared_token.clone();
         tasks.push(tokio::spawn(async move {
             let res = http
                 .post(format!("{base}/v1/artifacts"))
-                .bearer_auth(TOKEN_P1)
+                .bearer_auth(token)
                 .header("x-project-id", PROJECT_1.to_string())
                 .header("idempotency-key", "shared-idem")
                 .json(&json!({
@@ -766,9 +836,15 @@ async fn equivalent_json_serializations_share_one_fingerprint(pool: PgPool) {
     let send = |body: String| {
         let http = api.http.clone();
         let base = api.base.clone();
+        // 原始字符串 body → 解析为 Value 铸造绑定 token（指纹按解析后语义）。
+        let token = api.bound_token(
+            PROJECT_1,
+            &serde_json::from_str::<Value>(&body).expect("raw body is valid JSON"),
+            TOKEN_P1,
+        );
         async move {
             http.post(format!("{base}/v1/artifacts"))
-                .bearer_auth(TOKEN_P1)
+                .bearer_auth(token)
                 .header("content-type", "application/json")
                 .body(body)
                 .send()
@@ -1189,10 +1265,20 @@ async fn concurrent_one_idempotency_key_two_artifact_keys_has_one_winner(pool: P
         let http = api.http.clone();
         // 同一个 Idempotency-Key，两组不同的 artifact_key（因此 request_hash 不同）。
         let artifact_key = if index % 2 == 0 { "race.a" } else { "race.b" };
+        let token = api.bound_token(
+            PROJECT_1,
+            &json!({
+                "project_id": PROJECT_1,
+                "name": "Shared",
+                "artifact_type": "visualization",
+                "artifact_key": artifact_key,
+            }),
+            TOKEN_P1,
+        );
         tasks.push(tokio::spawn(async move {
             let res = http
                 .post(format!("{base}/v1/artifacts"))
-                .bearer_auth(TOKEN_P1)
+                .bearer_auth(token)
                 .header("x-project-id", PROJECT_1.to_string())
                 .header("idempotency-key", "shared-race")
                 .json(&json!({

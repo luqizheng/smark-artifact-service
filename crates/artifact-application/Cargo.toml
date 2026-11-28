@@ -13,6 +13,7 @@ artifact-contract = { workspace = true }
 async-trait = "0.1"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+bytes = { workspace = true }
 unicode-normalization = "0.1"
 uuid = { workspace = true }
 chrono = { workspace = true }
