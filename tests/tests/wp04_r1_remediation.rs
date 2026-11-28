@@ -408,14 +408,18 @@ async fn f3_positive_control_without_query_still_passes_query_gate(pool: PgPool)
             "W1" | "W6" => assert_eq!(status, StatusCode::CREATED, "{}: {value}", spec.label),
             "W2" | "W5" | "W9" => assert_eq!(status, StatusCode::OK, "{}: {value}", spec.label),
             "W7" => assert_eq!(status, StatusCode::NO_CONTENT, "{}: {value}", spec.label),
-            // 功能门类：503（query 门未拦截无 query 的合法请求）。
-            "W3" | "W4" | "W8" => {
+            // 功能门类：503（query 门未拦截无 query 的合法请求）；WP-AS-06
+            // 后 W8 走 keyed create → 202（0006 翻转 seecode available）。
+            "W3" | "W4" => {
                 assert_eq!(
                     status,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "{}: {value}",
                     spec.label
                 );
+            }
+            "W8" => {
+                assert_eq!(status, StatusCode::ACCEPTED, "{}: {value}", spec.label);
             }
             other => panic!("unexpected spec {other}"),
         }
@@ -448,19 +452,16 @@ async fn g1_w8_artifact_id_claim_matching_path_passes_target_binding(pool: PgPoo
         Some(&body),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
     assert_eq!(
-        value["error"]["code"], "GENERATOR_UNAVAILABLE",
-        "503 functional gate, not a 403 binding denial"
+        value["status"], "queued",
+        "202 created (WP-AS-06 keyed create), not a 403 binding denial"
     );
     let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        jobs, 0,
-        "gate is functionally closed; no job may be created"
-    );
+    assert_eq!(jobs, 1, "exactly the matching-path request creates a job");
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -525,14 +526,14 @@ async fn g3_w8_artifact_id_claim_absent_follows_frozen_contract_shape(pool: PgPo
         Some(&body),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
     assert_eq!(
-        value["error"]["code"], "GENERATOR_UNAVAILABLE",
-        "functional gate, not a binding denial"
+        value["status"], "queued",
+        "202 created (WP-AS-06 keyed create), not a binding denial"
     );
     let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact.generation_job")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(jobs, 0);
+    assert_eq!(jobs, 1);
 }

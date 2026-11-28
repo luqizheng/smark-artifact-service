@@ -82,6 +82,9 @@ GRANT EXECUTE ON FUNCTION artifact.fail_generation_job_attempt(uuid, uuid, text,
 GRANT EXECUTE ON FUNCTION artifact.confirm_generation_job_cancelled(uuid, uuid, text) TO "__WORKER_ROLE__";
 GRANT EXECUTE ON FUNCTION artifact.recover_expired_generation_jobs() TO "__WORKER_ROLE__";
 GRANT EXECUTE ON FUNCTION artifact.purge_expired_generation_job_input() TO "__WORKER_ROLE__";
+-- WP-AS-06：输出提交的单一受控路径（0006）。
+GRANT EXECUTE ON FUNCTION artifact.commit_generation_output(
+    uuid, uuid, text, text, char(64), bigint, text, text, jsonb) TO "__WORKER_ROLE__";
 
 -- API role 需要调用「创建（同事务输入快照 + durable caller identity）」与
 -- 「取消协调」两个受控函数；其余 Worker 专用函数、key holder 门禁 helper 与

@@ -1,25 +1,28 @@
-//! Artifact Worker 独立入口（ART-03B-01）。
+//! Artifact Worker 独立入口（ART-03B-01 协调 + WP-AS-06 执行循环）。
 //!
-//! 本切片的构建不包含任何 Generator Adapter，所以 `run` 只做协调维护
-//! （租约恢复 + 输入清理），不会领取任何 Job：
-//!   * 数据库只把 Job 交给申报了相同 adapter 版本的 Worker，没有 Adapter 的 Worker
-//!     不申报任何能力，也就领不到 Job；
-//!   * 领取、执行、heartbeat 与强杀的执行循环属于 ART-03B-02 / ART-03C。
+//! `run` 始终执行协调维护（租约恢复 + 输入清理）；当执行面配置齐备
+//! （`ARTIFACT_WORKER_SEECODE_CLI_PATH` + `ARTIFACT_WORKER_FILE_*` 五项
+//! all-or-nothing，见 config）时并行运行 SeeCode 执行循环：
+//!   * Worker 只申报与 vendored Adapter 版本一致的能力（claim v2 等值匹配）；
+//!   * 渲染经沙箱（零凭据 / stdin 传参 / 超时强杀），SVG 产物经静态化把闸；
+//!   * 输出经 file-service 上传 + sha256 重算校验 + 0006 单事务提交；
+//!   * 未配置执行面时不申报任何能力，领不到 Job（ART-03B-01 原姿态）。
 //!
-//! Worker 不包含 Node / SeeCode vendor，不继承用户 delegation，不读取 API 用户身份凭证。
+//! Worker 不继承用户 delegation，不读取 API 用户身份凭证；Node/SeeCode
+//! vendor 只进入 Worker 镜像（ART-03 部署边界）。
 //!
 //! 子命令：
-//!   `run`（默认）：协调维护循环，收到 SIGTERM / Ctrl-C 后退出。
+//!   `run`（默认）：协调维护 + （可选）执行循环，SIGTERM / Ctrl-C 后退出。
 //!   `recover-once`：执行一次租约恢复 + 输入清理（供运维/定时任务调用）。
 //!   `ping`：仅验证独立 DB 连接与角色可用。
 //!
 //! 日志不记录 lease token、输入正文或数据库连接串。
 
-mod config;
-
 use artifact_application::run_coordination_maintenance;
 use artifact_infrastructure::postgres::PgWorkerCoordination;
-use config::WorkerConfig;
+use artifact_worker::config::WorkerConfig;
+use artifact_worker::{execute, seecode_adapter};
+
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::time::{MissedTickBehavior, interval};
@@ -82,32 +85,66 @@ async fn run_loop(
     config: WorkerConfig,
     coordination: Arc<PgWorkerCoordination>,
 ) -> anyhow::Result<()> {
-    tracing::info!(
-        worker_id = %config.worker_id,
-        maintenance_interval_ms = config.maintenance_interval.as_millis() as u64,
-        "artifact-worker started in coordination-only mode: no generator adapter is compiled into this build, jobs will not be claimed"
-    );
+    // 执行面（WP-AS-06）：五项配置齐备才装配执行器；缺省保持协调-only。
+    let executor = match &config.execution {
+        Some(settings) => {
+            let executor = execute::build_executor(
+                coordination.clone() as Arc<dyn artifact_application::WorkerCoordinationPort>,
+                settings,
+                &config.worker_id,
+            )?;
+            tracing::info!(
+                worker_id = %config.worker_id,
+                seecode_cli = %settings.seecode_cli_path,
+                lease_seconds = settings.lease_seconds,
+                adapter_version = seecode_adapter::SEECODE_ADAPTER_VERSION,
+                "artifact-worker started with seecode execution loop (sandboxed vendored CLI)"
+            );
+            Some(executor)
+        }
+        None => {
+            tracing::info!(
+                worker_id = %config.worker_id,
+                maintenance_interval_ms = config.maintenance_interval.as_millis() as u64,
+                "artifact-worker started in coordination-only mode: no execution settings, jobs will not be claimed"
+            );
+            None
+        }
+    };
 
-    let mut tick = interval(config.maintenance_interval);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = shutdown_signal() => {
-                tracing::info!(worker_id = %config.worker_id, "shutdown signal received; artifact-worker stopped");
-                return Ok(());
-            }
-            _ = tick.tick() => {
-                match run_coordination_maintenance(coordination.as_ref()).await {
-                    // 恢复扫描的 advisory lock 被别的 Worker 持有时返回 0，属于正常情况。
-                    Ok((0, 0)) => {}
-                    Ok((recovered, purged)) => {
-                        tracing::info!(recovered, purged, "coordination maintenance applied");
-                    }
-                    Err(e) => tracing::warn!(error = %e, "coordination maintenance failed; will retry"),
+    let maintenance = async {
+        let mut tick = interval(config.maintenance_interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match run_coordination_maintenance(coordination.as_ref()).await {
+                // 恢复扫描的 advisory lock 被别的 Worker 持有时返回 0，属于正常情况。
+                Ok((0, 0)) => {}
+                Ok((recovered, purged)) => {
+                    tracing::info!(recovered, purged, "coordination maintenance applied");
                 }
+                Err(e) => tracing::warn!(error = %e, "coordination maintenance failed; will retry"),
             }
         }
+    };
+    tokio::pin!(maintenance);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    tokio::select! {
+        _ = &mut shutdown => {
+            tracing::info!(worker_id = %config.worker_id, "shutdown signal received; artifact-worker stopped");
+        }
+        _ = &mut maintenance => {}
+        _ = async {
+            if let Some(executor) = &executor {
+                executor.run_loop(std::future::pending::<()>()).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
     }
+    Ok(())
 }
 
 /// SIGTERM（容器停止）或 Ctrl-C（本地前台运行）。

@@ -310,8 +310,8 @@ pub fn sha256_hex(text: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 把 seecode 临时注册为可用并带 adapter 版本。生产 seed 是 unavailable；
-/// 这里只在 sqlx::test 为每个测试新建的独立库里生效，不是任何生产绕过开关。
+/// 把 seecode 注册为指定 adapter 版本（WP-AS-06 后生产 seed 已是 available，
+/// 0006 翻转；本 helper 仅调整 adapter 版本，不是任何生产绕过开关）。
 pub async fn sql_enable_seecode(pool: &sqlx::PgPool, adapter_version: &str) {
     sqlx::query(
         "UPDATE artifact.generator_registry \

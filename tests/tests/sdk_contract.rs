@@ -192,6 +192,8 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
         expected_current_version_id: None,
         caller_request_id: job_caller,
     };
+    // WP-AS-06：合法信封 + available 生成器 → 202 新建（keyed create 接线），
+    // 响应带 target_version_id=null（提交时物化）与 poll_url。
     let generation = client
         .request_generation(
             created.id,
@@ -206,10 +208,10 @@ async fn sdk_full_flow_matches_contract(pool: sqlx::PgPool) {
             ),
         )
         .await
-        .unwrap_err();
-    assert_eq!(generation.code(), "GENERATOR_UNAVAILABLE");
-    // 503 类错误按契约 retryable=true（Worker/Generator 未来部署后可用）。
-    assert!(generation.retryable());
+        .unwrap();
+    assert_eq!(generation.status, "queued");
+    assert_eq!(generation.caller_request_id, Some(job_caller));
+    assert_eq!(generation.target_version_id, None);
 
     // 不符合输入信封的请求在校验阶段被拒绝：稳定错误码 + 结构化的原因与位置。
     let rejected = client

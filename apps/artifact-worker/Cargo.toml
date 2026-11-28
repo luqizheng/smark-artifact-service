@@ -1,11 +1,19 @@
 [package]
 name = "artifact-worker"
-description = "Independent Artifact Service worker: job coordination maintenance only (no generator adapter, no SeeCode, no Node)"
+description = "Independent Artifact Service worker: coordination maintenance + SeeCode execution loop (vendored CLI, sandboxed; no Node in the API image)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "artifact_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "artifact-worker"
+path = "src/main.rs"
 
 [dependencies]
 artifact-application = { workspace = true }
@@ -15,3 +23,10 @@ sqlx = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+artifact-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = "0.1"
