@@ -1,7 +1,7 @@
 //! Migration 不变量守卫：
 //!   * 已发布迁移的内容与 migrations.sha256 清单完全一致（禁止修改历史 migration）；
 //!   * 每个迁移文件都必须在清单里（新增迁移在同一个 PR 里加一行）；
-//!   * Mermaid seed 删除幂等，SeeCode 保留且 unavailable；
+//!   * Mermaid seed 删除幂等，SeeCode 保留且 available（WP-AS-06：0006 翻转）；
 //!   * 0002 / 0003 的结构与约束存在；
 //!   * 0003 能在 0002 已造成损坏数据的库上升级并自动修复；
 //!   * 0002 → 0003 的 deadline 回填：历史活跃 Attempt 获得 deadline、租约被夹紧，
@@ -93,7 +93,7 @@ async fn mermaid_seed_removed_idempotently_and_seecode_kept(pool: PgPool) {
     .unwrap();
     let status: String = row.get("status");
     let reason: Option<String> = row.get("status_reason");
-    assert_eq!(status, "unavailable");
+    assert_eq!(status, "available");
     assert!(reason.is_some());
 }
 

@@ -44,9 +44,10 @@ async fn generators_report_unavailable_adapters(pool: sqlx::PgPool) {
     // ART-03A A3A-08：Mermaid seed 由 0002 后续 migration 删除，仅在 seecode 保留。
     assert_eq!(ids, vec!["seecode"]);
     for generator in &generators {
-        // Adapter 未实现，禁止上报 available。
+        // WP-AS-06：SeeCode Adapter + Worker 执行循环已落地（0006 翻转 seed），
+        // 注册表如实上报 available；能力真实性由执行链路测试背书。
         assert_eq!(
-            generator.status, "unavailable",
+            generator.status, "available",
             "{}",
             generator.generator_id
         );

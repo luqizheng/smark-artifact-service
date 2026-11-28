@@ -71,7 +71,7 @@ paths:
     get:
       operationId: listGenerators
       tags: [generators]
-      summary: 查询 Generator 注册表（需委托凭证 + generation:read 动作；未实现 Adapter 如实上报 unavailable）
+      summary: 查询 Generator 注册表（需委托凭证 + generation:read 动作；状态如实上报 available/unavailable/disabled）
       description: >-
         WP-03 认证修复（Q3）：本端点要求有效 delegation（Bearer）；无凭证 → 401，
         缺 `generation:read` 动作 → 403。注册表全局共享（不按 project 分片），

@@ -106,6 +106,31 @@ impl ConfirmCancelOutcome {
     }
 }
 
+/// Worker 上传产物后的对象面事实（WP-AS-06）。`sha256`/`size_bytes`/`mime`
+/// 来自 [`crate::StoragePort::inspect_object`]（file-service 无 hash
+/// attestation —— AS 下载重算，即"上传+校验"的校验半程）；`manifest` 由
+/// Worker 构建（含 sanitizer 策略版本等执行事实）。
+#[derive(Debug, Clone)]
+pub struct GenerationOutputFacts {
+    pub object_id: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub mime_type: String,
+    pub format: String,
+    pub manifest: serde_json::Value,
+}
+
+/// 输出提交的结果（WP-AS-06 §8 单一受控路径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutputOutcome {
+    /// 已提交；携带目标 Version id（稳定精确结果引用，ART-04 §211）。
+    Committed(Uuid),
+    /// 租约失效 / Job 非 running：提交放弃（不重试，按收尾语义处理）。
+    Stale,
+    /// 取消请求已登记：调用方应停止执行并 [`WorkerCoordinationPort::confirm_cancelled`]。
+    CancelRequested,
+}
+
 #[async_trait]
 pub trait WorkerCoordinationPort: Send + Sync {
     /// 原子领取一个 Job；返回一次性 lease token 与只读输入快照。
@@ -127,8 +152,9 @@ pub trait WorkerCoordinationPort: Send + Sync {
         lease_seconds: i32,
     ) -> Result<HeartbeatOutcome, DomainError>;
 
-    /// 完成 Attempt。数据库只在 Job 的目标 Version 已 READY、且存在已通过安全检查的主 Output
-    /// 时才会把 Job 置为 succeeded；输出尚未登记属于调用方协议错误，返回 `Err`。
+    /// 完成 Attempt（0002 协调语义：仅标记 Job/Attempt succeeded，**不写
+    /// Output/Version**）。生产执行循环的完成路径是 [`Self::commit_output`]
+    /// （ART-03A §8 单一受控提交）；本方法保留给协调测试与旧流程。
     async fn complete(
         &self,
         job_id: Uuid,
@@ -136,6 +162,20 @@ pub trait WorkerCoordinationPort: Send + Sync {
         lease_token: &str,
         output_sha256: &str,
     ) -> Result<CompleteOutcome, DomainError>;
+
+    /// 输出提交（WP-AS-06：ART-03A §8 单一受控提交路径，0006
+    /// `commit_generation_output`）。**生产执行循环的完成路径必须是本方法**
+    /// （[`Self::complete`] 仅是协调层的成功标记，用于协调测试/旧流程，
+    /// 不写 Output/Version）。单事务完成：租约校验 → 目标 Version 物化或
+    /// 校验（pending）→ Output 插入（primary，safety passed）→
+    /// Version pending→ready → Job/Attempt succeeded → audit。
+    async fn commit_output(
+        &self,
+        job_id: Uuid,
+        attempt_id: Uuid,
+        lease_token: &str,
+        output: &GenerationOutputFacts,
+    ) -> Result<CommitOutputOutcome, DomainError>;
 
     /// 失败上报。`error_code` 必须是稳定机器码（见 [`crate::is_valid_error_code`]）；
     /// `retryable` 只有落在数据库的可重试白名单内才生效。

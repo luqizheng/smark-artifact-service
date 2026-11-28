@@ -7,8 +7,9 @@
 //! 这里只把参数错误映射为 `InvalidRequest`，把真正的数据库故障映射为 `Internal`。
 
 use artifact_application::{
-    AdapterCapabilities, CompleteOutcome, ConfirmCancelOutcome, FailOutcome, HeartbeatOutcome,
-    WorkerCoordinationPort, is_valid_error_code, sanitize_diagnostic,
+    AdapterCapabilities, CommitOutputOutcome, CompleteOutcome, ConfirmCancelOutcome, FailOutcome,
+    GenerationOutputFacts, HeartbeatOutcome, WorkerCoordinationPort, is_valid_error_code,
+    sanitize_diagnostic,
 };
 use artifact_domain::{ClaimedJob, DomainError};
 use async_trait::async_trait;
@@ -66,6 +67,35 @@ impl From<ClaimRow> for ClaimedJob {
 fn map_db(err: sqlx::Error, context: &str) -> DomainError {
     tracing::warn!(context, error = %err, "worker coordination database error");
     DomainError::Internal(format!("{context}: {err}"))
+}
+
+/// commit_generation_output 的错误映射（WP-AS-06）：
+/// * `CANCEL_REQUESTED`（P0001）→ [`DomainError::CancelRequested`] 语义由
+///   调用方以 message token 识别并转 [`CommitOutputOutcome::CancelRequested`]；
+/// * `INVALID_OUTPUT_*`（22023）→ 400 InvalidRequest（Worker 协议错误）；
+/// * `TARGET_VERSION_NOT_PENDING`（P0001）→ 409 VersionConflict（DB 状态分叉，
+///   fail-closed 不重试）；
+/// * 其余 → Internal（数据库故障）。
+fn map_commit_output_db(err: sqlx::Error, context: &str) -> DomainError {
+    let message = match err.as_database_error() {
+        Some(db) => db.message().to_string(),
+        None => return map_db(err, context),
+    };
+    if message.contains("CANCEL_REQUESTED") {
+        tracing::warn!(context, "generation output commit rejected: cancel requested");
+        return DomainError::InvalidRequest("CANCEL_REQUESTED".into());
+    }
+    if message.contains("TARGET_VERSION_NOT_PENDING") {
+        tracing::warn!(context, "generation output commit rejected: target version not pending");
+        return DomainError::VersionConflict(
+            "target version is not pending and cannot receive output".into(),
+        );
+    }
+    if message.contains("INVALID_OUTPUT_") {
+        tracing::warn!(context, "generation output commit rejected: invalid output facts");
+        return DomainError::InvalidRequest(message);
+    }
+    map_db(err, context)
 }
 
 /// 数据库返回了契约之外的值：不是调用方的问题，按内部错误处理并保留原值以便排查。
@@ -179,6 +209,59 @@ impl WorkerCoordinationPort for PgWorkerCoordination {
                 .map_err(|e| map_db(e, "complete generation job attempt"))?;
         CompleteOutcome::parse(&outcome)
             .ok_or_else(|| unexpected("complete generation job attempt", outcome))
+    }
+
+    async fn commit_output(
+        &self,
+        job_id: Uuid,
+        attempt_id: Uuid,
+        lease_token: &str,
+        output: &GenerationOutputFacts,
+    ) -> Result<CommitOutputOutcome, DomainError> {
+        if !is_sha256_hex(&output.sha256) {
+            return Err(DomainError::InvalidRequest(
+                "output sha256 must be 64 lowercase hex characters".into(),
+            ));
+        }
+        if output.object_id.trim().is_empty() {
+            return Err(DomainError::InvalidRequest(
+                "output object_id must not be blank".into(),
+            ));
+        }
+        if output.size_bytes < 0 {
+            return Err(DomainError::InvalidRequest(
+                "output size_bytes must be non-negative".into(),
+            ));
+        }
+        let committed: Result<CommitOutputOutcome, DomainError> = sqlx::query_scalar(
+            "SELECT artifact.commit_generation_output($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(job_id)
+        .bind(attempt_id)
+        .bind(lease_token)
+        .bind(output.object_id.trim())
+        .bind(&output.sha256)
+        .bind(output.size_bytes)
+        .bind(output.mime_type.trim())
+        .bind(output.format.trim())
+        .bind(&output.manifest)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_commit_output_db(e, "commit generation output"))
+        .and_then(|version_id| {
+            Ok(match version_id {
+                Some(id) => CommitOutputOutcome::Committed(id),
+                None => CommitOutputOutcome::Stale,
+            })
+        });
+        // map_commit_output_db 以稳定 token 表达取消：转语义结果。
+        match committed {
+            Ok(outcome) => Ok(outcome),
+            Err(DomainError::InvalidRequest(message)) if message == "CANCEL_REQUESTED" => {
+                Ok(CommitOutputOutcome::CancelRequested)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     async fn fail(

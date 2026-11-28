@@ -31,7 +31,8 @@ pub use port::repo::{
 };
 pub use port::storage::{ObjectInspection, StorageError, StoragePort, UploadIntent};
 pub use port::worker::{
-    AdapterCapabilities, CompleteOutcome, ConfirmCancelOutcome, FailOutcome, HeartbeatOutcome,
+    AdapterCapabilities, CommitOutputOutcome, CompleteOutcome, ConfirmCancelOutcome, FailOutcome,
+    GenerationOutputFacts, HeartbeatOutcome,
     WorkerCoordinationPort,
 };
 pub use service::artifact::{

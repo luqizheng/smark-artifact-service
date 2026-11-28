@@ -114,7 +114,7 @@ async fn ready(State(state): State<AppState>) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// /v1/generators：注册表实况（未实现 Adapter 如实上报 unavailable）。
+/// /v1/generators：注册表实况（状态如实上报 available/unavailable/disabled）。
 /// 认证 + 授权（WP-03 R2-F-03 修复，Q3）：无有效委托 → 401；缺
 /// `generation:read` 动作 → 403；均前置于任何数据读取。
 async fn list_generators(
