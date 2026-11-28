@@ -191,8 +191,15 @@ REVOKE EXECUTE ON FUNCTION artifact.commit_generation_output(uuid, uuid, text, t
 
 -- ── ② SeeCode 门禁翻转（A3A-08：迁移式修改注册表状态） ────────────────────
 -- WP-AS-06 落地 SeeCode Adapter + Worker 执行循环后，注册表 status 翻转为
--- available（request_generation 才会放行）。回滚本迁移不会自动回退产品能力
--- 声明；本行仅恢复历史数据形态。
+-- available（request_generation 才会放行）。
+--
+-- adapter_version 必须同迁移钉住（WP-AS-06）：claim v2（0003）以
+-- `j.adapter_version = c.value` 等值匹配 Worker 申报的能力表；seed 的
+-- adapter_version 为 NULL，等值匹配永假 → Job 无法被领取。该值同时是
+-- Worker 侧（apps/artifact-worker）能力申报的契约常量，两侧必须一致；
+-- 升级 Adapter 时以新迁移更新此值并同步 Worker 版本。
 UPDATE artifact.generator_registry
-   SET status = 'available'
+   SET status = 'available',
+       adapter_version = 'svg-as-1',
+       status_reason = 'WP-AS-06 SeeCode adapter + worker execution loop landed'
  WHERE generator_id = 'seecode';

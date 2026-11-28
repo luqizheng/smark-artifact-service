@@ -6,8 +6,9 @@
 # 约束：
 #   * Worker 是独立进程，使用独立 DB 账号（ARTIFACT_WORKER_DATABASE_URL）；
 #     绝不复用 API 的 ARTIFACT_API_DATABASE_URL / 角色。口令若含 URL 保留字符需要百分号编码。
-#   * 此切片的 Worker 镜像只包含协调维护，不安装 Node、不含 SeeCode vendor，
-#     也不领取任何 Job（没有申报 adapter 能力）。
+#   * WP-AS-06：镜像包含 Node + vendored SeeCode；执行循环仅在下列
+#     ARTIFACT_WORKER_SEECODE_CLI_PATH / ARTIFACT_WORKER_FILE_* 五项全部
+#     配置时启用（all-or-nothing），缺省仍为协调维护-only。
 #   * 生产隔离（只读根文件系统、无外网、资源配额）属于 ART-03B-03，本文件不伪造完成。
 
 services:
@@ -29,3 +30,16 @@ services:
       ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS: ${ARTIFACT_WORKER_MAINTENANCE_INTERVAL_MS:-10000}
       ARTIFACT_WORKER_LOG: ${ARTIFACT_WORKER_LOG:-info}
       ARTIFACT_WORKER_DB_MAX_CONNECTIONS: ${ARTIFACT_WORKER_DB_MAX_CONNECTIONS:-4}
+      # ── WP-AS-06 执行面（五项 all-or-nothing；全缺 = 协调-only） ──────────
+      # 默认全空 = 不启用执行循环。启用示例：
+      #   ARTIFACT_WORKER_SEECODE_CLI_PATH=/opt/seecode/scripts/seecode.mjs
+      #   ARTIFACT_WORKER_FILE_SERVICE_URL=http://file-service:8082
+      #   ARTIFACT_WORKER_FILE_TOKEN_SERVICE_URL=http://token-service:8082
+      #   ARTIFACT_WORKER_FILE_BOOTSTRAP_TOKEN=<bootstrap-credential>
+      #   ARTIFACT_WORKER_FILE_LMMS_TID=1
+      ARTIFACT_WORKER_SEECODE_CLI_PATH: ${ARTIFACT_WORKER_SEECODE_CLI_PATH:-}
+      ARTIFACT_WORKER_FILE_SERVICE_URL: ${ARTIFACT_WORKER_FILE_SERVICE_URL:-}
+      ARTIFACT_WORKER_FILE_TOKEN_SERVICE_URL: ${ARTIFACT_WORKER_FILE_TOKEN_SERVICE_URL:-}
+      ARTIFACT_WORKER_FILE_BOOTSTRAP_TOKEN: ${ARTIFACT_WORKER_FILE_BOOTSTRAP_TOKEN:-}
+      ARTIFACT_WORKER_FILE_LMMS_TID: ${ARTIFACT_WORKER_FILE_LMMS_TID:-}
+      ARTIFACT_WORKER_LEASE_SECONDS: ${ARTIFACT_WORKER_LEASE_SECONDS:-300}

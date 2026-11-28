@@ -14,6 +14,7 @@ artifact-contract = { workspace = true }
 artifact-application = { workspace = true }
 artifact-domain = { workspace = true }
 artifact-infrastructure = { workspace = true, features = ["test-doubles"] }
+artifact-worker = { path = "../apps/artifact-worker" }
 
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -24,6 +25,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
+async-trait = "0.1"
 sha2 = { workspace = true }
 # WP 契约 v0.2 §3 安全测试：本地铸造 RS256 委托 token（测试密钥运行期生成，不落盘）。
 jsonwebtoken = { workspace = true }
@@ -98,3 +100,7 @@ path = "tests/version_lifecycle.rs"
 [[test]]
 name = "wp04_r1_remediation"
 path = "tests/wp04_r1_remediation.rs"
+
+[[test]]
+name = "wp06_execution"
+path = "tests/wp06_execution.rs"
