@@ -226,7 +226,20 @@ fn request_id_str(id: Option<RequestId>) -> Option<String> {
 }
 
 /// 构造 V10 操作绑定事实（WP-04）：method + 实例化 path（字节原样）+ 原始
-/// body Value。判定在应用服务层完成；本函数只采集，不做任何策略判定。
+/// body Value。判定在应用服务层完成；本函数只采集，不做任何策略判定——
+/// 唯一例外是 v1 契约红线的 query 拒绝（WP-04-R1 P1，见下）。
+///
+/// # v1 写端点拒绝 query（契约 §3.1.3 冻结规则，全部写路由统一生效）
+///
+/// v1 request fingerprint 的成分只有 METHOD/PATH/CALLER/BODY，**不含
+/// query**；契约明文规定 v1 全部写端点不得携带 query。因此 query 不是
+/// 指纹的遗漏维度，而是 v1 写请求的非法形态——在绑定事实采集的统一入口
+/// 拒绝（本函数为全部 9 个写 handler 的唯一入口），早于任何数据库写入、
+/// storage、generator 或队列副作用，也早于服务层绑定判定。
+///
+/// 存在性判断使用 [`axum::http::Uri::query`]：它保留原始 query 的存在性
+/// （裸 `?` 返回 `Some("")`，`?x=1` 返回 `Some("x=1")`，无 query 才是
+/// `None`）——不能用解析后的 query map 判断，空 query 会被解析层吃掉。
 fn write_binding(
     method: &axum::http::Method,
     uri: &axum::http::Uri,
@@ -235,8 +248,13 @@ fn write_binding(
     target_job_id: Option<Uuid>,
     raw_body: serde_json::Value,
     request_caller: Option<Uuid>,
-) -> artifact_application::WriteOperationBinding {
-    artifact_application::WriteOperationBinding {
+) -> Result<artifact_application::WriteOperationBinding, ApiError> {
+    if uri.query().is_some() {
+        return Err(ApiError::Domain(DomainError::InvalidRequest(
+            "write endpoints must not carry a query string (request-hash v1 contract)".into(),
+        )));
+    }
+    Ok(artifact_application::WriteOperationBinding {
         method: method.as_str().to_string(),
         path: uri.path().to_string(),
         operation_type,
@@ -244,7 +262,7 @@ fn write_binding(
         target_job_id,
         body: raw_body,
         request_caller_request_id: request_caller,
-    }
+    })
 }
 
 // ── Artifact 元数据（已实现） ──────────────────────────────────────────
@@ -267,7 +285,7 @@ pub async fn create_artifact(
         None,
         body.raw,
         None,
-    );
+    )?;
     let outcome = state
         .artifacts
         .create_artifact(
@@ -344,7 +362,7 @@ pub async fn patch_artifact(
         None,
         body.raw,
         None,
-    );
+    )?;
     let dto = state
         .artifacts
         .patch_artifact(
@@ -377,7 +395,7 @@ pub async fn set_current_version(
         None,
         body.raw,
         None,
-    );
+    )?;
     let dto = state
         .artifacts
         .set_current_version(
@@ -411,7 +429,7 @@ pub async fn create_version_session(
         None,
         body.raw,
         None,
-    );
+    )?;
     let dto = state
         .artifacts
         .create_version_session(
@@ -451,7 +469,7 @@ pub async fn commit_version(
         None,
         serde_json::Value::Null,
         None,
-    );
+    )?;
     match state
         .artifacts
         .commit_version_session(
@@ -527,7 +545,7 @@ pub async fn create_reference(
         None,
         body.raw,
         None,
-    );
+    )?;
     let outcome = state
         .artifacts
         .create_reference(
@@ -577,7 +595,7 @@ pub async fn remove_reference(
         None,
         serde_json::Value::Null,
         None,
-    );
+    )?;
     state
         .artifacts
         .remove_reference(
@@ -629,7 +647,7 @@ pub async fn request_generation(
         None,
         body.raw,
         Some(body.value.caller_request_id),
-    );
+    )?;
     match state
         .artifacts
         .request_generation(
@@ -697,7 +715,7 @@ pub async fn cancel_job(
         Some(job_id),
         serde_json::Value::Null,
         None,
-    );
+    )?;
     let dto = state
         .artifacts
         .cancel_job(

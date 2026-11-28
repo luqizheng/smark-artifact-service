@@ -25,12 +25,13 @@ ArtifactService 写方法（crates/artifact-application/src/service/artifact.rs�
 
 | 轴 | 规则 | 位置 |
 |---|---|---|
+| **query 禁带**（R1 P1） | v1 写端点不得携带 query（契约 §3.1.3 冻结规则）；`write_binding()` 统一入口以 `Uri::query()` 存在性判断（裸 `?` = `Some("")` 同样拒绝），400 `INVALID_REQUEST`，先于任何副作用 | HTTP adapter `write_binding()`（9 个写 handler 唯一入口） |
 | caller | 请求侧 caller 优先（W8 body 字段），其余路由取 claim；写 token 无 claim → 403（服务层防线独立于验证器 401 红线，防验证器替身/降级） | `enforce_write_binding` ① |
-| request_hash | `canonical_request_fingerprint`（v1 唯一权威实现）重算 vs `biz.request_hash` claim；配对/形状/算法校验仍在验证器（WP-03 PC-O6-1/2 未动） | `enforce_write_binding` ④ + `assert_delegation_matches_request` |
-| artifact_id | claim 存在 → 请求目标相等；无目标路由出现 → 403（D2 字面 fail-closed） | `enforce_write_binding` ② |
-| operation_id | 仅 W9：`generation_job:{job_id}`（§5.3 语法）；其余路由不比对不拒绝（D1 停止条件） | `enforce_write_binding` ③ |
+| request_hash | `canonical_request_fingerprint`（v1 唯一权威实现）重算 vs `biz.request_hash` claim；配对/形状/算法校验仍在验证器（WP-03 PC-O6-1/2 未动）；v1 算法与冻结向量未改动 | `enforce_write_binding` ④ + `assert_delegation_matches_request` |
+| artifact_id | claim 存在 → 与请求目标 artifact 精确相等（**W2–W8 目标寻址，含 W8 与路径 ID 比对——R1 P2 修正**）；真正无目标路由（W1/W9）出现 → 403（D2 字面 fail-closed）；claim 缺省不拒绝（决策项 D4） | `enforce_write_binding` ② |
+| operation_id | 仅 W9：`generation_job:{job_id}`（§5.3 语法）；其余 8 条路由（W1–W8）不比对不拒绝（D1 停止条件，待裁决） | `enforce_write_binding` ③ |
 
-失败一律 `DomainError::ScopeDenied` → 403 `SCOPE_DENIED` 稳定信封；消息只含判定原因，不含 token 本体/指纹值/请求内容。401/403 拒绝审计由既有中间件记录。
+失败一律 `DomainError::ScopeDenied` → 403 `SCOPE_DENIED` 稳定信封（query 拒绝除外：400 `INVALID_REQUEST`，契约既有错误码）；消息只含判定原因，不含 token 本体/指纹值/请求内容。401/403 拒绝审计由既有中间件记录。
 
 ## 3. 事务保证（任务书 §6.2 #6/#7）
 

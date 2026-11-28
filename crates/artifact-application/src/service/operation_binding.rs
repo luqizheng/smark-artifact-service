@@ -19,8 +19,13 @@
 //!    原始 body Value」重算，与 `biz.request_hash` claim 比对。任何成分差异
 //!    （跨 method / 换目标 / body 变异 / 编码形态差异）→ 指纹不同 → 拒绝。
 //! 3. **artifact_id**：claim 存在时请求目标 artifact 必须相等（§3.1.2 #1）。
-//!    无目标 artifact 的路由（artifact/job 创建）上出现该 claim → 拒绝
+//!    目标寻址路由（含 W8：路径含 `{artifact_id}`，与路径 artifact 精确比对）
+//!    之外，真正无目标 artifact 的路由是 artifact 创建（W1，目标尚不存在）与
+//!    取消（W9，路径仅含 job_id）——这两类路由上出现该 claim → 拒绝
 //!    （字面 fail-closed：无目标即不可能相等；裁决记录 D2）。
+//!    claim 缺省时本轴不拒绝：契约 §3.1.1 示例中 `generation:request` token
+//!    携带 `artifact_id: null` 合法，"条件必填"的具体条件属签发侧契约，
+//!    未冻结（WP-04-R1 决策项 D4）。
 //! 4. **operation_id**：仅 `generation:cancel` 落地
 //!    `generation_job:{job_id}` 精确比对（契约 §5.3 原文 + §3.1.1 示例语法）；
 //!    其余路由的语法表未在契约冻结（裁决记录 D1：停止接线，保持现状，
@@ -77,8 +82,12 @@ pub enum WriteOperationType {
 ///   与签发方对原始请求 JSON 的指纹对齐）；无 body 端点为 `Value::Null`。
 /// * `request_caller_request_id`：仅 Job 创建路由携带（body 字段，与 token
 ///   claim 构成真实交叉比对）；其余路由为 `None`。
-/// * `target_artifact_id`：本操作的目标 artifact（路径可定位时）；创建型
-///   路由（W1/W8）与取消路由（W9，路径仅含 job_id）为 `None`。
+/// * `target_artifact_id`：本操作的目标 artifact（路径可定位时）。W2–W8 均
+///   为目标寻址路由——**W8（`/v1/artifacts/{artifact_id}/generation-jobs`）
+///   路径含 artifact_id，为 `Some(路径 artifact)`，其 artifact_id claim 与
+///   路径 ID 精确比对**（WP-04-R1 P2 修正：W8 不是无目标路由）。真正
+///   `None` 的只有 artifact 创建（W1，目标尚不存在）与取消（W9，路径仅含
+///   job_id）。
 /// * `target_job_id`：取消路由的目标 job（路径可定位时）；其余路由 `None`。
 #[derive(Debug, Clone)]
 pub struct WriteOperationBinding {

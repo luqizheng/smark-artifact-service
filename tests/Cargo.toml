@@ -94,3 +94,7 @@ path = "tests/wp04_operation_binding.rs"
 [[test]]
 name = "version_lifecycle"
 path = "tests/version_lifecycle.rs"
+
+[[test]]
+name = "wp04_r1_remediation"
+path = "tests/wp04_r1_remediation.rs"

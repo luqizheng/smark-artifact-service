@@ -9,10 +9,11 @@
 | 轴 | 强制点 | 拒绝语义 |
 |---|---|---|
 | issuer/aud/purpose/actions/scope/jti | `AiPmDelegationVerifier`（验证层，401）+ `Delegation::require`（服务层，403）| 契约 §3.2 V1–V9（未改动）|
+| **query 禁带（v1 契约红线，WP-04-R1 P1）** | HTTP adapter 统一入口 `write_binding()`（全部 9 个写 handler 唯一入口），先于任何副作用 | 400 `INVALID_REQUEST`；`?x=1` 与裸 `?` 均拒绝（`Uri::query()` 保留存在性）|
 | **caller_request_id** | 服务层 `enforce_write_binding`（`operation_binding.rs`），`Delegation::require` 之后、任何副作用之前 | 403 `SCOPE_DENIED`；Job 创建路由 body caller 与 claim 交叉比对 |
 | **request_hash（v1 冻结）** | 同上：`canonical_request_fingerprint(method, 实例化path, caller, 原始bodyValue)` 重算 vs `biz.request_hash` | 403；method/path/目标/body 任一变异 → 指纹不同 |
-| **artifact_id** | 同上：claim 存在时请求目标必须相等；无目标路由（W1/W8/W9）出现该 claim → 403（裁决 D2）| 403 |
-| **operation_id** | 仅 W9 落地 `generation_job:{job_id}` 精确比对（契约 §5.3 语法）；其余路由语法未冻结（裁决 D1：存在时**不比对也不拒绝**，现状保持）| W9 不匹配 → 403 |
+| **artifact_id** | 同上：claim 存在时请求目标必须相等；**W2–W8 为目标寻址路由（含 W8：与路径 artifact ID 精确比对，R1 P2 修正）**；真正无目标路由（W1/W9）出现该 claim → 403（裁决 D2）；缺省时不拒绝（决策项 D4）| 403（失配/无目标出现）|
+| **operation_id** | 仅 W9 落地 `generation_job:{job_id}` 精确比对（契约 §5.3 语法）；其余 8 条路由（W1–W8）语法未冻结（裁决 D1：存在时**不比对也不拒绝**，现状保持；未完成语义绑定的路由清单见 TEST-EVIDENCE §7.4）| W9 不匹配 → 403 |
 | 幂等仲裁 | 每路由独立机制（§3） | 见分类表 |
 
 ## 2. 写路由矩阵（9 条）
@@ -25,7 +26,7 @@
 | Handler → 服务入口 | `artifacts::create_artifact` → `ArtifactService::create_artifact`（artifact.rs） |
 | 动作 | `artifact:create`；scope：tenant=token，project=**body**（唯一 Authed 路由） |
 | 目标 | 新建 Artifact（无既有目标） |
-| 绑定 claim | caller + request_hash；artifact_id/operation_id 存在 → 403（D1/D2） |
+| 绑定 claim | caller + request_hash；artifact_id 存在 → 403（D2，无目标路由）；operation_id 存在 → 不比对不拒绝（D1 待裁决） |
 | v1 指纹输入 | POST /v1/artifacts + claim caller + 原始 body Value（`ValidJson.raw`） |
 | caller 来源 | token claim（PC-O5-1 验证层红线 401） |
 | 分类① keyed（`artifact_key` 存在） | **自然键幂等**：`uq_artifact_project_key` + `artifact_creation_identity`；`PgKeyedArtifactCreator` 单事务（预留→身份→插入→完成→COMMIT） |
@@ -67,10 +68,10 @@
 - 分类：**状态幂等**：`removed_at IS NULL` 谓词软删；重试 → 404 确定性；无重复副作用。证据 `wp04 :: a6`。
 
 ### W8 · POST /v1/artifacts/{artifact_id}/generation-jobs（requestGeneration）
-- 动作 `generation:request`；目标 = 路径 artifact；请求侧 caller = **body.caller_request_id**（与 claim 交叉比对，`wp04 :: e2`）。
+- 动作 `generation:request`；**目标 = 路径 artifact（目标寻址路由；artifact_id claim 与路径 ID 精确比对——失配 403、匹配通过、缺省不拒绝（D4），R1 P2 修正：W8 不是无目标路由）**；请求侧 caller = **body.caller_request_id**（与 claim 交叉比对，`wp04 :: e2`）。
 - 现状：generator 注册表 gate → 恒 503 `GENERATOR_UNAVAILABLE`（AS-2 keyed job 端口**未接入 AppState**，ART-02 P0；生产零写入——**本 WP 明示不开启**，migration 0005 机制原样保留）。
 - 幂等分类：当前零写入 → N/A；AS-2 语义（caller 三元组部分唯一索引 + 单受控函数事务）未被回归，HTTP 接线属独立后续工作。
-- 证据 `wp04 :: a7/e2`、`generation_api :: as2_41_http_create_stays_fail_closed`。
+- 证据 `wp04 :: a7/e2/g1/g2/g3`、`generation_api :: as2_41_http_create_stays_fail_closed`。
 
 ### W9 · POST /v1/generation-jobs/{job_id}/cancel（cancelJob）
 - 动作 `generation:cancel`；目标 = 路径 job（进指纹）；无 body（null）；operation_id 契约语法 `generation_job:{job_id}` 强制比对（存在时）。
