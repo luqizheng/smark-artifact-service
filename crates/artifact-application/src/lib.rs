@@ -32,12 +32,14 @@ pub use port::repo::{
 pub use port::storage::{ObjectInspection, StorageError, StoragePort, UploadIntent};
 pub use port::worker::{
     AdapterCapabilities, CommitOutputOutcome, CompleteOutcome, ConfirmCancelOutcome, FailOutcome,
-    GenerationOutputFacts, HeartbeatOutcome,
-    WorkerCoordinationPort,
+    GenerationOutputFacts, HeartbeatOutcome, WorkerCoordinationPort,
 };
 pub use service::artifact::{
     ArtifactCreateOutcome, ArtifactService, CreateResolution, to_artifact_dto, to_generator_dto,
     to_job_dto, to_reference_dto, to_version_dto,
+};
+pub use service::artifact::{
+    GenerationJobCreateOutcome, JOB_INPUT_SCHEMA_VERSION_V1, JobResolution,
 };
 pub use service::creation_fingerprint::{
     CURRENT_FINGERPRINT_VERSION, FingerprintError, canonical_fingerprint, current_fingerprint,

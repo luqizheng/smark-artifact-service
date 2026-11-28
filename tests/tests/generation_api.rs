@@ -351,8 +351,9 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
         .await
         .unwrap();
 
-    // 合法信封：生成器没有 Worker，仍然 503，且不会产生 Job。
-    // （WP-04：请求侧 caller = body.caller_request_id，与 token claim 交叉比对。）
+    // 合法信封：WP-AS-06 接线 keyed create → 202 新建（0006 翻转 seecode 为
+    // available）。请求侧 caller = body.caller_request_id，与 token claim
+    // 交叉比对（WP-04）。
     let valid_caller = Uuid::new_v4();
     let valid_body = json!({
         "generator_id": "seecode",
@@ -372,10 +373,19 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
     .send()
     .await
     .unwrap();
-    assert_eq!(res.status(), 503);
+    assert_eq!(res.status(), 202);
+    assert_eq!(res.headers()["x-generation-job-resolution"], "created");
+    let created: Value = res.json().await.unwrap();
+    assert_eq!(created["status"], "queued");
+    assert_eq!(created["caller_request_id"], valid_caller.to_string());
+    assert_eq!(created["target_version_id"], Value::Null);
     assert_eq!(
-        res.json::<Value>().await.unwrap()["error"]["code"],
-        "GENERATOR_UNAVAILABLE"
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifact.generation_job")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        jobs_before + 1,
+        "exactly one job must be created"
     );
 
     // 超过 256 KiB：413，带 request_id。
@@ -467,9 +477,12 @@ async fn generation_request_enforces_the_input_envelope(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
+    // WP-AS-06：本测试仅首个合法信封请求创建一个 Job（202）；其余
+    // （超限/非法信封）一律不产生 Job。
     assert_eq!(
-        jobs_after, jobs_before,
-        "no request in this test may create a job"
+        jobs_after,
+        jobs_before + 1,
+        "exactly the valid-envelope request may create a job"
     );
 }
 
@@ -666,6 +679,14 @@ async fn as2_41_http_create_stays_fail_closed(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
+    // WP-AS-06 后 seecode seed 为 available；fail-closed 语义由
+    // disabled 状态表达（HTTP 层仍 503 GENERATOR_UNAVAILABLE）。
+    sqlx::query(
+        "UPDATE artifact.generator_registry SET status='disabled' WHERE generator_id='seecode'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let job_caller = Uuid::new_v4();
     let job_body = json!({
         "generator_id": "seecode",

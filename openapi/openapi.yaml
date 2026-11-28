@@ -899,6 +899,12 @@ components:
       properties:
         id: { type: string, format: uuid }
         artifact_id: { type: string, format: uuid }
+        target_version_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            目标 Version（稳定精确结果引用；ART-04 §211 加法性暴露）。
+            Job 创建未预分配时由输出提交事务物化，committed 前为 null。
         generator_id: { type: string }
         caller_request_id:
           type: [string, "null"]

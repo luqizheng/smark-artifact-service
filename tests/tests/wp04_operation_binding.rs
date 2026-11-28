@@ -1601,8 +1601,8 @@ async fn e2_job_request_caller_must_equal_token_claim(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
-    // claim == body caller → 通过绑定，到达 generator 门：seecode 在注册表中
-    // 状态为 unavailable → 503 GENERATOR_UNAVAILABLE（证明绑定先于 generator 查询）。
+    // claim == body caller → 通过绑定，创建成功：WP-AS-06 后 seecode 为
+    // available（0006），keyed create 放行 → 202 created（证明绑定先于创建）。
     let token = mint(
         &verifier,
         TENANT,
@@ -1621,6 +1621,6 @@ async fn e2_job_request_caller_must_equal_token_claim(pool: PgPool) {
         Some(&body),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["error"]["code"], "GENERATOR_UNAVAILABLE");
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+    assert_eq!(value["status"], "queued");
 }

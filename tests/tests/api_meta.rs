@@ -46,11 +46,7 @@ async fn generators_report_unavailable_adapters(pool: sqlx::PgPool) {
     for generator in &generators {
         // WP-AS-06：SeeCode Adapter + Worker 执行循环已落地（0006 翻转 seed），
         // 注册表如实上报 available；能力真实性由执行链路测试背书。
-        assert_eq!(
-            generator.status, "available",
-            "{}",
-            generator.generator_id
-        );
+        assert_eq!(generator.status, "available", "{}", generator.generator_id);
         assert!(generator.status_reason.is_some());
     }
 }

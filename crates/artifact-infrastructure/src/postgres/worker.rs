@@ -82,17 +82,26 @@ fn map_commit_output_db(err: sqlx::Error, context: &str) -> DomainError {
         None => return map_db(err, context),
     };
     if message.contains("CANCEL_REQUESTED") {
-        tracing::warn!(context, "generation output commit rejected: cancel requested");
+        tracing::warn!(
+            context,
+            "generation output commit rejected: cancel requested"
+        );
         return DomainError::InvalidRequest("CANCEL_REQUESTED".into());
     }
     if message.contains("TARGET_VERSION_NOT_PENDING") {
-        tracing::warn!(context, "generation output commit rejected: target version not pending");
+        tracing::warn!(
+            context,
+            "generation output commit rejected: target version not pending"
+        );
         return DomainError::VersionConflict(
             "target version is not pending and cannot receive output".into(),
         );
     }
     if message.contains("INVALID_OUTPUT_") {
-        tracing::warn!(context, "generation output commit rejected: invalid output facts");
+        tracing::warn!(
+            context,
+            "generation output commit rejected: invalid output facts"
+        );
         return DomainError::InvalidRequest(message);
     }
     map_db(err, context)
@@ -248,11 +257,9 @@ impl WorkerCoordinationPort for PgWorkerCoordination {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| map_commit_output_db(e, "commit generation output"))
-        .and_then(|version_id| {
-            Ok(match version_id {
-                Some(id) => CommitOutputOutcome::Committed(id),
-                None => CommitOutputOutcome::Stale,
-            })
+        .map(|version_id| match version_id {
+            Some(id) => CommitOutputOutcome::Committed(id),
+            None => CommitOutputOutcome::Stale,
         });
         // map_commit_output_db 以稳定 token 表达取消：转语义结果。
         match committed {

@@ -1189,7 +1189,13 @@ async fn job_creation_pins_versions_and_is_idempotent(pool: PgPool) {
     let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "create").await;
     let options = common::JobOptions::default();
 
-    // 生成器不可用（生产 seed）：不能入队。
+    // 生成器不可用（WP-AS-06 后 seed 为 available，显式 disable 表达不可用态）：不能入队。
+    sqlx::query(
+        "UPDATE artifact.generator_registry SET status='disabled' WHERE generator_id='seecode'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let err = common::try_sql_create_job_with(
         &pool,
         Uuid::new_v4(),

@@ -211,6 +211,9 @@ pub struct CreateGenerationJobRequest {
 pub struct GenerationJobResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
+    /// 目标 Version（稳定精确结果引用，ART-04 §211 加法性暴露；
+    /// Job 创建时未预分配则提交时物化，committed 前为 null）。
+    pub target_version_id: Option<Uuid>,
     pub generator_id: String,
     pub status: String,
     /// 终态或最近一次失败原因的稳定机器码（例如 `GENERATION_TIMEOUT`）；成功时为空。

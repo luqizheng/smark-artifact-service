@@ -68,6 +68,9 @@ pub struct ValidGenerationJson<T> {
     pub value: T,
     pub raw: serde_json::Value,
     pub envelope_bytes: usize,
+    /// 原始请求体 sha256（keyed create 的 Idempotency-Key 冲突判定依据，
+    /// ART-04G v3 §5.3：即使未携带 Idempotency-Key 也必须提供）。
+    pub request_hash: String,
 }
 
 impl<S, T> FromRequest<S> for ValidGenerationJson<T>
@@ -93,6 +96,7 @@ where
                 )
             })?;
         let envelope_bytes = bytes.len();
+        let request_hash = sha256_hex(&bytes);
         let raw: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| invalid_request(format!("invalid JSON body: {e}")))?;
         let value: T = serde_json::from_value(raw.clone())
@@ -101,6 +105,7 @@ where
             value,
             raw,
             envelope_bytes,
+            request_hash,
         })
     }
 }
@@ -618,7 +623,7 @@ pub async fn request_generation(
     method: axum::http::Method,
     uri: axum::http::Uri,
     Path(artifact_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: ValidGenerationJson<CreateGenerationJobRequest>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_path_uuid(&artifact_id, "artifact_id")?;
@@ -648,26 +653,32 @@ pub async fn request_generation(
         body.raw,
         Some(body.value.caller_request_id),
     )?;
-    match state
+    let outcome = state
         .artifacts
         .request_generation(
             &req.delegation,
             &req.scope,
             artifact_id,
             body.value,
+            body.request_hash,
+            idempotency_key(&headers),
+            body.envelope_bytes,
             request_id_str(req.request_id).as_deref(),
             &binding,
         )
-        .await
-    {
-        Err(e) => Err(e.into()),
-        // 不可达：注册表中无 available 生成器；新增可用生成器必须伴随
-        // GenerationJob 编排与 Worker 契约实现（ART-03+）。
-        Ok(_) => Err(DomainError::Internal(
-            "generation request succeeded while generator adapters are not implemented".into(),
-        )
-        .into()),
-    }
+        .await?;
+    // WP-AS-06：202 新建 / 200 重放（OpenAPI 冻结契约；ART-04 §74），
+    // X-Generation-Job-Resolution 区分三态。
+    let status = match outcome.resolution {
+        artifact_application::JobResolution::Created => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
+    };
+    Ok((
+        status,
+        [("X-Generation-Job-Resolution", outcome.resolution.as_str())],
+        axum::Json(outcome.job),
+    )
+        .into_response())
 }
 
 pub async fn get_job(

@@ -10,6 +10,9 @@ use crate::port::keyed_create::{
     IdempotencyInput, KeyedArtifactCreateOutcome, KeyedArtifactCreationPort,
     ValidatedCreateArtifactRequest,
 };
+use crate::port::keyed_job_create::{
+    KeyedGenerationJobCreatePort, KeyedJobCreateOutcome, ValidatedCreateGenerationJobRequest,
+};
 use crate::port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
     JobRepository, NewArtifact, NewVersion, ReferenceRepository, VersionCommitOutput,
@@ -28,8 +31,7 @@ use artifact_contract::{
 };
 use artifact_domain::{
     Action, Artifact, ArtifactReference, ArtifactType, ArtifactVersion, Delegation, DomainError,
-    GenerationJob, GeneratorDescriptor, GeneratorStatus, OwnerType, RelationType, TenantScope,
-    VersionState,
+    GenerationJob, GeneratorDescriptor, OwnerType, RelationType, TenantScope, VersionState,
 };
 use base64::Engine as _;
 use std::sync::Arc;
@@ -80,8 +82,38 @@ pub struct ArtifactService {
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub keyed_create: Arc<dyn KeyedArtifactCreationPort>,
     pub unkeyed_create: Arc<dyn UnkeyedArtifactCreationPort>,
+    /// WP-AS-06：GenerationJob keyed create（AS-2 端口接线）。
+    pub keyed_jobs: Arc<dyn KeyedGenerationJobCreatePort>,
     pub audit: Arc<dyn AuditSink>,
 }
+
+/// Job 创建解析语义（ART-04G v3 §5.5；`X-Generation-Job-Resolution` 头值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobResolution {
+    Created,
+    ResolvedByCallerRequest,
+    ResolvedByIdempotency,
+}
+
+impl JobResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobResolution::Created => "created",
+            JobResolution::ResolvedByCallerRequest => "caller_request_replay",
+            JobResolution::ResolvedByIdempotency => "idempotency_replay",
+        }
+    }
+}
+
+/// Job 创建结果（created/replayed 二态 + 解析语义）。
+pub struct GenerationJobCreateOutcome {
+    pub job: GenerationJobResponse,
+    pub resolution: JobResolution,
+}
+
+/// 输入快照 schema 版本（A3A-22 过渡形态：信封层 allowlist 已实现，
+/// 逐字段 schema 冻结由 vendored SeeCode schemas 承担；指纹/快照均按 v1）。
+pub const JOB_INPUT_SCHEMA_VERSION_V1: &str = "1";
 
 impl ArtifactService {
     // ── Artifact 元数据 ────────────────────────────────────────────────
@@ -704,18 +736,24 @@ impl ArtifactService {
 
     // ── GenerationJobs ─────────────────────────────────────────────────
 
+    /// 请求生成（WP-AS-06 接线 AS-2 keyed create）：授权 → V10 绑定 →
+    /// Artifact 检查 → ECV 前置条件（ART-04 §74）→ 输入校验/规范化 →
+    /// 单事务 keyed create/resolve（幂等三态）。注册表可用性检查在受控
+    /// 函数内完成（0006 已将 seecode 翻转为 available）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_generation(
         &self,
         delegation: &Delegation,
         scope: &TenantScope,
         artifact_id: Uuid,
         req: CreateGenerationJobRequest,
+        request_hash: String,
+        idempotency_key: Option<String>,
+        envelope_bytes: usize,
         request_id: Option<&str>,
         binding: &WriteOperationBinding,
-    ) -> Result<GenerationJobResponse, DomainError> {
+    ) -> Result<GenerationJobCreateOutcome, DomainError> {
         delegation.require(Action::GenerationRequest, scope)?;
-        // V10：body caller_request_id 与 token claim 交叉比对 + v1 指纹绑定
-        // （WP-04；先于 generator 注册表查询与任何可能的 job 写入）。
         enforce_write_binding(delegation, binding)?;
         let artifact = self
             .repo
@@ -726,22 +764,14 @@ impl ArtifactService {
                 "artifact is deleted and does not accept generation jobs".into(),
             ));
         }
-        let generator = self
-            .generators
-            .get(&req.generator_id)
-            .await
-            .map_err(|e| match e {
-                DomainError::NotFound => {
-                    DomainError::InvalidRequest(format!("unknown generator '{}'", req.generator_id))
-                }
-                other => other,
-            })?;
-        if generator.status != GeneratorStatus::Available {
-            let err = DomainError::GeneratorUnavailable(format!(
-                "generator '{}' is '{}' — its adapter is not implemented in ART-02",
-                generator.generator_id,
-                generator.status.as_str()
-            ));
+        // ART-04 §74：expected_current_version_id 是 current-pointer 并发
+        // 前置条件（不是目标 Version id）；不匹配 → 409，不创建 Job。
+        if let Some(expected) = req.expected_current_version_id
+            && artifact.current_version_id != Some(expected)
+        {
+            let err = DomainError::VersionConflict(
+                "expected_current_version_id does not match the current pointer".into(),
+            );
             self.audit
                 .record(denial_event(
                     "generation.request",
@@ -754,9 +784,70 @@ impl ArtifactService {
                 .ok();
             return Err(err);
         }
-        Err(DomainError::GeneratorUnavailable(
-            "generator reports available but no worker is running".into(),
-        ))
+        let validated = match ValidatedCreateGenerationJobRequest::try_new(
+            scope,
+            artifact_id,
+            Some(req.caller_request_id),
+            req.generator_id.clone(),
+            req.input.clone(),
+            req.options.clone(),
+            JOB_INPUT_SCHEMA_VERSION_V1.to_string(),
+            envelope_bytes,
+        ) {
+            Ok(validated) => validated,
+            Err(err) => {
+                self.audit
+                    .record(denial_event(
+                        "generation.request",
+                        err.code(),
+                        request_id,
+                        Some(scope),
+                        Some(delegation),
+                    ))
+                    .await
+                    .ok();
+                return Err(err);
+            }
+        };
+        let outcome = match self
+            .keyed_jobs
+            .create_or_resolve_keyed_job(validated, request_hash, idempotency_key)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let domain = err.to_domain_error();
+                self.audit
+                    .record(denial_event(
+                        "generation.request",
+                        domain.code(),
+                        request_id,
+                        Some(scope),
+                        Some(delegation),
+                    ))
+                    .await
+                    .ok();
+                return Err(domain);
+            }
+        };
+        match outcome {
+            KeyedJobCreateOutcome::Created(job) => {
+                self.audit_allowed(scope, delegation, "generation.create", job.id, request_id)
+                    .await;
+                Ok(GenerationJobCreateOutcome {
+                    job: to_job_dto(&job),
+                    resolution: JobResolution::Created,
+                })
+            }
+            KeyedJobCreateOutcome::ResolvedByCallerRequest(job) => Ok(GenerationJobCreateOutcome {
+                job: to_job_dto(&job),
+                resolution: JobResolution::ResolvedByCallerRequest,
+            }),
+            KeyedJobCreateOutcome::ResolvedByIdempotency(job) => Ok(GenerationJobCreateOutcome {
+                job: to_job_dto(&job),
+                resolution: JobResolution::ResolvedByIdempotency,
+            }),
+        }
     }
 
     pub async fn get_job(
@@ -987,6 +1078,7 @@ pub fn to_job_dto(j: &GenerationJob) -> GenerationJobResponse {
     GenerationJobResponse {
         id: j.id,
         artifact_id: j.artifact_id,
+        target_version_id: j.target_version_id,
         generator_id: j.generator_id.clone(),
         status: j.status.as_str().to_string(),
         error_code: j.error_code.clone(),

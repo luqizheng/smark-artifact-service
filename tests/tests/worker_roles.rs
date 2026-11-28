@@ -140,7 +140,8 @@ async fn worker_role_cannot_touch_business_tables(pool: PgPool) {
         assert_eq!(pg_error_code(&e).as_deref(), Some("42501"), "{ddl}");
     }
 
-    // 4. 函数权限矩阵是精确的：Worker 只能执行授权给它的 7 个协调函数。
+    // 4. 函数权限矩阵是精确的：Worker 只能执行授权给它的 8 个协调函数
+    //    （WP-AS-06 0006 新增 commit_generation_output）。
     let worker_granted: Vec<String> = executable_functions(&pool, &worker)
         .await
         .into_iter()
@@ -151,6 +152,7 @@ async fn worker_role_cannot_touch_business_tables(pool: PgPool) {
         worker_granted,
         vec![
             "claim_generation_job",
+            "commit_generation_output",
             "complete_generation_job_attempt",
             "confirm_generation_job_cancelled",
             "fail_generation_job_attempt",
