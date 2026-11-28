@@ -126,6 +126,18 @@ impl Delegation {
         self.actions.contains(&action)
     }
 
+    /// 对象面出站路由用的 LMMS 数字 tid（WP-AS-05）：取自 `lmms_tid` 追溯
+    /// claim，**仅用于出站服务令牌 mint 与 file-service 自身的租户 scope**，
+    /// 绝不参与 AS 授权判定或 scope 装配（本结构体注释的红线）。缺失、
+    /// 非法或非正数 → `None`（调用方 fail-closed，绝不回落默认租户）。
+    pub fn lmms_tid_i64(&self) -> Option<i64> {
+        self.lmms_tid
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|t| *t > 0)
+    }
+
     /// 校验动作与作用域；失败时返回稳定错误码文本（SCOPE_DENIED）。
     pub fn require(
         &self,

@@ -66,6 +66,73 @@ impl TestDelegationVerifier {
         actions: &[Action],
         binding: TestTokenBinding,
     ) -> &Self {
+        self.allow_with_binding_and_tid(
+            token, tenant_id, project_id, subject, actor_type, actions, binding, None,
+        )
+    }
+
+    /// 登记一条携带 `lmms_tid` 追溯 claim 的测试委托（WP-AS-05 对象面路由）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn allow_with_lmms_tid(
+        &self,
+        token: impl Into<String>,
+        tenant_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        subject: impl Into<String>,
+        actor_type: ActorType,
+        actions: &[Action],
+        lmms_tid: &str,
+    ) -> &Self {
+        self.allow_with_binding_and_tid(
+            token,
+            tenant_id,
+            project_id,
+            subject,
+            actor_type,
+            actions,
+            TestTokenBinding::default(),
+            Some(lmms_tid.to_string()),
+        )
+    }
+
+    /// 完全受控的登记入口（WP-AS-05：可同时指定绑定与 lmms_tid）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn allow_with_tid_binding(
+        &self,
+        token: impl Into<String>,
+        tenant_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        subject: impl Into<String>,
+        actor_type: ActorType,
+        actions: &[Action],
+        binding: TestTokenBinding,
+        lmms_tid: Option<&str>,
+    ) -> &Self {
+        self.allow_with_binding_and_tid(
+            token,
+            tenant_id,
+            project_id,
+            subject,
+            actor_type,
+            actions,
+            binding,
+            lmms_tid.map(str::to_string),
+        )
+    }
+
+    /// 完全受控的登记入口（内部）。
+    #[allow(clippy::too_many_arguments)]
+    fn allow_with_binding_and_tid(
+        &self,
+        token: impl Into<String>,
+        tenant_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        subject: impl Into<String>,
+        actor_type: ActorType,
+        actions: &[Action],
+        binding: TestTokenBinding,
+        lmms_tid: Option<String>,
+    ) -> &Self {
         let token = token.into();
         self.delegations.lock().expect("test verifier lock").insert(
             token.clone(),
@@ -76,7 +143,7 @@ impl TestDelegationVerifier {
                 actor: Actor::new(subject, actor_type),
                 actions: actions.iter().copied().collect(),
                 expires_at: Utc::now() + Duration::minutes(5),
-                lmms_tid: None,
+                lmms_tid,
                 artifact_id: binding.artifact_id,
                 operation_id: binding.operation_id,
                 caller_request_id: binding.caller_request_id,

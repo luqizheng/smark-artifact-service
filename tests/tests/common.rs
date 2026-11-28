@@ -60,6 +60,23 @@ pub async fn spawn_app(pool: sqlx::PgPool, verifier: Arc<dyn DelegationVerifier>
     format!("http://{addr}")
 }
 
+/// WP-AS-05：注入指定存储端口（loopback fake file-service 适配器）启动 API。
+pub async fn spawn_app_with_storage(
+    pool: sqlx::PgPool,
+    verifier: Arc<dyn DelegationVerifier>,
+    storage: Arc<dyn artifact_application::StoragePort>,
+) -> String {
+    let state = artifact_api::app_state_with_storage(pool, verifier, storage);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, artifact_api::router(state))
+            .await
+            .expect("server task");
+    });
+    format!("http://{addr}")
+}
+
 /// 默认 fail-closed 装配（用于默认拒绝测试）。
 pub async fn spawn_app_closed(pool: sqlx::PgPool) -> String {
     spawn_app(pool, artifact_api::default_verifier()).await
@@ -115,6 +132,39 @@ pub fn mint_write_token(
             caller_request_id: Some(caller),
             request_hash: Some(hash),
         },
+    );
+    caller
+}
+
+/// 为具体写请求铸造一枚 V10 绑定 + lmms_tid 追溯 claim 的 token（WP-AS-05）。
+#[allow(clippy::too_many_arguments)]
+pub fn mint_write_token_with_tid(
+    verifier: &Arc<TestDelegationVerifier>,
+    token: &str,
+    tenant: Uuid,
+    project: Uuid,
+    actions: &[Action],
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+    lmms_tid: &str,
+) -> Uuid {
+    let caller = Uuid::new_v4();
+    let hash = v1_fingerprint(method, path, caller, body);
+    verifier.allow_with_tid_binding(
+        token,
+        tenant,
+        project,
+        "test-user",
+        ActorType::User,
+        actions,
+        TestTokenBinding {
+            artifact_id: None,
+            operation_id: None,
+            caller_request_id: Some(caller),
+            request_hash: Some(hash),
+        },
+        Some(lmms_tid),
     );
     caller
 }

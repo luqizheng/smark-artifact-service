@@ -6,8 +6,8 @@
 
 use artifact_application::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, AuditSink, GeneratorRepository,
-    IdempotencyOutcome, IdempotencyStore, JobCancelOutcome, JobRepository, NewArtifact,
-    ReferenceRepository, VersionRepository,
+    IdempotencyOutcome, IdempotencyStore, JobCancelOutcome, JobRepository, NewArtifact, NewVersion,
+    ReferenceRepository, VersionCommitOutput, VersionRepository,
 };
 use artifact_domain::{
     Artifact, ArtifactReference, ArtifactType, ArtifactVersion, DomainError, GenerationJob,
@@ -553,6 +553,111 @@ impl VersionRepository for PgVersionRepository {
         rows.into_iter()
             .map(ArtifactVersion::try_from)
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    async fn insert(
+        &self,
+        scope: (Uuid, Uuid),
+        new: NewVersion,
+    ) -> Result<ArtifactVersion, DomainError> {
+        // id 应用层生成（表无默认）；version_number 由 assign_version_number
+        // 触发器在父行 FOR UPDATE 锁下分配（0001 §触发器）。
+        let id = Uuid::new_v4();
+        let sql = format!(
+            "INSERT INTO artifact.artifact_version \
+             (id, tenant_id, project_id, artifact_id, state, source_format, \
+              source_object_id, source_sha256, created_by) \
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8) \
+             RETURNING {VERSION_COLUMNS}"
+        );
+        let row: VersionRow = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(scope.0)
+            .bind(scope.1)
+            .bind(new.artifact_id)
+            .bind(new.source_format)
+            .bind(new.source_object_id)
+            .bind(new.source_sha256)
+            .bind(new.created_by)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| map_db_error(e, "insert version"))?;
+        row.try_into()
+    }
+
+    async fn commit_ready(
+        &self,
+        scope: (Uuid, Uuid),
+        artifact_id: Uuid,
+        version_id: Uuid,
+        output: VersionCommitOutput,
+    ) -> Result<ArtifactVersion, DomainError> {
+        // WP-AS-05 commit 协议：artifact_output 插入 + Version pending→ready
+        // 单事务（契约 openapi commit 描述；READY 终态由 DB 触发器强制）。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_db_error(e, "commit version begin"))?;
+        let out_sql = "INSERT INTO artifact.artifact_output \
+             (id, tenant_id, project_id, artifact_id, version_id, output_role, \
+              format, mime_type, size_bytes, sha256, file_object_id, safety_status) \
+             VALUES ($1, $2, $3, $4, $5, 'primary', $6, $7, $8, $9, $10, 'pending')";
+        let out_id = Uuid::new_v4();
+        let mime = output
+            .content_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let manifest = serde_json::json!({
+            "object_id": output.object_id,
+            "size_bytes": output.size_bytes,
+            "sha256": output.sha256,
+            "content_type": mime,
+        });
+        sqlx::query(out_sql)
+            .bind(out_id)
+            .bind(scope.0)
+            .bind(scope.1)
+            .bind(artifact_id)
+            .bind(version_id)
+            .bind(output.format)
+            .bind(mime)
+            .bind(output.size_bytes)
+            .bind(output.sha256)
+            .bind(output.object_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(e, "insert version output"))?;
+        let sql = format!(
+            "UPDATE artifact.artifact_version \
+             SET state = 'ready', ready_at = now(), manifest = $5 \
+             WHERE id = $1 AND artifact_id = $2 AND tenant_id = $3 AND project_id = $4 \
+               AND state = 'pending' \
+             RETURNING {VERSION_COLUMNS}"
+        );
+        let row: VersionRow = sqlx::query_as(&sql)
+            .bind(version_id)
+            .bind(artifact_id)
+            .bind(scope.0)
+            .bind(scope.1)
+            .bind(manifest)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(e, "commit version update"))?
+            .ok_or_else(|| {
+                // 0 行 = Version 不在 pending（READY 终态/failed/quarantined）
+                // 或 scope 不匹配；一律 409（不泄露存在性）。
+                DomainError::VersionConflict(
+                    "version is not pending and cannot be committed".into(),
+                )
+            })?;
+        tx.commit()
+            .await
+            .map_err(|e| map_db_error(e, "commit version tx"))?;
+        row.try_into()
     }
 }
 

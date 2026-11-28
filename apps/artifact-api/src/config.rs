@@ -74,6 +74,41 @@ fn validate_jwks_url(raw: &str) -> anyhow::Result<()> {
     }
 }
 
+/// LMMS file-service 对象面配置（WP-AS-05）。
+///
+/// **三项必填同现**（`file_service_url` / `token_service_url` /
+/// `bootstrap_token`）：任一出现而其余缺失 → 启动失败（硬错，不静默降级）；
+/// 三者全缺 → `None` → Version 链路保持 503 `PROTOCOL_BLOCKED`（诚实拒绝）。
+/// LMMS file-service 对象面配置（WP-AS-05）。
+///
+/// **三项必填同现**（`file_service_url` / `token_service_url` /
+/// `bootstrap_token`）：任一出现而其余缺失 → 启动失败（硬错，不静默降级）；
+/// 三者全缺 → `None` → Version 链路保持 503 `PROTOCOL_BLOCKED`（诚实拒绝）。
+#[derive(Clone)]
+pub struct FileServiceSettings {
+    pub file_service_url: String,
+    pub token_service_url: String,
+    /// bootstrap 服务凭证（自定义 Debug 恒定脱敏）。
+    pub bootstrap_token: String,
+    pub upload_max_bytes: i64,
+    pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for FileServiceSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileServiceSettings")
+            .field("file_service_url", &self.file_service_url)
+            .field("token_service_url", &self.token_service_url)
+            .field("bootstrap_token", &"<redacted>")
+            .field("upload_max_bytes", &self.upload_max_bytes)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
+const FILE_UPLOAD_MAX_BYTES_DEFAULT: i64 = 67_108_864; // 64 MiB
+const FILE_REQUEST_TIMEOUT_DEFAULT: u64 = 10;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -84,6 +119,8 @@ pub struct Config {
     /// 受信委托签发方清单。**空 = 维持全拒（fail-closed 默认）**：
     /// `ClosedDelegationVerifier` 装配，一切业务请求 401。
     pub delegation_issuers: Vec<DelegationIssuerConfig>,
+    /// LMMS file-service 对象面配置；None = Version 链路 503（诚实阻断）。
+    pub file_service: Option<FileServiceSettings>,
 }
 
 impl Config {
@@ -119,6 +156,7 @@ impl Config {
                 }
                 _ => Vec::new(),
             };
+        let file_service = file_service_settings_from_env()?;
         Ok(Self {
             bind,
             database_url,
@@ -126,7 +164,51 @@ impl Config {
             db_max_connections,
             request_timeout: Duration::from_secs(timeout_secs),
             delegation_issuers,
+            file_service,
         })
+    }
+}
+
+/// 三项必填同现规则（见 [`FileServiceSettings`] 文档）。
+fn file_service_settings_from_env() -> anyhow::Result<Option<FileServiceSettings>> {
+    let file_url = std::env::var("ARTIFACT_FILE_SERVICE_URL").ok();
+    let token_url = std::env::var("ARTIFACT_FILE_TOKEN_SERVICE_URL").ok();
+    let bootstrap = std::env::var("ARTIFACT_FILE_BOOTSTRAP_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    match (&file_url, &token_url, &bootstrap) {
+        (None, None, None) => Ok(None),
+        _ => {
+            let file_service_url = file_url
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("ARTIFACT_FILE_SERVICE_URL is required when any ARTIFACT_FILE_* setting is set (all-or-nothing)"))?;
+            let token_service_url = token_url
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("ARTIFACT_FILE_TOKEN_SERVICE_URL is required when any ARTIFACT_FILE_* setting is set (all-or-nothing)"))?;
+            let bootstrap_token = bootstrap.ok_or_else(|| anyhow::anyhow!("ARTIFACT_FILE_BOOTSTRAP_TOKEN is required when any ARTIFACT_FILE_* setting is set (all-or-nothing)"))?;
+            let upload_max_bytes = std::env::var("ARTIFACT_FILE_UPLOAD_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(FILE_UPLOAD_MAX_BYTES_DEFAULT);
+            if upload_max_bytes <= 0 {
+                anyhow::bail!("ARTIFACT_FILE_UPLOAD_MAX_BYTES must be positive");
+            }
+            let request_timeout_secs = std::env::var("ARTIFACT_FILE_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(FILE_REQUEST_TIMEOUT_DEFAULT);
+            if request_timeout_secs == 0 {
+                anyhow::bail!("ARTIFACT_FILE_REQUEST_TIMEOUT_SECS must be positive");
+            }
+            Ok(Some(FileServiceSettings {
+                file_service_url,
+                token_service_url,
+                bootstrap_token,
+                upload_max_bytes,
+                request_timeout: Duration::from_secs(request_timeout_secs),
+            }))
+        }
     }
 }
 

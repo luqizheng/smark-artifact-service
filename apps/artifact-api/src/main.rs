@@ -42,7 +42,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
     let verifier = verifier_from_config(&config.delegation_issuers);
-    let state = artifact_api::app_state_with_verifier(pool, verifier);
+    // WP-AS-05：file-service 配置齐备 → 真实适配器；否则 Version 链路
+    // 保持 503 协议阻断（诚实模式，/v1/ready 如实上报）。
+    let (storage, storage_mode) = artifact_api::storage_from_config(config.file_service.as_ref());
+    let state = artifact_api::app_state_with_storage(pool, verifier, storage);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let delegation_mode = if config.delegation_issuers.is_empty() {
         "fail-closed (no trusted issuer configured)".to_string()
@@ -57,7 +60,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         version = state.build_info.version,
         git_sha = state.build_info.git_sha,
         delegation = %delegation_mode,
-        "artifact-api listening (storage: protocol-blocked)"
+        "artifact-api listening (storage: {storage_mode})"
     );
     axum::serve(listener, router(state)).await?;
     Ok(())

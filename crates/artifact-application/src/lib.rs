@@ -26,7 +26,8 @@ pub use port::unkeyed_create::{
 
 pub use port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
-    JobRepository, NewArtifact, ReferenceRepository, VersionRepository,
+    JobRepository, NewArtifact, NewVersion, ReferenceRepository, VersionCommitOutput,
+    VersionRepository,
 };
 pub use port::storage::{ObjectInspection, StorageError, StoragePort, UploadIntent};
 pub use port::worker::{

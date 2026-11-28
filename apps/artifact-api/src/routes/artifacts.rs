@@ -412,20 +412,25 @@ pub async fn create_version_session(
         body.raw,
         None,
     );
-    match state
+    let dto = state
         .artifacts
-        .create_version_session(&req.delegation, &req.scope, artifact_id, body.value, &binding)
-        .await
-    {
-        Err(e) => Err(e.into()),
-        // 不可达：StoragePort 生产实现为 ProtocolBlocked；若未来此处返回 Ok，
-        // 必须先落地完整版本提交协议（ART-02 存储 P0）。
-        Ok(_) => Err(DomainError::Internal(
-            "version session succeeded while storage protocol is blocked; refusing to fabricate success"
-                .into(),
+        .create_version_session(
+            &req.delegation,
+            &req.scope,
+            artifact_id,
+            body.value,
+            &binding,
+            request_id_str(req.request_id).as_deref(),
         )
-        .into()),
-    }
+        .await?;
+    // WP-AS-05：201 Created，Location 指向版本资源（提交协议见 commit）。
+    let location = format!("/v1/artifacts/{artifact_id}/versions/{}", dto.id);
+    Ok((
+        StatusCode::CREATED,
+        [("Location", location)],
+        axum::Json(dto),
+    )
+        .into_response())
 }
 
 pub async fn commit_version(
@@ -449,15 +454,20 @@ pub async fn commit_version(
     );
     match state
         .artifacts
-        .commit_version_session(&req.delegation, &req.scope, artifact_id, version_id, &binding)
+        .commit_version_session(
+            &req.delegation,
+            &req.scope,
+            artifact_id,
+            version_id,
+            &binding,
+            request_id_str(req.request_id).as_deref(),
+        )
         .await
     {
         Err(e) => Err(e.into()),
-        Ok(_) => Err(DomainError::Internal(
-            "version commit succeeded while storage protocol is blocked; refusing to fabricate success"
-                .into(),
-        )
-        .into()),
+        // WP-AS-05：Ok 分支由原"拒绝伪成功"守卫改为真实提交协议
+        // （inspect + sha256 比对 + 单事务 output/ready），此处保持直返。
+        Ok(dto) => Ok(json_response(StatusCode::OK, dto)),
     }
 }
 

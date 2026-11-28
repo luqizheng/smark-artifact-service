@@ -12,7 +12,8 @@ use crate::port::keyed_create::{
 };
 use crate::port::repo::{
     ArtifactListFilter, ArtifactPatch, ArtifactRepository, GeneratorRepository, JobCancelOutcome,
-    JobRepository, NewArtifact, ReferenceRepository, VersionRepository,
+    JobRepository, NewArtifact, NewVersion, ReferenceRepository, VersionCommitOutput,
+    VersionRepository,
 };
 use crate::port::storage::{StorageError, StoragePort};
 use crate::port::unkeyed_create::{
@@ -28,6 +29,7 @@ use artifact_contract::{
 use artifact_domain::{
     Action, Artifact, ArtifactReference, ArtifactType, ArtifactVersion, Delegation, DomainError,
     GenerationJob, GeneratorDescriptor, GeneratorStatus, OwnerType, RelationType, TenantScope,
+    VersionState,
 };
 use base64::Engine as _;
 use std::sync::Arc;
@@ -465,15 +467,23 @@ impl ArtifactService {
         Ok(to_artifact_dto(&updated))
     }
 
-    // ── Version 会话（P0 阻断：file-service 上传协议未落地） ──────────
+    // ── Version 会话（WP-AS-05：file-service 对象 + 提交协议） ──────────
+    //
+    // 契约依据（WP v0.3 §12）：LMMS 无 upload-intent/finalize（P1）。流程：
+    // 调用方先把对象上传到 file-service（自行持身份），再以
+    // `source_object_id`+`source_sha256` 创建 pending 会话；commit 时 AS
+    // 下载重算 sha256（"校验"）并在单事务写入 output + pending→ready。
+    // 失败路径不删除调用方对象（重试幂等）；补偿删除仅用于 AS 自身上传
+    // 的输出对象（Worker，WP-AS-06）。
 
     pub async fn create_version_session(
         &self,
         delegation: &Delegation,
         scope: &TenantScope,
         artifact_id: Uuid,
-        _req: CreateVersionSessionRequest,
+        req: CreateVersionSessionRequest,
         binding: &WriteOperationBinding,
+        request_id: Option<&str>,
     ) -> Result<ArtifactVersionResponse, DomainError> {
         delegation.require(Action::VersionCreate, scope)?;
         enforce_write_binding(delegation, binding)?;
@@ -486,21 +496,45 @@ impl ArtifactService {
                 "artifact is deleted and does not accept new versions".into(),
             ));
         }
-        match self
+        let object_id = req
+            .source_object_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                DomainError::InvalidRequest(
+                    "source_object_id is required (upload the object to file-service first)".into(),
+                )
+            })?;
+        let declared_sha = normalize_sha256(req.source_sha256.as_deref())?;
+        let lmms_tid = object_plane_tid(delegation)?;
+        // fail-early：对象必须已存在且在调用方租户范围内（404 不泄露存在性）。
+        let head = self
             .storage
-            .create_upload_intent(scope.tenant_id, scope.project_id, "artifact-source")
+            .head_object(lmms_tid, object_id)
             .await
-        {
-            Err(StorageError::ProtocolBlocked(reason)) => {
-                Err(DomainError::StorageUnavailable(reason))
-            }
-            Err(other) => Err(storage_to_domain(other)),
-            // 不可达：生产 StoragePort 当前必然 ProtocolBlocked；一旦未来
-            // file-service 协议就绪，必须先实现完整版本提交协议再放开本路径。
-            Ok(_) => Err(DomainError::Internal(
-                "storage accepted an upload intent but the version commit protocol is not implemented".into(),
-            )),
+            .map_err(storage_to_domain)?;
+        if head.size_bytes <= 0 {
+            return Err(DomainError::InvalidRequest("source object is empty".into()));
         }
+        let version = self
+            .versions
+            .insert(
+                (scope.tenant_id, scope.project_id),
+                NewVersion {
+                    tenant_id: scope.tenant_id,
+                    project_id: scope.project_id,
+                    artifact_id,
+                    source_format: req.source_format.clone(),
+                    source_object_id: object_id.to_owned(),
+                    source_sha256: declared_sha,
+                    created_by: delegation.actor.subject.clone(),
+                },
+            )
+            .await?;
+        self.audit_allowed(scope, delegation, "version.create", version.id, request_id)
+            .await;
+        Ok(to_version_dto(&version))
     }
 
     pub async fn commit_version_session(
@@ -510,6 +544,7 @@ impl ArtifactService {
         artifact_id: Uuid,
         version_id: Uuid,
         binding: &WriteOperationBinding,
+        request_id: Option<&str>,
     ) -> Result<ArtifactVersionResponse, DomainError> {
         delegation.require(Action::VersionCommit, scope)?;
         enforce_write_binding(delegation, binding)?;
@@ -520,25 +555,64 @@ impl ArtifactService {
             .versions
             .get((scope.tenant_id, scope.project_id), artifact_id, version_id)
             .await?;
-        match self
-            .storage
-            .inspect_object(
-                version
-                    .source_object_id
-                    .as_deref()
-                    .unwrap_or("artifact-source"),
-            )
-            .await
-        {
-            Err(StorageError::ProtocolBlocked(reason)) => {
-                Err(DomainError::StorageUnavailable(reason))
-            }
-            Err(other) => Err(storage_to_domain(other)),
-            Ok(_) => Err(DomainError::Internal(
-                "storage inspection succeeded but the atomic commit protocol is not implemented"
-                    .into(),
-            )),
+        if version.state != VersionState::Pending {
+            return Err(DomainError::VersionConflict(format!(
+                "version is in state '{}' and cannot be committed",
+                version.state.as_str()
+            )));
         }
+        let declared_sha = version.source_sha256.clone().ok_or_else(|| {
+            DomainError::InvalidRequest("version session has no declared source_sha256".into())
+        })?;
+        let object_id = version.source_object_id.clone().ok_or_else(|| {
+            DomainError::Internal("pending version is missing its source object id".into())
+        })?;
+        let lmms_tid = object_plane_tid(delegation)?;
+        // 校验：下载对象并重算 sha256，与会话声明比对（file-service 不提供
+        // hash attestation——P1 差异，本实现即契约"校验"步骤）。
+        let inspection = self
+            .storage
+            .inspect_object(lmms_tid, &object_id)
+            .await
+            .map_err(storage_to_domain)?;
+        let actual_sha = inspection.sha256.clone().ok_or_else(|| {
+            DomainError::Internal("storage inspection did not produce sha256".into())
+        })?;
+        if !constant_sha_eq(&actual_sha, &declared_sha) {
+            return Err(DomainError::InvalidRequest(format!(
+                "source object sha256 mismatch (declared {declared_sha}, actual {actual_sha})"
+            )));
+        }
+        if inspection.size_bytes <= 0 {
+            return Err(DomainError::InvalidRequest("source object is empty".into()));
+        }
+        // finalize 近似：LMMS 无 finalize 协议，no-op 返回原 id（P1 差异）。
+        let finalized = self
+            .storage
+            .copy_or_finalize_object(lmms_tid, &object_id)
+            .await
+            .map_err(storage_to_domain)?;
+        let committed = self
+            .versions
+            .commit_ready(
+                (scope.tenant_id, scope.project_id),
+                artifact_id,
+                version_id,
+                VersionCommitOutput {
+                    format: version
+                        .source_format
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into()),
+                    object_id: finalized,
+                    size_bytes: inspection.size_bytes,
+                    sha256: actual_sha,
+                    content_type: Some(inspection.detected_mime).filter(|s| !s.is_empty()),
+                },
+            )
+            .await?;
+        self.audit_allowed(scope, delegation, "version.commit", version_id, request_id)
+            .await;
+        Ok(to_version_dto(&committed))
     }
 
     // ── References ─────────────────────────────────────────────────────
@@ -819,6 +893,40 @@ pub fn storage_to_domain(err: StorageError) -> DomainError {
         StorageError::Unavailable(reason) => DomainError::StorageUnavailable(reason),
         StorageError::ObjectNotFound => DomainError::NotFound,
     }
+}
+
+/// 会话声明的对象指纹：64 位十六进制（大小写归一为小写）。
+fn normalize_sha256(raw: Option<&str>) -> Result<String, DomainError> {
+    let trimmed = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            DomainError::InvalidRequest("source_sha256 is required (64 hex characters)".into())
+        })?;
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.len() != 64 || !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(DomainError::InvalidRequest(
+            "source_sha256 must be exactly 64 hex characters".into(),
+        ));
+    }
+    Ok(lower)
+}
+
+/// 指纹比对（声明 vs 重算）；定长等价比较（sha256 十六进制，大小写不敏感）。
+fn constant_sha_eq(actual: &str, declared: &str) -> bool {
+    actual.eq_ignore_ascii_case(declared)
+}
+
+/// 对象面出站路由的 LMMS 数字 tid（WP-AS-05）：来自委托 claim 追溯字段。
+/// 缺失 → fail-closed 503（新令牌携带 lmms_tid 后重试可解）。
+fn object_plane_tid(delegation: &Delegation) -> Result<i64, DomainError> {
+    delegation.lmms_tid_i64().ok_or_else(|| {
+        DomainError::StorageUnavailable(
+            "delegation lacks lmms_tid traceability claim; object-plane \
+             tenant routing is unavailable (fail-closed)"
+                .into(),
+        )
+    })
 }
 
 // ── DTO 转换 ───────────────────────────────────────────────────────────

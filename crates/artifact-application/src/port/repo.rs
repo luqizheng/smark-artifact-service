@@ -66,6 +66,32 @@ pub trait ArtifactRepository: Send + Sync {
     ) -> Result<Artifact, DomainError>;
 }
 
+/// 新建 pending Version（WP-AS-05 版本会话）。`source_object_id` 为
+/// file-service 对象 id（调用方先上传、后建会话）；`source_sha256` 为
+/// 调用方声明的对象指纹（commit 时由 AS 下载重算比对）。
+#[derive(Debug, Clone)]
+pub struct NewVersion {
+    pub tenant_id: Uuid,
+    pub project_id: Uuid,
+    pub artifact_id: Uuid,
+    pub source_format: Option<String>,
+    pub source_object_id: String,
+    pub source_sha256: String,
+    pub created_by: String,
+}
+
+/// commit 校验产出的对象事实（WP-AS-05）。单事务写入 `artifact_output`
+/// （primary 输出行）并驱动 Version `pending → ready`。
+#[derive(Debug, Clone)]
+pub struct VersionCommitOutput {
+    /// 输出格式标识（取会话声明的 `source_format`，缺省 "unknown"）。
+    pub format: String,
+    pub object_id: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub content_type: Option<String>,
+}
+
 #[async_trait]
 pub trait VersionRepository: Send + Sync {
     async fn get(
@@ -80,6 +106,23 @@ pub trait VersionRepository: Send + Sync {
         artifact_id: Uuid,
         limit: i64,
     ) -> Result<Vec<ArtifactVersion>, DomainError>;
+    /// 插入 pending Version（version_number 由 DB 触发器在父行锁下分配）。
+    async fn insert(
+        &self,
+        scope: (Uuid, Uuid),
+        new: NewVersion,
+    ) -> Result<ArtifactVersion, DomainError>;
+    /// 提交就绪（WP-AS-05 commit 协议，单事务）：
+    /// `artifact_output` 插入（primary/safety pending）+ Version
+    /// `pending → ready`（ready_at + manifest 由校验事实构建）。
+    /// Version 非 pending 或输出行冲突 → 错误（DB 触发器/约束背书）。
+    async fn commit_ready(
+        &self,
+        scope: (Uuid, Uuid),
+        artifact_id: Uuid,
+        version_id: Uuid,
+        output: VersionCommitOutput,
+    ) -> Result<ArtifactVersion, DomainError>;
 }
 
 #[async_trait]

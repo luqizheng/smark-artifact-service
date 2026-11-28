@@ -8,8 +8,9 @@ pub mod routes;
 pub mod state;
 
 pub use build_info::{BuildInfo, build_info};
-pub use config::Config;
+pub use config::{Config, FileServiceSettings};
 pub use routes::router;
 pub use state::{
-    AppState, app_state, app_state_with_verifier, default_verifier, verifier_from_config,
+    AppState, app_state, app_state_with_storage, app_state_with_verifier, default_verifier,
+    storage_from_config, verifier_from_config,
 };

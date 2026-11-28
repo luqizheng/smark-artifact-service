@@ -94,15 +94,15 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// /v1/ready：数据库可达即 ready；file-storage 协议被 P0 阻断时如实上报。
+/// /v1/ready：数据库可达即 ready；file-storage 装配模式如实上报
+/// （WP-AS-05：`file_service_adapter` 或 `protocol_blocked_*`）。
 async fn ready(State(state): State<AppState>) -> Response {
     let database_ok = sqlx::query("SELECT 1").fetch_one(&state.pool).await.is_ok();
     let body = ReadyResponse {
         status: if database_ok { "ready" } else { "not_ready" }.to_string(),
         components: ReadyComponents {
             database: if database_ok { "ok" } else { "unreachable" }.to_string(),
-            // 诚实上报：file-service 上传/finalize 协议被 ART-02 存储 P0 阻断。
-            file_storage: "protocol_blocked_p0".to_string(),
+            file_storage: state.storage_mode.to_string(),
         },
         version: state.build_info.version.to_string(),
     };

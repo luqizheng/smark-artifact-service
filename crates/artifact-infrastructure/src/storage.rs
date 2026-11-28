@@ -29,6 +29,40 @@ impl ProtocolBlockedStorage {
 
 #[async_trait]
 impl StoragePort for ProtocolBlockedStorage {
+    async fn upload_object(
+        &self,
+        _lmms_tid: i64,
+        _data: bytes::Bytes,
+        _filename: &str,
+        _content_type: Option<&str>,
+    ) -> Result<String, StorageError> {
+        self.blocked()
+    }
+
+    async fn head_object(
+        &self,
+        _lmms_tid: i64,
+        _object_id: &str,
+    ) -> Result<ObjectInspection, StorageError> {
+        self.blocked()
+    }
+
+    async fn inspect_object(
+        &self,
+        _lmms_tid: i64,
+        _object_id: &str,
+    ) -> Result<ObjectInspection, StorageError> {
+        self.blocked()
+    }
+
+    async fn create_download_intent(
+        &self,
+        _lmms_tid: i64,
+        _object_id: &str,
+    ) -> Result<String, StorageError> {
+        self.blocked()
+    }
+
     async fn create_upload_intent(
         &self,
         _tenant_id: uuid::Uuid,
@@ -38,23 +72,15 @@ impl StoragePort for ProtocolBlockedStorage {
         self.blocked()
     }
 
-    async fn inspect_object(&self, _object_id: &str) -> Result<ObjectInspection, StorageError> {
+    async fn copy_or_finalize_object(
+        &self,
+        _lmms_tid: i64,
+        _object_id: &str,
+    ) -> Result<String, StorageError> {
         self.blocked()
     }
 
-    async fn create_download_intent(&self, _object_id: &str) -> Result<String, StorageError> {
-        self.blocked()
-    }
-
-    async fn copy_or_finalize_object(&self, _object_id: &str) -> Result<String, StorageError> {
-        self.blocked()
-    }
-
-    async fn delete_object(&self, _object_id: &str) -> Result<(), StorageError> {
-        self.blocked()
-    }
-
-    async fn head_object(&self, _object_id: &str) -> Result<ObjectInspection, StorageError> {
+    async fn delete_object(&self, _lmms_tid: i64, _object_id: &str) -> Result<(), StorageError> {
         self.blocked()
     }
 }

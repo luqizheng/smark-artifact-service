@@ -414,9 +414,15 @@ async fn a9_version_session_routes_binding_passes_then_storage_blocks(pool: PgPo
     let (base, verifier) = spawn(&pool).await;
     let artifact = common::sql_insert_artifact(&pool, TENANT, PROJECT_1, "a9").await;
 
-    // W3：正确绑定 → 通过服务绑定检查 → P0 存储 503（不是 403）。
+    // W3：正确绑定 → 通过服务绑定检查 → 存储门 503（WP-AS-05 后：绑定通过
+    // → 输入校验需要 source_object_id/sha256（齐备）→ 默认装配仍是
+    // ProtocolBlocked → 503 STORAGE_UNAVAILABLE，不是 403）。
     let path = format!("/v1/artifacts/{artifact}/versions");
-    let body = json!({"source_format": "yaml"});
+    let body = json!({
+        "source_format": "yaml",
+        "source_object_id": uuid::Uuid::new_v4().to_string(),
+        "source_sha256": common::sha256_hex("wp04-a9"),
+    });
     let token = mint(
         &verifier,
         TENANT,
@@ -438,8 +444,19 @@ async fn a9_version_session_routes_binding_passes_then_storage_blocks(pool: PgPo
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
     assert_eq!(value["error"]["code"], "STORAGE_UNAVAILABLE");
 
-    // W4：正确绑定 → 同样到达存储门。
+    // W4：正确绑定 → 同样到达存储门（WP-AS-05：pending 版本需带声明对象；
+    // 委托缺 lmms_tid → 对象面路由 fail-closed 503，语义不变）。
     let version = common::sql_insert_version(&pool, TENANT, PROJECT_1, artifact, "pending").await;
+    sqlx::query(
+        "UPDATE artifact.artifact_version \
+         SET source_object_id = $2, source_sha256 = $3 WHERE id = $1",
+    )
+    .bind(version)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(common::sha256_hex("wp04-a9-w4"))
+    .execute(&pool)
+    .await
+    .unwrap();
     let commit_path = format!("/v1/artifacts/{artifact}/versions/{version}/commit");
     let token = mint(
         &verifier,
